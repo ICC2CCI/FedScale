@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flower-server-sa
+  namespace: flower-superlink
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flower-server-object-store-role
+  namespace: flower-superlink
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flower-server-object-store-rolebinding
+  namespace: flower-superlink
+subjects:
+  - kind: ServiceAccount
+    name: flower-server-sa
+    namespace: flower-superlink
+roleRef:
+  kind: Role
+  name: flower-server-object-store-role
+  apiGroup: rbac.authorization.k8s.io

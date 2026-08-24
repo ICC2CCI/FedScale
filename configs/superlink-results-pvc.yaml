@@ -1,0 +1,14 @@
+# SuperLink 命名空间的 CFS PVC
+# 用于 ServerApp 持久化训练结果（聚合后的 LoRA 权重）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flowertune-results-pvc
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteMany  # CFS 支持多节点同时读写
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: cfs

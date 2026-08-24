@@ -1,0 +1,51 @@
+# One-off in-cluster copy Job.  It is deliberately separate from the
+# migration shell pod so kubectl exec connection lifetime cannot interrupt
+# the 65GiB copy.  A retry starts a complete overwrite copy from the read-only
+# source; it never writes to the source claim.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: superexec-serverapp-results-copy-300g
+  namespace: flower-superlink
+  labels:
+    app: superexec-results-migration
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: superexec-results-migration
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: copy
+          image: ccr.ccs.tencentyun.com/czfflower/flwr_superexec:0.0.1
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              cd /source
+              # Archive entries below the mount point rather than `.` itself.
+              # This avoids a harmless root-directory timestamp change causing
+              # GNU tar to mark an otherwise quiescent copy as failed.
+              find . -xdev -mindepth 1 -print0 | \
+                tar --null --verbatim-files-from --no-recursion \
+                  --numeric-owner --xattrs --acls -T - -cpf - | \
+                (cd /destination && tar --numeric-owner --xattrs --acls -xpf -)
+              sync
+              echo "copy-complete"
+              du -sxB1 /source /destination
+          volumeMounts:
+            - name: results-source
+              mountPath: /source
+              readOnly: true
+            - name: results-destination
+              mountPath: /destination
+      volumes:
+        - name: results-source
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc
+        - name: results-destination
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc-300g

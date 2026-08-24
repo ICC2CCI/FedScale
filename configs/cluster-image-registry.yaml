@@ -1,0 +1,74 @@
+# Private, persistent Registry for Flower infrastructure images.  It is kept
+# ClusterIP-only: image publication is performed through a local port-forward.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flower-image-registry-pvc
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: cbs
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower-image-registry
+  namespace: flower-superlink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower-image-registry
+  template:
+    metadata:
+      labels:
+        app: flower-image-registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: registry
+              containerPort: 5000
+          env:
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+          volumeMounts:
+            - name: registry-data
+              mountPath: /var/lib/registry
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: registry
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: registry-data
+          persistentVolumeClaim:
+            claimName: flower-image-registry-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower-image-registry
+  namespace: flower-superlink
+spec:
+  selector:
+    app: flower-image-registry
+  ports:
+    - name: registry
+      port: 5000
+      targetPort: registry
+  type: ClusterIP

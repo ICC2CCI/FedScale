@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flower Runtime Overrides"
+  short_description: "Use Flower runtime and registry workflows"
+  default_prompt: "Use $flower-runtime-overrides for Flower runtime changes and authorized stalled-experiment stop/restart recovery; reuse the current registry login only when authorized, and verify dashboard rollouts without replacing the training image."

@@ -1,0 +1,14 @@
+# Center-side experiment results.  This replaces the former 1TiB CBS claim
+# after its data has been migrated and verified.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: superexec-serverapp-results-pvc-300g
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 300Gi
+  storageClassName: cbs

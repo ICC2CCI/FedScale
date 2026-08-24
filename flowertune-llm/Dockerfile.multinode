@@ -1,0 +1,19 @@
+# Dockerfile for multi-node distributed training support
+# This image includes Kubernetes client library and distributed training modules
+
+FROM ccr.ccs.tencentyun.com/czfflower/flwr_superexec:0.0.1
+
+USER root
+
+# Install Kubernetes Python client
+#RUN pip install --no-cache-dir kubernetes>=28.1.0 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# Copy flowertune_llm module code to the image
+COPY flowertune_llm/ /app/flowertune_llm/
+
+# Install the flowertune_llm package in editable mode
+WORKDIR /app
+RUN pip install -e . -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# Default command (can be overridden by K8s deployment)
+#ENTRYPOINT ["flower-superexec"]

@@ -1,0 +1,13 @@
+# ServerApp 只有一个副本，使用 RWO CBS 盘即可持久保存重启前日志。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: superexec-serverapp-logs-pvc
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: cbs

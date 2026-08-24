@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openllama-full-pair-eval
+  namespace: flower-supernode-a
+  labels:
+    app: openllama-full-pair-eval
+    scope: global-checkpoint-comparison
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    metadata:
+      labels:
+        app: openllama-full-pair-eval
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node.tke.cloud.tencent.com/accelerator-type: gpu
+      containers:
+        - name: evaluator
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_client_train:0.0.19
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - >-
+              set -euo pipefail;
+              python -m pip install --disable-pip-version-check --no-cache-dir
+              rouge-score==0.1.2 bert-score==0.3.13;
+              python /app/eval/evaluate_alpaca_sft.py
+              --full-state-path /app/outputs/evaluations/full-pair-checkpoints/fsdp/model_state.pt
+              --label fsdp-full-topk-3b-s512-s10-gc-pair-r1
+              --base-model openlm-research/open_llama_3b_v2
+              --dataset vicgalle/alpaca-gpt4
+              --num-partitions 2
+              --eval-split-ratio 0.1
+              --split-seed 42
+              --max-samples 100
+              --max-length 512
+              --max-new-tokens 128
+              --bertscore-model /app/.cache/huggingface/models--roberta-large/snapshots/722cf37b1afa9454edce342e7895e588b6ff1d59
+              --bertscore-layers 17
+              --bertscore-batch-size 8
+              --output-dir /app/outputs/evaluations/fsdp-full-topk-3b-s512-s10-gc-pair-r1
+              --local-files-only
+              --skip-base;
+              python /app/eval/evaluate_alpaca_sft.py
+              --full-state-path /app/outputs/evaluations/full-pair-checkpoints/ddp/model_state.pt
+              --label ddp-full-cpuoffload-topk-3b-s512-s10-gc-pair-r2
+              --base-model openlm-research/open_llama_3b_v2
+              --dataset vicgalle/alpaca-gpt4
+              --num-partitions 2
+              --eval-split-ratio 0.1
+              --split-seed 42
+              --max-samples 100
+              --max-length 512
+              --max-new-tokens 128
+              --bertscore-model /app/.cache/huggingface/models--roberta-large/snapshots/722cf37b1afa9454edce342e7895e588b6ff1d59
+              --bertscore-layers 17
+              --bertscore-batch-size 8
+              --output-dir /app/outputs/evaluations/ddp-full-cpuoffload-topk-3b-s512-s10-gc-pair-r2
+              --local-files-only
+              --skip-base
+          env:
+            - name: HF_HOME
+              value: /app/.cache/huggingface
+            - name: HF_DATASETS_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 24Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: 34Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: eval-script
+              mountPath: /app/eval
+              readOnly: true
+            - name: cache-volume
+              mountPath: /app/.cache
+            - name: outputs-volume
+              mountPath: /app/outputs
+      volumes:
+        - name: eval-script
+          configMap:
+            name: openllama-full-pair-eval-script
+        - name: cache-volume
+          persistentVolumeClaim:
+            claimName: flowertune-cache-pvc
+        - name: outputs-volume
+          persistentVolumeClaim:
+            claimName: flowertune-output-pvc

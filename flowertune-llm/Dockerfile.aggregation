@@ -1,0 +1,13 @@
+# CPU-only one-shot FedAvg Worker. Build and push this image before enabling
+# train.full-update-transport=object-store in a cluster run.
+# Reuse the training runtime so aggregation/seed jobs can load the exact
+# pinned torch and transformers state format used by ClientApp.
+FROM ccr.ccs.tencentyun.com/flwr_pcl/flwr_client_train:latest
+
+USER root
+WORKDIR /app
+COPY pyproject.toml ./pyproject.toml
+COPY flowertune_llm ./flowertune_llm
+RUN python -m pip install --no-cache-dir 'boto3>=1.35.0,<2.0.0'
+
+ENTRYPOINT ["python", "-m", "flowertune_llm.aggregation"]

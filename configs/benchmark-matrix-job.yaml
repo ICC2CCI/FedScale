@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: benchmark-matrix-supervisor
+  namespace: flower-superlink
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: supervisor
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-mvp-20260818
+          imagePullPolicy: Always
+          command: ["/bin/bash", "/scripts/supervise.sh"]
+          env:
+            - name: MATRIX_ID
+              value: qwen25-7b-lora-matrix-20260821
+            - name: POLL_SECONDS
+              value: "120"
+            - name: STALL_SECONDS
+              # Each matrix item uses one-step LoRA smoke training. If a
+              # client message is lost, fail this item promptly and continue
+              # with the next serial combination.
+              value: "1200"
+            - name: MAX_RESTARTS
+              # The requested matrix policy is fail-fast per combination:
+              # record the error and move to the next strategy/round pair.
+              value: "0"
+            - name: SUPERVISOR_STRATEGY
+              value: fsdp
+            - name: SUPERVISOR_ROUNDS
+              value: "10"
+            - name: SUPERVISOR_PLAN
+              value: fsdp:10,fsdp:20,fedscale:10,fedscale:20,ddp:10,ddp:20
+            - name: SUPERVISOR_MODEL
+              value: Qwen/Qwen2.5-7B
+            - name: SUPERVISOR_DATASET
+              value: HuggingFaceH4/ultrachat_200k
+            - name: SUPERVISOR_FINETUNING_TYPE
+              value: lora
+            - name: APP_DIR
+              value: /app-source/flowertune-llm
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: validator
+              mountPath: /validator
+              readOnly: true
+            - name: results-storage
+              mountPath: /app/results
+            - name: app-source
+              mountPath: /app-source
+              readOnly: true
+      initContainers:
+        - name: app-unpack
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-mvp-20260818
+          command: ["sh", "-ceu", "mkdir -p /app-source && tar -xzf /bundle/app.tar.gz -C /app-source"]
+          volumeMounts:
+            - name: app-bundle
+              mountPath: /bundle
+              readOnly: true
+            - name: app-source
+              mountPath: /app-source
+      volumes:
+        - name: scripts
+          configMap:
+            name: benchmark-matrix-supervisor
+            defaultMode: 0755
+        - name: validator
+          configMap:
+            name: benchmark-matrix-validator
+            defaultMode: 0555
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc-300g
+        - name: app-bundle
+          configMap:
+            name: benchmark-matrix-app
+        - name: app-source
+          emptyDir: {}

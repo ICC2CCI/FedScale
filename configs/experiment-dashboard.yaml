@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: experiment-dashboard
+  namespace: flower-superlink
+  labels:
+    app: experiment-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: experiment-dashboard
+  template:
+    metadata:
+      labels:
+        app: experiment-dashboard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
+      imagePullSecrets:
+        - name: ccr-registry-auth
+      containers:
+        - name: dashboard
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flower-experiment-dashboard:control-console-v3
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: RESULTS_ROOT
+              value: /app/results
+            - name: GPU_MODEL
+              value: NVIDIA V100
+            - name: CENTER_KUBECONFIG
+              value: /app/kubeconfigs/config-center
+            - name: TKE_A_KUBECONFIG
+              value: /app/kubeconfigs/config-tke-a
+            - name: TKE_B_KUBECONFIG
+              value: /app/kubeconfigs/config-tke-b
+            - name: DASHBOARD_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: experiment-dashboard-auth
+                  key: username
+            - name: DASHBOARD_AUTH_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: experiment-dashboard-auth
+                  key: password-hash
+            - name: SWANLAB_ENABLED
+              value: "true"
+            - name: SWANLAB_API_HOST
+              value: http://swanlab-self-hosted
+            - name: SWANLAB_WEB_HOST
+              value: http://swanlab-self-hosted
+            - name: DASHBOARD_SWANLAB_PROJECT
+              value: flower-federated-experiments
+            - name: SWANLAB_WORKSPACE
+              value: duanbw
+            # Backfill historical experiments sequentially: a fresh SDK
+            # process per experiment avoids shared SwanLab session state.
+            - name: SWANLAB_BACKFILL_PER_SYNC
+              value: "3"
+            - name: SWANLAB_SYNC_INTERVAL_SECONDS
+              value: "10"
+            - name: SWANLAB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: swanlab-api-key
+                  key: api-key
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: results-storage
+              mountPath: /app/results
+              readOnly: true
+            - name: cloud-kubeconfigs
+              mountPath: /app/kubeconfigs
+              readOnly: true
+            # SwanLab writes lightweight run metadata under /tmp/swanlab.
+            # Preserve a read-only root filesystem while giving it ephemeral
+            # per-Pod scratch storage.
+            - name: runtime-tmp
+              mountPath: /tmp
+      volumes:
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc-300g
+        - name: cloud-kubeconfigs
+          secret:
+            secretName: experiment-dashboard-kubeconfigs
+            optional: true
+        - name: runtime-tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: experiment-dashboard
+  namespace: flower-superlink
+spec:
+  selector:
+    app: experiment-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP

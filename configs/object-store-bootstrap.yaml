@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: object-store-bootstrap
+  namespace: flower-superlink
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mc alias set local http://object-store-minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+              mc mb --ignore-existing local/fl-models
+              mc anonymous set none local/fl-models
+          envFrom:
+            - secretRef:
+                name: object-store-minio-root

@@ -1,0 +1,60 @@
+# SwanLab self-hosted Helm values for the Flower federation cluster.
+# Chart: swanlab/self-hosted, version 0.6.2 (app version 3.1.1)
+#
+# This deployment intentionally uses the chart-managed MinIO instance. It keeps
+# experiment metadata, scalar metrics and media inside the cluster instead of
+# requiring an external S3 endpoint. All persistent volumes use Tencent CBS.
+
+global:
+  # The ClusterIP gateway is used by the dashboard syncer. Set this only when
+  # an Ingress or LoadBalancer is added for browser access.
+  settings:
+    host: ""
+
+gateway:
+  replicas: 1
+  service:
+    type: ClusterIP
+
+vector:
+  replicas: 1
+  sinks:
+    # Keep this below one third of the 20Gi vector PVC.
+    bufferMaxSize: 5368709120
+  persistence:
+    storageClass: cbs
+    storageSize: 20Gi
+
+service:
+  server:
+    replicas: 1
+  auth:
+    replicas: 1
+  house:
+    replicas: 1
+    persistence:
+      storageClass: cbs
+      storageSize: 10Gi
+  cloud:
+    replicas: 1
+  next:
+    replicas: 1
+
+dependencies:
+  postgres:
+    persistence:
+      storageClass: cbs
+      storageSize: 10Gi
+  redis:
+    persistence:
+      storageClass: cbs
+      storageSize: 10Gi
+  clickhouse:
+    persistence:
+      storageClass: cbs
+      storageSize: 20Gi
+  s3:
+    persistence:
+      storageClass: cbs
+      storageSize: 20Gi
+

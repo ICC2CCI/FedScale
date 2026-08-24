@@ -1,0 +1,121 @@
+# superexec-serverapp-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superexec-serverapp
+  namespace: flower-superlink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superexec-serverapp
+  template:
+    metadata:
+      labels:
+        app: superexec-serverapp
+    spec:
+      serviceAccountName: flower-server-sa
+      containers:
+      - name: superexec-serverapp
+        image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-mvp-20260818
+        command:
+          - /usr/bin/bash
+          - -c
+        args:
+          - |
+            set -euo pipefail
+            log_dir=/app/persistent-logs
+            mkdir -p "$log_dir"
+            log_file="$log_dir/serverapp-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ).log"
+            exec > >(tee -a "$log_file") 2>&1
+            echo "Persistent log file: $log_file"
+            child_pid=""
+            on_signal() {
+              signal="$1"
+              echo "$(date -u +%FT%TZ) received ${signal}; Kubernetes is terminating this SuperExec"
+              if [ -n "$child_pid" ]; then
+                kill -TERM "$child_pid" 2>/dev/null || true
+                wait "$child_pid" || true
+              fi
+              echo "$(date -u +%FT%TZ) SuperExec stopped because of ${signal}"
+              exit 0
+            }
+            trap 'on_signal TERM' TERM
+            trap 'on_signal INT' INT
+            flower-superexec --insecure \
+              --appio-api-address superlink-server-svc:9091 \
+              --plugin-type serverapp &
+            child_pid=$!
+            wait "$child_pid"
+            status=$?
+            echo "$(date -u +%FT%TZ) SuperExec exited with status ${status}"
+            exit "$status"
+        ports:
+        - containerPort: 9091
+        terminationMessagePolicy: FallbackToLogsOnError
+        env:
+        - name: OBJECT_STORE_AGGREGATION_IMAGE
+          value: "ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-aggregation-mvp-20260818-r3"
+        - name: OBJECT_STORE_AGGREGATION_SECRET
+          value: object-store-aggregator
+        - name: OBJECT_STORE_AGGREGATION_NAMESPACE
+          value: flower-superlink
+        # The Worker mmap-loads its two source checkpoints, so it fits the
+        # current 30Gi central node without putting aggregation in ServerApp.
+        - name: OBJECT_STORE_AGGREGATION_MEMORY_REQUEST
+          value: "8Gi"
+        - name: OBJECT_STORE_AGGREGATION_MEMORY_LIMIT
+          value: "26Gi"
+        - name: HF_ENDPOINT
+          value: "https://hf-mirror.com"
+        - name: HF_HOME
+          value: "/app/.cache/huggingface"
+        # Full OpenLLaMA FP16 state is 6.54GB. 4MB object RPCs still caused
+        # Skupper to miss gRPC ping acknowledgements under load. Use 1MB chunks
+        # for a stable cross-cloud control/data path.
+        - name: FLWR_PRIVATE_MAX_ARRAY_CHUNK_SIZE
+          value: "1048576"
+        # Must exceed the client-side Job timeout, including result collection.
+        - name: FEDERATED_ROUND_TIMEOUT_SECONDS
+          value: "43200"
+        envFrom:
+        - secretRef:
+            name: object-store-server
+            optional: true
+        volumeMounts:
+        - name: flwr-state
+          mountPath: /app/.flwr
+        - name: model-cache
+          mountPath: /app/.cache
+        - name: persistent-logs
+          mountPath: /app/persistent-logs
+        - name: results-storage
+          mountPath: /app/results
+        - name: object-store-ca
+          mountPath: /var/run/object-store-ca
+          readOnly: true
+        resources:
+          requests:
+            cpu: "1"
+            memory: "8Gi"
+            ephemeral-storage: "2Gi"
+          limits:
+            cpu: "4"
+            memory: "28Gi"
+            ephemeral-storage: "10Gi"
+      volumes:
+      - name: flwr-state
+        emptyDir:
+          sizeLimit: 200Mi
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: superexec-serverapp-cache-pvc
+      - name: persistent-logs
+        persistentVolumeClaim:
+          claimName: superexec-serverapp-logs-pvc
+      - name: results-storage
+        persistentVolumeClaim:
+          claimName: superexec-serverapp-results-pvc-300g
+      - name: object-store-ca
+        secret:
+          secretName: object-store-direct-ca

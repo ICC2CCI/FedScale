@@ -1,0 +1,113 @@
+# Dedicated federation model store. Do not reuse the SwanLab chart's 20Gi S3.
+# Credentials and TLS material are supplied by Secrets created out-of-band.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: object-store-minio-pvc
+  namespace: flower-superlink
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: cbs
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: object-store-minio
+  namespace: flower-superlink
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: object-store-minio}
+  template:
+    metadata:
+      labels: {app: object-store-minio}
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+          # MinIO terminates TLS itself. The direct NodePort exposes only this
+          # S3 listener; the Console remains cluster-internal.
+          args: [server, --certs-dir, /certs, /data, --console-address, ":9001"]
+          envFrom:
+            - secretRef:
+                name: object-store-minio-root
+          ports:
+            - {name: s3, containerPort: 9000}
+            - {name: console, containerPort: 9001}
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tls, mountPath: /certs, readOnly: true}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: object-store-minio-pvc}
+        - name: tls
+          secret:
+            secretName: object-store-minio-tls
+            items:
+              - key: tls.crt
+                path: public.crt
+              - key: tls.key
+                path: private.key
+---
+# Direct cross-cluster data-plane entry. `externalTrafficPolicy: Local` retains
+# the source address so the NetworkPolicy below can enforce its IP allowlist.
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-store-minio-direct
+  namespace: flower-superlink
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector: {app: object-store-minio}
+  ports:
+    - name: s3-tls
+      port: 9000
+      targetPort: s3
+      nodePort: 30900
+---
+# This list contains the current public IPs of every schedulable client node.
+# Update it before adding/replacing client nodes. All center-namespace pods may
+# still use the internal ClusterIP service for bootstrap and aggregation.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: object-store-minio-direct-allowlist
+  namespace: flower-superlink
+spec:
+  podSelector:
+    matchLabels: {app: object-store-minio}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 9000}
+        - {protocol: TCP, port: 9001}
+    - from:
+        - ipBlock: {cidr: 81.71.31.45/32}
+        - ipBlock: {cidr: 119.91.149.148/32}
+        - ipBlock: {cidr: 175.178.245.173/32}
+        - ipBlock: {cidr: 43.142.65.37/32}
+        - ipBlock: {cidr: 124.220.5.185/32}
+        - ipBlock: {cidr: 101.35.91.232/32}
+      ports:
+        - {protocol: TCP, port: 9000}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-store-minio
+  namespace: flower-superlink
+spec:
+  type: ClusterIP
+  selector: {app: object-store-minio}
+  ports:
+    - {name: s3, port: 9000, targetPort: s3}
+    - {name: console, port: 9001, targetPort: console}

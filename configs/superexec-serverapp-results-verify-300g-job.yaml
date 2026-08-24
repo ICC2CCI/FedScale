@@ -1,0 +1,44 @@
+# One-off byte-for-byte validation before releasing the old 1TiB CBS disk.
+# Both claims are mounted read-only; this Job cannot alter either copy.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: superexec-serverapp-results-verify-300g
+  namespace: flower-superlink
+  labels:
+    app: superexec-results-migration
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: superexec-results-migration
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: ccr.ccs.tencentyun.com/czfflower/flwr_superexec:0.0.1
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              diff -qr --no-dereference /source /destination
+              echo "byte-for-byte-verification-complete"
+              du -sxB1 /source /destination
+              find /source -xdev -type f | wc -l
+              find /destination -xdev -type f | wc -l
+          volumeMounts:
+            - name: results-source
+              mountPath: /source
+              readOnly: true
+            - name: results-destination
+              mountPath: /destination
+              readOnly: true
+      volumes:
+        - name: results-source
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc
+        - name: results-destination
+          persistentVolumeClaim:
+            claimName: superexec-serverapp-results-pvc-300g

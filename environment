@@ -1,0 +1,3 @@
+export KUBECONFIG_CENTER=configs/config-center
+export KUBECONFIG_TKE_A=configs/config-tke-a
+export KUBECONFIG_TKE_B=configs/config-tke-b

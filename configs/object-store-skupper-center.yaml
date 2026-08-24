@@ -1,0 +1,10 @@
+apiVersion: skupper.io/v2alpha1
+kind: Connector
+metadata:
+  name: object-store-s3
+  namespace: flower-superlink
+spec:
+  port: 9000
+  routingKey: object-store-s3
+  selector: app=object-store-minio
+  type: tcp

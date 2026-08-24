@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flowertune-llm"
+version = "1.0.1"
+description = "FlowerTune LLM: Federated LLM Fine-tuning with Flower"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.28.0",
+    "flwr-datasets>=0.6.0",
+    "torch==2.8.0",
+    "trl==0.8.1",
+    "bitsandbytes==0.49.1",
+    "scipy==1.13.0",
+    "peft==0.6.2",
+    "fschat[model_worker,webui]==0.2.35",
+    "transformers==4.53.0",
+    "sentencepiece==0.2.1",
+    "omegaconf==2.3.0",
+    "hf_transfer==0.1.8",
+    "kubernetes>=28.1.0",
+    "boto3>=1.35.0,<2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "flowertune_llm.server_app:app"
+clientapp = "flowertune_llm.client_app:app"
+
+[tool.flwr.app.config]
+# Stable result directory name used by ServerApp. It must be declared here so
+# Flower accepts --run-config "experiment-id='...'" at submission time.
+experiment-id = ""
+dataset.name = "HuggingFaceH4/ultrachat_200k"
+# 0 keeps the full per-client partition. A positive value deterministically
+# samples at most this many records per client before train/eval splitting.
+dataset.max-train-samples = 0
+# Select the base model per run. Supported choices (cache must be warmed) are:
+#   Qwen/Qwen2.5-14B
+#   Qwen/Qwen3-8B
+#   openlm-research/open_llama_3b_v2
+model.name = "Qwen/Qwen2.5-14B"
+# lora exchanges only adapter tensors; full exchanges the complete FP16 model.
+model.finetuning-type = "lora"
+# 0 means unquantized FP16. Full fine-tuning requires 0; LoRA supports 0/4/8.
+model.quantization = 4
+model.gradient-checkpointing = true
+model.lora.peft-lora-r = 32
+model.lora.peft-lora-alpha = 64
+train.save-every-round = 5
+train.resume-peft-path = ""
+train.resume-round = 0
+train.learning-rate-max = 5e-5
+train.learning-rate-min = 1e-6
+train.seq-length = 512
+# Select per submission with --run-config "train.distributed-strategy='ddp'"
+# or --run-config "train.distributed-strategy='fsdp'".
+train.distributed-strategy = "fsdp"
+# DDP-only experimental baseline: keep model/gradients on GPU while AdamW
+# parameters and states live on CPU. This is intentionally slower but permits
+# a memory-constrained comparison against FSDP GPU sharding.
+train.ddp-cpu-offload = false
+# First-round full tuning can use an identical, preflight-verified base snapshot
+# already cached at every client instead of sending 6.54GB from the server.
+train.full-local-initialization = false
+# Full FP16 model states are too large for the current cross-cloud link.  The
+# Top-K is the legacy private-index baseline.  fedscale-int8 uses a public
+# canonical block mask and shared INT8 block scales instead.
+train.full-update-compression = "none"
+# Select where dense full-model checkpoint bytes travel. ``flower-rpc`` keeps
+# the legacy behavior; ``object-store`` sends only URI metadata through Flower.
+train.full-update-transport = "flower-rpc"
+# Empty derives s3://$S3_BUCKET/$experiment-id/round-0/global.pt. Set this only
+# when resuming from a deliberately seeded object with another location.
+train.object-store-initial-global-uri = ""
+train.full-update-topk-ratio = 0.001
+# FedScale v1 public canonical-block configuration.  The ServerApp signs the
+# per-round layout and rotating block mask into the RoundPlan sent to every ICC.
+train.fedscale-block-size = 1048576
+train.fedscale-mask-ratio = 0.001
+# Keep model evaluation outside the blocking federated training round by default.
+train.evaluate-after-fit = false
+train.num-eval-samples = 50
+# Bound a single server-side federated message wait per run; deployments can
+# still provide FEDERATED_ROUND_TIMEOUT_SECONDS as the fallback default.
+train.federated-round-timeout-seconds = 3600
+train.training-arguments.output-dir = "/app/output"
+train.training-arguments.learning-rate = ""
+train.training-arguments.per-device-train-batch-size = 4
+train.training-arguments.gradient-accumulation-steps = 12
+train.training-arguments.logging-steps = 10
+train.training-arguments.num-train-epochs = 3
+train.training-arguments.max-steps = 50
+train.training-arguments.save-steps = 1000
+train.training-arguments.save-total-limit = 10
+train.training-arguments.gradient-checkpointing = true
+train.training-arguments.lr-scheduler-type = "constant"
+strategy.fraction-train = 0.1
+strategy.fraction-evaluate = 0.0
+strategy.min-fit-clients = 2
+strategy.min-available-clients = 2
+num-server-rounds = 50
+
+[tool.flower.federation.options]
+num-supernodes = 2

@@ -1,0 +1,67 @@
+# clientapp-a-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clientapp-a
+  namespace: flower-supernode-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clientapp-a
+  template:
+    metadata:
+      labels:
+        app: clientapp-a
+    spec:
+      containers:
+      - name: clientapp
+        image: ccr.ccs.tencentyun.com/czfflower/llama_3b_v2-client
+        command: ["flwr-clientapp"]
+        args:
+          - "--supernode"
+          - "supernode-a-svc:9094"   # SuperNode 的 ClusterIP Service
+          - "--app"
+          - "flowertune_llm.client_app:app"
+        env:
+        # HuggingFace Token（如模型需要登录）
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-credentials
+              key: token
+              optional: true
+        # 强制使用 GPU 0
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: HF_HOME
+          value: "/app/.cache/huggingface"
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "32Gi"
+            cpu: "8"
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "24Gi"
+            cpu: "4"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/.cache
+        - name: outputs
+          mountPath: /app/outputs
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: flowertune-cache-pvc    # 缓存模型权重，避免每轮重复下载
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: flowertune-output-pvc   # 持久化 checkpoint
+      nodeSelector:
+        accelerator: nvidia-gpu
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      # 确保 ClientApp Pod 和 SuperNode Pod 在同一节点或至少同一集群
+      # （同 namespace 即可，通过 ClusterIP Service 通信）

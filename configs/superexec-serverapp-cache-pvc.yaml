@@ -1,0 +1,13 @@
+# 中心端模型缓存。ServerApp 单副本，RWO CBS 盘可在 Pod 重启后保留下载结果。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: superexec-serverapp-cache-pvc
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: cbs

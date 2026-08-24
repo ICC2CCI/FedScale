@@ -1,0 +1,14 @@
+# SuperLink 命名空间的 HuggingFace 缓存 PVC
+# 替代 emptyDir 避免占用节点 ephemeral-storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flowertune-cache-pvc-superlink
+  namespace: flower-superlink
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: cfs

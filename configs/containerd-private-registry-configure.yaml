@@ -1,0 +1,42 @@
+# One-shot configuration for the current centre node. It permits the node's
+# containerd runtime to pull only the in-cluster Registry ClusterIP over HTTP.
+# Containerd restart temporarily restarts Pods on this node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: containerd-private-registry-configure
+  namespace: flower-superlink
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      nodeName: 10.3.0.38
+      hostPID: true
+      restartPolicy: Never
+      containers:
+        - name: configure-containerd
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -ec
+            - |
+              cfg=/host/etc/containerd/config.toml
+              endpoint='172.16.18.27:5000'
+              if ! grep -Fq "registry.mirrors.\"${endpoint}\"" "${cfg}"; then
+                cp "${cfg}" "${cfg}.flower-registry-backup"
+                printf '\n[plugins."io.containerd.grpc.v1.cri".registry.mirrors."%s"]\n  endpoint = ["http://%s"]\n' "${endpoint}" "${endpoint}" >> "${cfg}"
+              fi
+              chroot /host /bin/systemctl restart containerd
+              sleep 15
+              chroot /host /bin/systemctl is-active containerd
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

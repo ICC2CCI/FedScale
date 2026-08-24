@@ -1,0 +1,18 @@
+apiVersion: cloud.tencent.com/v1alpha1
+kind: TkeServiceConfig
+metadata:
+  name: skupper-grant-server-lb-health
+  namespace: skupper
+spec:
+  loadBalancer:
+    l4Listeners:
+      - protocol: TCP
+        port: 9090
+        deregisterTargetRst: true
+        healthCheck:
+          enable: true
+          checkType: TCP
+          intervalTime: 10
+          healthNum: 2
+          unHealthNum: 3
+          timeout: 5

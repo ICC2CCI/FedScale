@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: object-store-seed-smoke
+  namespace: flower-superlink
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-aggregation-mvp-20260818
+          command: ["python", "-m", "flowertune_llm.seed_global_model"]
+          args:
+            - --model
+            - openlm-research/open_llama_3b_v2
+            - --experiment-id
+            - object-store-smoke-20260818
+            - --round
+            - "0"
+            - --output-dir
+            - /scratch
+          envFrom:
+            - secretRef:
+                name: object-store-aggregator
+          resources:
+            requests: {cpu: "2", memory: 8Gi, ephemeral-storage: 20Gi}
+            limits: {cpu: "6", memory: 26Gi, ephemeral-storage: 40Gi}
+          volumeMounts:
+            - {name: cache, mountPath: /app/.cache}
+            - {name: scratch, mountPath: /scratch}
+            - {name: object-store-ca, mountPath: /var/run/object-store-ca, readOnly: true}
+      volumes:
+        - name: cache
+          persistentVolumeClaim: {claimName: superexec-serverapp-cache-pvc}
+        - name: scratch
+          emptyDir: {sizeLimit: 40Gi}
+        - name: object-store-ca
+          secret:
+            secretName: object-store-direct-ca

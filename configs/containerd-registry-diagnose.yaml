@@ -1,0 +1,29 @@
+# One-shot, read-only host-runtime inspection.  This does not modify the node.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: containerd-registry-diagnose
+  namespace: flower-superlink
+spec:
+  nodeName: 10.3.0.38
+  restartPolicy: Never
+  containers:
+    - name: diagnose
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - >-
+          echo '--- config.toml ---';
+          sed -n '1,260p' /host-etc-containerd/config.toml 2>/dev/null || true;
+          echo '--- certs.d ---';
+          find /host-etc-containerd/certs.d -maxdepth 3 -type f -print -exec sed -n '1,160p' {} \; 2>/dev/null || true
+      volumeMounts:
+        - name: containerd-etc
+          mountPath: /host-etc-containerd
+          readOnly: true
+  volumes:
+    - name: containerd-etc
+      hostPath:
+        path: /etc/containerd
+        type: Directory

@@ -1,0 +1,59 @@
+# 仅覆盖中心端的日志启动包装与新增日志卷，保留线上 Deployment 的其他字段。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superexec-serverapp
+  namespace: flower-superlink
+spec:
+  template:
+    spec:
+      containers:
+      - name: superexec-serverapp
+        command:
+        - /usr/bin/bash
+        - -c
+        args:
+        - |
+          set -euo pipefail
+          log_dir=/app/persistent-logs
+          mkdir -p "$log_dir"
+          log_file="$log_dir/serverapp-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ).log"
+          exec > >(tee -a "$log_file") 2>&1
+          echo "Persistent log file: $log_file"
+          child_pid=""
+          on_signal() {
+            signal="$1"
+            echo "$(date -u +%FT%TZ) received ${signal}; Kubernetes is terminating this SuperExec"
+            if [ -n "$child_pid" ]; then
+              kill -TERM "$child_pid" 2>/dev/null || true
+              wait "$child_pid" || true
+            fi
+            echo "$(date -u +%FT%TZ) SuperExec stopped because of ${signal}"
+            exit 0
+          }
+          trap 'on_signal TERM' TERM
+          trap 'on_signal INT' INT
+          flower-superexec --insecure \
+            --appio-api-address superlink-server-svc:9091 \
+            --plugin-type serverapp &
+          child_pid=$!
+          wait "$child_pid"
+          status=$?
+          echo "$(date -u +%FT%TZ) SuperExec exited with status ${status}"
+          exit "$status"
+        terminationMessagePolicy: FallbackToLogsOnError
+        env:
+        - name: FEDERATED_ROUND_TIMEOUT_SECONDS
+          value: "16200"
+        volumeMounts:
+        - name: persistent-logs
+          mountPath: /app/persistent-logs
+        - name: results-storage
+          mountPath: /app/results
+      volumes:
+      - name: persistent-logs
+        persistentVolumeClaim:
+          claimName: superexec-serverapp-logs-pvc
+      - name: results-storage
+        persistentVolumeClaim:
+          claimName: superexec-serverapp-results-pvc-300g

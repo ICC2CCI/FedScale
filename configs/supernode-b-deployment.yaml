@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supernode-b
+  namespace: flower-supernode-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: supernode-b
+  template:
+    metadata:
+      labels:
+        app: supernode-b
+    spec:
+      # Ensures mounted volumes are writable by the pod's non-root user on OpenShift
+      #securityContext:
+      #  runAsNonRoot: true
+      containers:
+      - name: supernode
+        image: docker.1ms.run/flwr/supernode:1.28.0
+        args:
+          - "--insecure"
+          - "--rest"
+          - "--superlink"
+          - "http://fleet-api:9092" # REST Fleet API via Skupper listener DNS
+          - "--clientappio-api-address"
+          - "0.0.0.0:9094"
+          - "--node-config"
+          - "partition-id=1 num-partitions=2"
+          - "--isolation"
+          - "process"
+        env:
+          # Keep the SuperNode heartbeat thread alive across transient REST
+          # disconnects and advertise a longer WAN heartbeat grace period.
+          - name: PYTHONPATH
+            value: "/app/flower-overrides"
+          # One upload at a time prevents two large object RPCs from starving
+          # the single cross-cloud Skupper path and its heartbeat traffic.
+          - name: FLWR_PRIVATE_MAX_CONCURRENT_OBJ_PUSHES
+            value: "1"
+        ports:
+        - containerPort: 9094
+        volumeMounts:
+        - name: heartbeat-module
+          mountPath: /python/venv/lib/python3.13/site-packages/flwr/supercore/heartbeat.py
+          subPath: heartbeat.py
+          readOnly: true
+        - name: heartbeat-bootstrap
+          mountPath: /app/flower-overrides
+          readOnly: true
+        - name: cache-volume
+          mountPath: /app/.cache
+        - name: tmp-volume
+          mountPath: /var/tmp
+        - name: fab-volume
+          mountPath: /app/.flwr
+        - name: config-volume
+          mountPath: /app/.config
+        # ClientApp writes the final global state here and reads the evaluator
+        # result back from the same RWX PVC mounted by the evaluation Job.
+        - name: outputs-volume
+          mountPath: /app/outputs
+      volumes:
+      - name: heartbeat-module
+        configMap:
+          name: flower-heartbeat-module
+      - name: heartbeat-bootstrap
+        configMap:
+          name: flower-heartbeat-bootstrap
+      - name: cache-volume
+        emptyDir:
+          sizeLimit: 50Mi
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: 50Mi
+      - name: fab-volume
+        emptyDir:
+          sizeLimit: 50Mi
+      - name: config-volume
+        emptyDir:
+          sizeLimit: 50Mi
+      - name: outputs-volume
+        persistentVolumeClaim:
+          claimName: flowertune-output-pvc

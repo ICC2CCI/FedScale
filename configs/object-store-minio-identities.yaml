@@ -1,0 +1,70 @@
+# Create the least-privilege MinIO identities required by the object-store
+# federation transport. The credential Secret is generated outside Git and is
+# intentionally not the MinIO root credential.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: object-store-minio-policies
+  namespace: flower-superlink
+data:
+  client-a.json: |
+    {"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":["s3:GetObject","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::fl-models","arn:aws:s3:::fl-models/*/round-*/global.pt"]},
+      {"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"arn:aws:s3:::fl-models/*/round-*/client-a.pt"}
+    ]}
+  client-b.json: |
+    {"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":["s3:GetObject","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::fl-models","arn:aws:s3:::fl-models/*/round-*/global.pt"]},
+      {"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"arn:aws:s3:::fl-models/*/round-*/client-b.pt"}
+    ]}
+  server.json: |
+    {"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":["s3:GetObject","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::fl-models","arn:aws:s3:::fl-models/*/round-*/global.pt"]},
+      {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::fl-models/*/round-*/round_state.json"}
+    ]}
+  aggregator.json: |
+    {"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":["s3:GetObject","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::fl-models","arn:aws:s3:::fl-models/*/round-*/client-a.pt","arn:aws:s3:::fl-models/*/round-*/client-b.pt"]},
+      {"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::fl-models/*/round-*/global.pt","arn:aws:s3:::fl-models/*/round-*/round_state.json"]}
+    ]}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: object-store-minio-identities
+  namespace: flower-superlink
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mc alias set local http://object-store-minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+              ensure_policy() {
+                mc admin policy create local "$1" "/policies/$1.json" 2>/dev/null || mc admin policy update local "$1" "/policies/$1.json"
+              }
+              ensure_user() {
+                mc admin user add local "$2" "$3"
+                mc admin policy attach local "$1" --user "$2"
+              }
+              ensure_policy client-a
+              ensure_policy client-b
+              ensure_policy server
+              ensure_policy aggregator
+              ensure_user client-a "$CLIENT_A_ACCESS_KEY" "$CLIENT_A_SECRET_KEY"
+              ensure_user client-b "$CLIENT_B_ACCESS_KEY" "$CLIENT_B_SECRET_KEY"
+              ensure_user server "$SERVER_ACCESS_KEY" "$SERVER_SECRET_KEY"
+              ensure_user aggregator "$AGGREGATOR_ACCESS_KEY" "$AGGREGATOR_SECRET_KEY"
+          envFrom:
+            - secretRef: {name: object-store-minio-root}
+            - secretRef: {name: object-store-minio-identities}
+          volumeMounts:
+            - {name: policies, mountPath: /policies, readOnly: true}
+      volumes:
+        - name: policies
+          configMap: {name: object-store-minio-policies}

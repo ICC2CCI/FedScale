@@ -1,0 +1,21 @@
+# One-shot validation that the node runtime (not merely a Pod) can pull from
+# the in-cluster Registry.  Apply only after the image has been pushed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flower-image-registry-pull-test
+  namespace: flower-superlink
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify-rest-image
+          image: 172.16.18.27:5000/flwr_superlink_rest:1.28.0-1
+          imagePullPolicy: Always
+          command:
+            - python
+            - -c
+            - "import starlette, uvicorn; print('registry-pull-ok')"

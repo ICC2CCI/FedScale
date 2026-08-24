@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superlink
+  namespace: flower-superlink # The project name from above
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superlink
+  template:
+    metadata:
+      labels:
+        app: superlink
+    spec:
+      # Ensures mounted volumes are writable by the pod's non-root user on OpenShift
+      #securityContext:
+      #  runAsNonRoot: true
+      containers:
+        - name: superlink
+          # Served by the centre cluster's persistent private Registry.
+          image: 172.16.18.27:5000/flwr_superlink_rest:1.28.0-1
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--insecure"
+            - "--fleet-api-type"
+            - "rest"
+            - "--fleet-api-address"
+            - "0.0.0.0:9092"
+            - "--isolation"
+            - "process"
+          ports: # which ports to expose/available
+            - containerPort: 9091
+              name: superexec
+            - containerPort: 9092
+              name: fleet
+            - containerPort: 9093
+              name: control
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /app/.cache
+            - name: tmp-volume
+              mountPath: /var/tmp
+            - name: fab-volume
+              mountPath: /app/.flwr
+            - name: config-volume
+              mountPath: /app/.config
+      volumes:
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 50Mi
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: 50Mi
+        - name: fab-volume
+          emptyDir:
+            sizeLimit: 50Mi
+        - name: config-volume
+          emptyDir:
+            sizeLimit: 50Mi

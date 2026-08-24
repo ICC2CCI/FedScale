@@ -1,0 +1,82 @@
+# 诊断评测：A 侧第 25 轮客户端 LoRA，不代表 FedAvg 全局模型。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openllama-fsdp-local-round25-p0-eval
+  namespace: flower-supernode-a
+  labels:
+    app: openllama-fsdp-local-round25-eval
+    scope: client-local-diagnostic
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: openllama-fsdp-local-round25-eval
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node.tke.cloud.tencent.com/accelerator-type: gpu
+      containers:
+      - name: evaluator
+        image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_client_train:0.0.19
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-lc"]
+        args:
+        - >-
+          set -euo pipefail;
+          adapter=/app/outputs/evaluations/openllama-fsdp-local-round25-p0;
+          mkdir -p "$adapter";
+          cp /app/outputs/train-round-25-0-1784357124/model_weights.pt "$adapter/adapter_model.bin";
+          cp /app/outputs/checkpoint-1/adapter_config.json "$adapter/adapter_config.json";
+          python -m pip install --disable-pip-version-check --no-cache-dir rouge-score==0.1.2 bert-score==0.3.13 &&
+          python /app/eval/evaluate_alpaca_sft.py
+          --adapter-path "$adapter"
+          --base-model openlm-research/open_llama_3b_v2
+          --dataset vicgalle/alpaca-gpt4
+          --num-partitions 2
+          --eval-split-ratio 0.1
+          --split-seed 42
+          --max-samples 100
+          --max-length 512
+          --max-new-tokens 128
+          --bertscore-model /app/.cache/huggingface/models--roberta-large/snapshots/722cf37b1afa9454edce342e7895e588b6ff1d59
+          --bertscore-layers 17
+          --output-dir /app/outputs/evaluations/openllama-fsdp-local-round25-p0-eval
+          --local-files-only
+        env:
+        - name: HF_HOME
+          value: /app/.cache/huggingface
+        - name: HF_DATASETS_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+        resources:
+          requests:
+            cpu: "4"
+            memory: 24Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "6"
+            memory: 32Gi
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: eval-script
+          mountPath: /app/eval
+          readOnly: true
+        - name: cache-volume
+          mountPath: /app/.cache
+        - name: outputs-volume
+          mountPath: /app/outputs
+      volumes:
+      - name: eval-script
+        configMap:
+          name: openllama-sft-eval-script-20260720-v2
+      - name: cache-volume
+        persistentVolumeClaim:
+          claimName: flowertune-cache-pvc
+      - name: outputs-volume
+        persistentVolumeClaim:
+          claimName: flowertune-output-pvc

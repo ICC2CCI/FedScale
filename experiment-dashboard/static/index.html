@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="联邦学习 FSDP 与 DDP 实验结果对比看板" />
+    <title>联邦训练实验对比</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="联邦训练实验对比首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" role="img">
+            <path d="M8 13.5 20 6l12 7.5v13L20 34 8 26.5z" />
+            <path d="m8 13.5 12 7.2 12-7.2M20 20.7V34" />
+          </svg>
+        </span>
+        <span>
+          <strong>Federated Lab</strong>
+          <small>训练策略实验台</small>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div class="live-state"><span></span> RESULT VOLUME CONNECTED</div>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换浅色和深色模式">
+          <span class="theme-icon theme-icon-light" aria-hidden="true">☼</span>
+          <span class="theme-icon theme-icon-dark" aria-hidden="true">☾</span>
+          <span id="theme-label">浅色模式</span>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">EXPERIMENT COMPARISON / 01</p>
+          <h1>让每一次训练差异<br /><em>都有数据可循</em></h1>
+          <p class="hero-copy">从中心端结果卷读取真实实验记录，统一查看正式对照参数、关键路径耗时与策略胜负。</p>
+        </div>
+        <div class="hero-orbit" aria-hidden="true">
+          <div class="orbit orbit-outer"></div>
+          <div class="orbit orbit-inner"></div>
+          <div class="orbit-core">FL</div>
+          <span class="orbit-node node-a">A</span>
+          <span class="orbit-node node-b">B</span>
+          <span class="orbit-node node-c">Σ</span>
+        </div>
+      </section>
+
+      <section class="selector-panel" aria-labelledby="selector-title">
+        <div class="section-heading compact">
+          <div>
+            <span class="section-index">01</span>
+            <div>
+              <p class="eyebrow" id="selector-title">SELECT RUNS</p>
+              <h2>选择实验对照或日志对象</h2>
+            </div>
+          </div>
+          <div class="selector-actions">
+            <div class="source-switch" id="source-switch" aria-label="选择实验数据源">
+              <button class="active" data-source="center" type="button">
+                <span></span>中心结果
+              </button>
+              <button data-source="cloud" type="button">
+                <span></span>TKE 云端
+              </button>
+            </div>
+            <button class="ghost-button" id="refresh-button" type="button" title="刷新实验列表">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7" /></svg>
+              刷新结果
+            </button>
+          </div>
+        </div>
+
+        <div class="selectors">
+          <label class="experiment-select select-left">
+            <span class="select-kicker"><i></i> 实验 A</span>
+            <span class="select-strategy" id="left-strategy">FSDP</span>
+            <select id="left-select" aria-label="选择左侧实验"></select>
+            <small id="left-meta">等待实验数据</small>
+          </label>
+
+          <button class="swap-button" id="swap-button" type="button" title="交换两个实验" aria-label="交换两个实验">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 3-3m-3 3 3 3M17 17l-3 3m3-3-3-3M8 7h9a3 3 0 0 1 3 3v1M16 17H7a3 3 0 0 1-3-3v-1" /></svg>
+          </button>
+
+          <label class="experiment-select select-right">
+            <span class="select-kicker"><i></i> 实验 B</span>
+            <span class="select-strategy" id="right-strategy">DDP</span>
+            <select id="right-select" aria-label="选择右侧实验"></select>
+            <small id="right-meta">等待实验数据</small>
+          </label>
+        </div>
+      </section>
+
+      <section class="content-section log-section" id="log-section" aria-labelledby="log-title">
+        <div class="section-heading compact">
+          <div>
+            <span class="section-index">LIVE</span>
+            <div>
+              <p class="eyebrow">LIVE RUN OBSERVATION</p>
+              <h2 id="log-title">运行日志与实时指标</h2>
+            </div>
+          </div>
+          <p class="section-note log-scope-note">仅用于查看运行状态和逐轮事件，不参与正式实验对照结论。</p>
+          <div class="log-actions">
+            <label class="auto-refresh"><input id="log-auto-refresh" type="checkbox" checked /> 每 10 秒刷新</label>
+            <button class="ghost-button" id="log-refresh-button" type="button">刷新日志</button>
+          </div>
+        </div>
+        <div class="log-toolbar">
+          <label>
+            <span>EXPERIMENT ID</span>
+            <select id="log-experiment-select" aria-label="选择要查看日志的实验"></select>
+          </label>
+          <p id="log-meta">选择实验后将读取中心端的运行状态与逐轮聚合记录。</p>
+        </div>
+        <div class="log-stream" id="log-stream" aria-live="polite">
+          <p class="log-empty">正在加载实验日志…</p>
+        </div>
+      </section>
+
+      <section class="content-section control-section" id="control-section" aria-labelledby="control-title">
+        <div class="section-heading compact">
+          <div>
+            <span class="section-index">CTRL</span>
+            <div>
+              <p class="eyebrow">SUPERVISOR CONTROL</p>
+              <h2 id="control-title">实验监督器控制台</h2>
+            </div>
+          </div>
+          <p class="section-note">控制的是监督器调度：启动会创建新的监督器 Job，暂停只暂停后续启动，停止会请求终止当前 Flower Run。</p>
+        </div>
+        <div class="control-layout">
+          <article class="control-status" aria-live="polite">
+            <div class="control-status-line"><span class="status-dot" id="supervisor-dot"></span><strong id="supervisor-phase">正在读取监督器状态</strong></div>
+            <p id="supervisor-message">—</p>
+            <dl class="control-facts">
+              <div><dt>当前实验</dt><dd id="supervisor-experiment">—</dd></div>
+              <div><dt>Run ID</dt><dd id="supervisor-run">—</dd></div>
+              <div><dt>监督器 Job</dt><dd id="supervisor-job">—</dd></div>
+              <div><dt>最后心跳</dt><dd id="supervisor-heartbeat">—</dd></div>
+            </dl>
+          </article>
+          <form class="control-form" id="supervisor-form">
+            <div class="control-subheading control-wide">
+              <strong>下一次实验配置</strong>
+              <span>保存后由监督器在下一次提交 Flower Run 时使用；当前正在运行的 Run 不会被改写。</span>
+            </div>
+            <label>
+              <span>分布式训练模式</span>
+              <select id="control-strategy">
+                <option value="fsdp">FSDP：分片数据并行</option>
+                <option value="fedscale">FedScale：FSDP + 稀疏更新</option>
+                <option value="ddp">DDP：数据并行</option>
+              </select>
+            </label>
+            <label>
+              <span>联邦训练轮数</span>
+              <input id="control-rounds" type="number" min="1" max="1000" step="1" value="10" />
+            </label>
+            <label>
+              <span>微调方式</span>
+              <select id="control-finetuning-type">
+                <option value="lora">LoRA 参数高效微调</option>
+                <option value="full">全参数微调</option>
+              </select>
+            </label>
+            <label class="control-wide">
+              <span>基座模型（受训模型）</span>
+              <input id="control-model" type="text" list="model-options" maxlength="255" placeholder="组织名/模型名，例如 Qwen/Qwen2.5-7B" />
+            </label>
+            <label class="control-wide">
+              <span>训练数据集</span>
+              <input id="control-dataset" type="text" list="dataset-options" maxlength="255" placeholder="组织名/数据集名，例如 HuggingFaceH4/ultrachat_200k" />
+            </label>
+            <datalist id="model-options">
+              <option value="Qwen/Qwen2.5-7B"></option>
+              <option value="Qwen/Qwen2.5-3B"></option>
+              <option value="openlm-research/open_llama_3b_v2"></option>
+            </datalist>
+            <datalist id="dataset-options">
+              <option value="HuggingFaceH4/ultrachat_200k"></option>
+              <option value="vicgalle/alpaca-gpt4"></option>
+            </datalist>
+            <div class="control-subheading control-wide control-subheading-secondary">
+              <strong>监督器运行参数</strong>
+              <span>这些参数只影响监督器的轮询、卡住判定和失败重试。</span>
+            </div>
+            <label><span>轮询间隔（秒）</span><input id="control-poll" type="number" min="5" max="3600" step="1" value="120" /></label>
+            <label><span>卡住判定阈值（秒）</span><input id="control-stall" type="number" min="60" max="86400" step="60" value="7200" /></label>
+            <label><span>失败最大重试次数</span><input id="control-restarts" type="number" min="0" max="10" step="1" value="3" /></label>
+            <label class="control-wide"><span>实验配置标识（可选）</span><input id="control-matrix" type="text" maxlength="80" placeholder="沿用当前实验配置标识" /></label>
+            <div class="control-actions control-wide">
+              <button class="primary-button" type="submit">保存实验配置</button>
+              <button class="ghost-button" type="button" data-supervisor-action="start">启动监督器</button>
+              <button class="ghost-button" type="button" data-supervisor-action="resume">恢复调度</button>
+              <button class="ghost-button warning-button" type="button" data-supervisor-action="pause">暂停调度</button>
+              <button class="ghost-button danger-button" type="button" data-supervisor-action="stop">停止当前 Run</button>
+            </div>
+            <p class="control-feedback control-wide" id="control-feedback" role="status"></p>
+          </form>
+        </div>
+      </section>
+
+      <div id="loading" class="loading-state" role="status">
+        <span></span><span></span><span></span>
+        <p>正在读取实验结果</p>
+      </div>
+
+      <div id="error" class="error-state" role="alert" hidden>
+        <strong>结果加载失败</strong>
+        <p id="error-message"></p>
+      </div>
+
+      <div id="dashboard" hidden>
+        <section class="comparison-gate" aria-labelledby="comparison-scope-title">
+          <div>
+            <p class="eyebrow" id="comparison-scope-eyebrow">COMPLETED EXPERIMENT COMPARISON</p>
+            <h2 id="comparison-scope-title">已完成实验正式对照</h2>
+            <p id="comparison-scope-status">只有两侧实验都完成并写入汇总后，才会展示对照指标。</p>
+          </div>
+          <p class="comparison-not-ready" id="comparison-not-ready" hidden>当前选择包含运行中或缺少汇总的实验；请在上方日志区查看实时状态，完成后再进行正式对照。</p>
+        </section>
+        <div id="comparison-body">
+        <section class="verdict-section" aria-labelledby="verdict-title">
+          <div class="verdict-card">
+            <div class="verdict-copy">
+              <p class="eyebrow">CRITICAL PATH VERDICT</p>
+              <h2 id="verdict-title">—</h2>
+              <p id="verdict-description">—</p>
+              <div class="verdict-tags">
+                <span>同负载</span><span>同硬件</span><span>单轮实测</span>
+              </div>
+            </div>
+            <div class="verdict-number">
+              <span id="winner-strategy">—</span>
+              <strong id="winner-percent">—</strong>
+              <small>关键路径提速</small>
+            </div>
+          </div>
+
+          <div class="metric-highlights">
+            <article>
+              <span>关键路径差值</span>
+              <strong id="critical-delta">—</strong>
+              <small>秒</small>
+            </article>
+            <article>
+              <span>训练阶段差值</span>
+              <strong id="training-delta">—</strong>
+              <small>秒</small>
+            </article>
+            <article>
+              <span>参数一致项</span>
+              <strong id="parameter-match">—</strong>
+              <small>工作负载参数</small>
+            </article>
+          </div>
+        </section>
+
+        <section class="content-section" aria-labelledby="parameter-title">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">02</span>
+              <div>
+                <p class="eyebrow">CONTROL VARIABLES</p>
+                <h2 id="parameter-title">正式对照参数</h2>
+              </div>
+            </div>
+            <div class="legend"><span class="same-dot"></span>一致 <span class="different-dot"></span>策略差异</div>
+          </div>
+
+          <div class="table-shell">
+            <table class="comparison-table">
+              <thead>
+                <tr>
+                  <th>参数</th>
+                  <th id="parameter-left-heading">实验 A</th>
+                  <th id="parameter-right-heading">实验 B</th>
+                  <th>一致性</th>
+                </tr>
+              </thead>
+              <tbody id="parameter-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="content-section results-section" aria-labelledby="result-title">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">03</span>
+              <div>
+                <p class="eyebrow">MEASURED PERFORMANCE</p>
+                <h2 id="result-title">实测结果</h2>
+              </div>
+            </div>
+            <p class="section-note">条形越短表示耗时越少；端到端 Run 可能包含集群排队，仅作上下文展示。</p>
+          </div>
+
+          <div class="metric-grid" id="metric-grid"></div>
+        </section>
+
+        <section class="content-section federated-timing-section" id="federated-timing-section" aria-labelledby="federated-timing-title" hidden>
+          <div class="section-heading">
+            <div>
+              <span class="section-index">04</span>
+              <div>
+                <p class="eyebrow">ROUND TIMELINE</p>
+                <h2 id="federated-timing-title">逐轮联邦时间链路</h2>
+              </div>
+            </div>
+            <p class="section-note">把 FSDP 内部训练、客户端整轮、Top-K 压缩、中心联邦周期和 checkpoint 间隔按联邦轮次对齐展示。</p>
+          </div>
+          <div class="timing-columns" id="federated-timing-columns"></div>
+        </section>
+
+        <section class="content-section quality-section" id="quality-section" aria-labelledby="quality-title">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">05</span>
+              <div>
+                <p class="eyebrow">MODEL QUALITY EVALUATION</p>
+                <h2 id="quality-title">正式模型质量评测</h2>
+              </div>
+            </div>
+            <p class="section-note" id="quality-status">两个全局 checkpoint 使用相同 held-out 样本与确定性生成参数；Loss/PPL/空回答越低越好，ROUGE-L/BERTScore 越高越好。</p>
+          </div>
+          <div class="metric-grid" id="quality-grid"></div>
+        </section>
+
+        <section class="content-section aggregation-section" id="aggregation-section" aria-labelledby="aggregation-title" hidden>
+          <div class="section-heading">
+            <div>
+              <span class="section-index">06</span>
+              <div>
+                <p class="eyebrow">AGGREGATION SERVER OBSERVABILITY</p>
+                <h2 id="aggregation-title">联邦聚合端：集群内训练与资源</h2>
+              </div>
+            </div>
+            <p class="section-note">聚合端统一汇集同一联邦轮中 TKE-A/B 已完成的训练结果；仅展示集群内训练与资源使用，不将跨中心更新耗时混入其中。</p>
+          </div>
+          <div class="aggregation-meta" id="aggregation-meta"></div>
+          <p class="aggregation-server-timing" id="aggregation-server-timing"></p>
+          <h3 class="subsection-title">集群内训练性能</h3>
+          <div class="metric-grid" id="aggregation-performance-grid"></div>
+          <h3 class="subsection-title">集群内资源使用</h3>
+          <div class="metric-grid" id="aggregation-resource-grid"></div>
+          <h3 class="subsection-title">网络流量与 NCCL 开销</h3>
+          <div class="metric-grid" id="aggregation-network-grid"></div>
+          <h3 class="subsection-title">FSDP 状态导出开销</h3>
+          <div class="metric-grid" id="aggregation-state-export-grid"></div>
+          <p class="deferred-note" id="aggregation-deferred-note"></p>
+        </section>
+
+        <section class="content-section cloud-section" id="cloud-section" aria-labelledby="cloud-title" hidden>
+          <div class="section-heading">
+            <div>
+              <span class="section-index">07</span>
+              <div>
+                <p class="eyebrow">TKE CLIENT DETAILS</p>
+                <h2 id="cloud-title">云端客户端原始结果</h2>
+              </div>
+            </div>
+            <p class="section-note">供聚合端观测明细追溯：直接读取 TKE A/B 的 metrics.json 与 metrics_detailed.json。</p>
+          </div>
+          <div class="cloud-columns">
+            <article>
+              <div class="cloud-column-title"><i class="left-dot"></i><span id="cloud-left-title">实验 A</span></div>
+              <div class="cloud-client-list" id="cloud-left-clients"></div>
+            </article>
+            <article>
+              <div class="cloud-column-title"><i class="right-dot"></i><span id="cloud-right-title">实验 B</span></div>
+              <div class="cloud-client-list" id="cloud-right-clients"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="run-details" aria-label="实验运行信息">
+          <article>
+            <span class="detail-accent accent-left"></span>
+            <div><small>实验 A / RUN ID</small><strong id="left-run-id">—</strong><p id="left-timestamp">—</p></div>
+          </article>
+          <article>
+            <span class="detail-accent accent-right"></span>
+            <div><small>实验 B / RUN ID</small><strong id="right-run-id">—</strong><p id="right-timestamp">—</p></div>
+          </article>
+        </section>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <span>FEDERATED LAB · RESULT OBSERVABILITY</span>
+      <span>数据源：Flower ServerApp results volume</span>
+    </footer>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

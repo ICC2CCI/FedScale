@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: experiment-dashboard
+  namespace: flower-supernode-a
+  labels:
+    app: experiment-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: experiment-dashboard
+  template:
+    metadata:
+      labels:
+        app: experiment-dashboard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
+      imagePullSecrets:
+        - name: ccr-registry-auth
+      containers:
+        - name: dashboard
+          image: ccr.ccs.tencentyun.com/flwr_pcl/flower-experiment-dashboard:control-console-v3
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # The TKE-hosted dashboard uses cloud mode and reads center/TKE
+            # artifacts through the mounted kubeconfigs. It does not need a
+            # local copy of the center PVC.
+            - name: RESULTS_ROOT
+              value: /tmp/results
+            - name: CENTER_KUBECONFIG
+              value: /app/kubeconfigs/config-center
+            - name: TKE_A_KUBECONFIG
+              value: /app/kubeconfigs/config-tke-a
+            - name: TKE_B_KUBECONFIG
+              value: /app/kubeconfigs/config-tke-b
+            - name: DASHBOARD_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: experiment-dashboard-auth
+                  key: username
+            - name: DASHBOARD_AUTH_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: experiment-dashboard-auth
+                  key: password-hash
+            - name: SWANLAB_ENABLED
+              value: "false"
+            - name: CLOUD_EXEC_TIMEOUT_SECONDS
+              value: "20"
+            - name: CLOUD_EXEC_RETRIES
+              value: "2"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cloud-kubeconfigs
+              mountPath: /app/kubeconfigs
+              readOnly: true
+            - name: runtime-tmp
+              mountPath: /tmp
+      volumes:
+        - name: cloud-kubeconfigs
+          secret:
+            # Create this Secret in flower-supernode-a from the three current
+            # kubeconfig files before applying this manifest.
+            secretName: experiment-dashboard-kubeconfigs
+        - name: runtime-tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: experiment-dashboard
+  namespace: flower-supernode-a
+spec:
+  selector:
+    app: experiment-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP

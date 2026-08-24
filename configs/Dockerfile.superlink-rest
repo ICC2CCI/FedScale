@@ -1,0 +1,8 @@
+# Flower's stock SuperLink image does not include the optional REST Fleet API
+# dependencies.  The REST Fleet API avoids the long-lived HTTP/2 stream that
+# Skupper drops during multi-GB model-state uploads.
+FROM flwr/superlink:1.28.0
+
+RUN python -m pip install --no-cache-dir \
+    'starlette>=0.50.0,<0.51.0' \
+    'uvicorn[standard]>=0.40.0,<0.41.0'

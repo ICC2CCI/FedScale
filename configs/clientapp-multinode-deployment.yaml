@@ -1,0 +1,98 @@
+# clientapp-multinode-deployment.yaml
+# Flower Client deployment with multi-node distributed training support
+# This Client acts as a scheduler that launches Kubernetes Jobs for distributed training
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clientapp-multinode
+  namespace: flower-supernode-a
+  labels:
+    app: clientapp-multinode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clientapp-multinode
+  template:
+    metadata:
+      labels:
+        app: clientapp-multinode
+    spec:
+      # Service account with K8s API access for creating Jobs
+      serviceAccountName: flower-client-sa
+      
+      containers:
+      - name: clientapp
+        image: ccr.ccs.tencentyun.com/czfflower/llama_3b_v2-client-multinode
+        imagePullPolicy: Always
+        command: ["flwr-clientapp"]
+        args:
+          - "--supernode"
+          - "supernode-a-svc:9094"
+          - "--app"
+          - "flowertune_llm.client_app_multinode:app"
+        
+        env:
+        # HuggingFace Token (if model requires login)
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-credentials
+              key: token
+              optional: true
+        
+        # Distributed training configuration
+        - name: DIST_NUM_NODES
+          value: "3"  # Number of worker nodes for distributed training (3 V100 nodes)
+        - name: DIST_GPUS_PER_NODE
+          value: "1"  # GPUs per worker node (1 GPU per V100 node)
+        # Total GPUs = DIST_NUM_NODES × DIST_GPUS_PER_NODE = 3
+        - name: TRAIN_HF_HUB_OFFLINE
+          value: "1"
+        - name: TRAIN_HF_DATASETS_OFFLINE
+          value: "1"
+        - name: JOB_COMPLETION_TIMEOUT_SECONDS
+          value: "7200"
+        
+        # Pod namespace for K8s API calls
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        
+        # HuggingFace cache directory
+        - name: HF_HOME
+          value: "/app/.cache/huggingface"
+        
+        resources:
+          limits:
+            memory: "8Gi"
+            cpu: "2"
+          requests:
+            memory: "4Gi"
+            cpu: "1"
+        
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/.cache
+        - name: outputs
+          mountPath: /app/outputs
+      
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: flowertune-cache-pvc
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: flowertune-output-pvc
+      
+      # Node selection for GPU nodes
+      nodeSelector:
+        accelerator: nvidia-gpu
+      
+      # Tolerations for GPU taints
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule

@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: train-output-model-state-retention
+  namespace: flower-supernode-a
+spec:
+  schedule: "30 3 * * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: retention
+              image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:0.0.3
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/opt/retention/prune.py"]
+              args: ["--root", "/app/outputs", "--min-age-hours", "24", "--keep-successful", "3"]
+              volumeMounts:
+                - name: outputs
+                  mountPath: /app/outputs
+                - name: retention-script
+                  mountPath: /opt/retention
+                  readOnly: true
+          volumes:
+            - name: outputs
+              persistentVolumeClaim:
+                claimName: flowertune-output-pvc
+            - name: retention-script
+              configMap:
+                name: train-output-model-state-retention
+                defaultMode: 0555

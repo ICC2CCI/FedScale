@@ -1,0 +1,32 @@
+# One-off, manual migration pod.  The source is mounted read-only and the
+# destination is the new 300GiB CBS claim.  Do not run it while writers use
+# the source PVC.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: superexec-serverapp-results-migration-300g
+  namespace: flower-superlink
+  labels:
+    app: superexec-results-migration
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: migrator
+      image: ccr.ccs.tencentyun.com/czfflower/flwr_superexec:0.0.1
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/bin/bash", "-c"]
+      args: ["exec sleep infinity"]
+      volumeMounts:
+        - name: results-source
+          mountPath: /source
+          readOnly: true
+        - name: results-destination
+          mountPath: /destination
+  volumes:
+    - name: results-source
+      persistentVolumeClaim:
+        claimName: superexec-serverapp-results-pvc
+    - name: results-destination
+      persistentVolumeClaim:
+        claimName: superexec-serverapp-results-pvc-300g

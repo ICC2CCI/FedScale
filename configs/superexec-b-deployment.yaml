@@ -1,0 +1,178 @@
+# superexec-clientapp-b-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superexec-clientapp-b
+  namespace: flower-supernode-b       # 与 SuperNode B 同 namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: superexec-clientapp-b
+  template:
+    metadata:
+      labels:
+        app: superexec-clientapp-b
+    spec:
+      # Service account with K8s API access for creating Jobs
+      serviceAccountName: flower-client-sa
+      containers:
+      - name: superexec-clientapp
+        image: ccr.ccs.tencentyun.com/flwr_pcl/flwr_superexec:object-store-mvp-20260818
+        command:
+          - /usr/bin/bash
+          - -c
+        args:
+          - |
+            set -euo pipefail
+            log_dir=/app/persistent-logs
+            mkdir -p "$log_dir"
+            log_file="$log_dir/clientapp-b-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ).log"
+            exec > >(tee -a "$log_file") 2>&1
+            echo "Persistent log file: $log_file"
+            child_pid=""
+            on_signal() {
+              signal="$1"
+              echo "$(date -u +%FT%TZ) received ${signal}; Kubernetes is terminating this SuperExec"
+              if [ -n "$child_pid" ]; then
+                kill -TERM "$child_pid" 2>/dev/null || true
+                wait "$child_pid" || true
+              fi
+              echo "$(date -u +%FT%TZ) SuperExec stopped because of ${signal}"
+              exit 0
+            }
+            trap 'on_signal TERM' TERM
+            trap 'on_signal INT' INT
+            # ``flwr-clientapp`` can exit while pulling an AppInput whose
+            # object registration is still propagating through Skupper.  Keep
+            # the SuperExec process restartable so that transient condition
+            # does not permanently strand the SuperNode.  A running client
+            # training task keeps SuperExec alive, so this loop never restarts
+            # a healthy long-running task.
+            while :; do
+              flower-superexec --insecure \
+                --appio-api-address supernode-b-svc:9094 \
+                --plugin-type clientapp &
+              child_pid=$!
+              if wait "$child_pid"; then
+                status=0
+              else
+                status=$?
+              fi
+              child_pid=""
+              echo "$(date -u +%FT%TZ) SuperExec exited with status ${status}; retrying in 10s"
+              sleep 10
+            done
+        ports:
+        - containerPort: 9094
+        terminationMessagePolicy: FallbackToLogsOnError
+        # Do not use a zombie-process liveness probe here. Flower may briefly
+        # leave a completed/failed flwr-clientapp child while another long
+        # training task is still running; restarting SuperExec at that point
+        # loses the valid task's AppOutputs. Kubernetes still restarts this
+        # container automatically if the wrapper/SuperExec process exits.
+        env:
+        - name: OBJECT_STORE_CLIENT_ROLE
+          value: client-b
+        - name: CUDA_VISIBLE_DEVICES
+          value: ""
+        - name: HF_ENDPOINT
+          value: "https://hf-mirror.com"
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "0"
+        - name: HF_HOME
+          value: "/app/.cache/huggingface"
+        - name: FLWR_PRIVATE_MAX_ARRAY_CHUNK_SIZE
+          # 1MiB bounds every generated model object RPC on the congested
+          # cross-cloud Skupper tunnel.
+          value: "1048576"
+        - name: TRAIN_HF_HUB_OFFLINE
+          value: "1"
+        - name: TRAIN_HF_DATASETS_OFFLINE
+          value: "1"
+        - name: JOB_COMPLETION_TIMEOUT_SECONDS
+          value: "14400"
+        - name: DISTRIBUTED_JOB_MAX_ATTEMPTS
+          value: "3"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+              optional: true
+        # Distributed training configuration
+        - name: DIST_NUM_NODES
+          value: "3"  # Number of worker nodes for distributed training (3 V100 nodes)
+        - name: DIST_GPUS_PER_NODE
+          value: "1"  # GPUs per worker node (1 GPU per V100 node)
+        # Total GPUs = DIST_NUM_NODES × DIST_GPUS_PER_NODE = 3
+        # FSDP/NCCL communication tuning.  RDMA is not enabled because these
+        # nodes do not advertise an RDMA resource; use multiple socket workers
+        # and overlap FSDP prefetches on the TCP path instead.
+        - name: NCCL_SOCKET_NTHREADS
+          value: "4"
+        - name: NCCL_NSOCKS_PERTHREAD
+          value: "2"
+        - name: FSDP_BACKWARD_PREFETCH
+          value: "BACKWARD_PRE"
+        - name: FSDP_FORWARD_PREFETCH
+          value: "true"
+        - name: FSDP_LIMIT_ALL_GATHERS
+          value: "true"
+        # Training Job configuration (cluster-specific)
+        - name: TRAIN_IMAGE
+          value: "ccr.ccs.tencentyun.com/flwr_pcl/flwr_client_train:latest"
+        - name: CACHE_PVC
+          value: "flowertune-cache-pvc"
+        - name: OUTPUT_PVC
+          value: "flowertune-output-pvc"
+        # Pod namespace for K8s API calls
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Object-store credentials are optional so the existing Flower-RPC
+        # experiments keep working until object-store mode is explicitly used.
+        envFrom:
+        - secretRef:
+            name: object-store-client-b
+            optional: true
+        volumeMounts:
+        - name: cache-volume
+          mountPath: /app/.cache
+        - name: flwr-volume
+          mountPath: /app/.flwr
+        - name: config-volume
+          mountPath: /app/.config
+        - name: outputs-volume
+          mountPath: /app/outputs
+        - name: outputs-volume
+          mountPath: /app/persistent-logs
+        - name: object-store-ca
+          mountPath: /var/run/object-store-ca
+          readOnly: true
+        resources:
+          limits:
+            #nvidia.com/gpu: "1"
+            memory: "30Gi"
+            cpu: "8"
+          requests:
+            #nvidia.com/gpu: "1"
+            memory: "8Gi"
+            cpu: "2"
+      volumes:
+      - name: cache-volume
+        persistentVolumeClaim:
+          claimName: flowertune-cache-pvc    # 共享缓存（模型、数据）
+      - name: flwr-volume
+        emptyDir:
+          sizeLimit: 500Mi                   # Flower 临时状态
+      - name: config-volume
+        emptyDir:
+          sizeLimit: 500Mi
+      - name: outputs-volume
+        persistentVolumeClaim:
+          claimName: flowertune-output-pvc   # 训练输出
+      - name: object-store-ca
+        secret:
+          secretName: object-store-direct-ca

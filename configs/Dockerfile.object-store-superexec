@@ -1,0 +1,7 @@
+# Minimal extension for Flower App bundles that enable object-store transport.
+# The ServerApp image already has the Kubernetes client; ClientApp images use
+# the same boto3 helper to upload/download verified model artifacts.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN python -m pip install --no-cache-dir 'boto3>=1.35.0,<2.0.0'
