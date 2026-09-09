@@ -10,6 +10,8 @@
 | [model-download.md](model-download.md) | 基础模型下载（ModelScope） |
 | [data-preparation.md](data-preparation.md) | 测试数据准备 |
 | [run-experiment.md](run-experiment.md) | 运行 S3R12v3 及其他实验的步骤 |
+| [central-server-prep.md](central-server-prep.md) | 双集群 Central Server 本机准备（MinIO Docker 等） |
+| [central-server-git-notes.md](central-server-git-notes.md) | 与 ICC 上游协作、降低 git 冲突 |
 
 ## 快速开始（5 步）
 
@@ -43,7 +45,17 @@ python experiments/run_s3r12v3_block_uniform.py
 
 ## 多集群部署
 
-如需多集群联邦部署（K8s + Flower SuperNode），请参考：
+### 双集群 FSDP + MinIO（当前方案）
+
+规划见 [`../docs/algorithm/2026-09-09-dual-cluster-fsdp-deployment.md`](../docs/algorithm/2026-09-09-dual-cluster-fsdp-deployment.md)。  
+Central Server 本机操作见 [central-server-prep.md](central-server-prep.md)；Compose 文件为 [docker-compose.yml](docker-compose.yml)。
+
+```bash
+# MinIO（成熟组件，Docker，无自动重启）
+bash scripts/docker-central-up.sh
+```
+
+### 旧版 K8s + Flower SuperNode
 
 - [`../deploy_multinode.sh`](../deploy_multinode.sh) — 多节点部署脚本
 - [`../configs/`](../configs/) — K8s 部署配置

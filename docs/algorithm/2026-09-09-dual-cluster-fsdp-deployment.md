@@ -374,3 +374,4 @@ cd experiment-dashboard && python server.py --port 3000
 
 - 2026-09-09: 讨论双集群 FSDP 部署架构，记录规划文档
 - 2026-09-09: 确认最终架构决策：去掉 Flower、用 Accelerate+FSDP、MinIO 通信、Central Server 独立部署。V100 CUDA 13.0 driver 向下兼容 cu128 PyTorch。
+- 2026-09-09: Central Server 侧 MinIO 已用 Docker Compose 部署（运维细节见 `deployment/central-server-prep.md`，不改动本规划 checklist 正文以免与上游并行编辑冲突）。

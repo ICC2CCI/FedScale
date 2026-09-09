@@ -172,3 +172,9 @@ data/medical_medqa_*
 
 # Model weights
 /data/models/
+
+# Central Server local runtime (MinIO data/binaries, logs, secrets)
+/data/minio/
+/tools/minio/
+/logs/
+deployment/central-server.env

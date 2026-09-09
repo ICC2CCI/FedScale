@@ -1,0 +1,30 @@
+# Central Server — 成熟组件 Docker 部署
+# 用法：
+#   cd deployment && docker compose --env-file central-server.env up -d
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: fedscale-minio
+    restart: "no"
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-fedscale}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+    volumes:
+      - "${MINIO_DATA_DIR:-../data/minio}:/data"
+    # 官方镜像未必带 curl；用进程存活 + 宿主机 curl 做就绪检查
+    healthcheck:
+      test: ["CMD", "minio", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
