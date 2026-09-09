@@ -1,0 +1,122 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.5164,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.2071,
+    "eval_loss": 1.5149,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2233,
+    "eval_loss": 1.4446,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1859,
+    "eval_loss": 1.4219,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.2397,
+    "eval_loss": 1.2469,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.1789,
+    "eval_loss": 1.2439,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.1673,
+    "eval_loss": 1.2407,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.1751,
+    "eval_loss": 1.2033,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.171,
+    "eval_loss": 1.1838,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.1732,
+    "eval_loss": 1.1729,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1475,
+    "eval_loss": 1.1675,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.1569,
+    "eval_loss": 1.1612,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1478,
+    "eval_loss": 1.1696,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.1337,
+    "eval_loss": 1.1725,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.1334,
+    "eval_loss": 1.1932,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.1511,
+    "eval_loss": 1.1851,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.1236,
+    "eval_loss": 1.1851,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.12,
+    "eval_loss": 1.2345,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.0822,
+    "eval_loss": 1.247,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.1279,
+    "eval_loss": 1.2935,
+    "blocks_uploaded": 121
+  }
+]

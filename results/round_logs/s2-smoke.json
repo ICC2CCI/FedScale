@@ -1,0 +1,12 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.4454,
+    "eval_loss": 1.3304
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.4385,
+    "eval_loss": 1.3854
+  }
+]

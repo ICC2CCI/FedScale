@@ -1,0 +1,382 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.2903,
+    "selected_layers": [
+      0,
+      2,
+      4,
+      5,
+      6,
+      9,
+      12,
+      15,
+      16,
+      17,
+      18,
+      22
+    ]
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.23,
+    "eval_loss": 1.2224,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2159,
+    "eval_loss": 1.1983,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1786,
+    "eval_loss": 1.182,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.1877,
+    "eval_loss": 1.1688,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.1633,
+    "eval_loss": 1.1575,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.1542,
+    "eval_loss": 1.1481,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.148,
+    "eval_loss": 1.1385,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.1374,
+    "eval_loss": 1.1306,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.1294,
+    "eval_loss": 1.1222,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1108,
+    "eval_loss": 1.1141,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.1189,
+    "eval_loss": 1.1063,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1046,
+    "eval_loss": 1.0989,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.0885,
+    "eval_loss": 1.0914,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.0824,
+    "eval_loss": 1.0838,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.1044,
+    "eval_loss": 1.0765,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.0793,
+    "eval_loss": 1.0687,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.0687,
+    "eval_loss": 1.0615,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.0329,
+    "eval_loss": 1.0539,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.0704,
+    "eval_loss": 1.0473,
+    "selected_layers": [
+      2,
+      5,
+      6,
+      9,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      23
+    ]
+  }
+]

@@ -1,0 +1,142 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.5164,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.2071,
+    "eval_loss": 1.5149,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2233,
+    "eval_loss": 1.4446,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1859,
+    "eval_loss": 1.4219,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.2397,
+    "eval_loss": 1.2469,
+    "blocks_uploaded": 121,
+    "base_refreshed": true
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.2099,
+    "eval_loss": 1.2455,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.18,
+    "eval_loss": 1.2436,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.1756,
+    "eval_loss": 1.2283,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.1676,
+    "eval_loss": 1.2154,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.1757,
+    "eval_loss": 1.1963,
+    "blocks_uploaded": 121,
+    "base_refreshed": true
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1738,
+    "eval_loss": 1.1948,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.171,
+    "eval_loss": 1.1918,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1563,
+    "eval_loss": 1.1842,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.1469,
+    "eval_loss": 1.1771,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.1474,
+    "eval_loss": 1.1686,
+    "blocks_uploaded": 121,
+    "base_refreshed": true
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.184,
+    "eval_loss": 1.1658,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.1513,
+    "eval_loss": 1.1658,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.1393,
+    "eval_loss": 1.1593,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.1091,
+    "eval_loss": 1.1544,
+    "blocks_uploaded": 121,
+    "base_refreshed": false
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.1579,
+    "eval_loss": 1.15,
+    "blocks_uploaded": 121,
+    "base_refreshed": true
+  }
+]

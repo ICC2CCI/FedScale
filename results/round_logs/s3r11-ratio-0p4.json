@@ -1,0 +1,322 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.3205,
+    "selected_layers": [
+      2,
+      4,
+      5,
+      6,
+      9,
+      12,
+      15,
+      17,
+      22
+    ]
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.2421,
+    "eval_loss": 1.2365,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2251,
+    "eval_loss": 1.2133,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1856,
+    "eval_loss": 1.1958,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.1976,
+    "eval_loss": 1.1816,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.1728,
+    "eval_loss": 1.1698,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.1633,
+    "eval_loss": 1.1598,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.1571,
+    "eval_loss": 1.1504,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.1464,
+    "eval_loss": 1.1413,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.14,
+    "eval_loss": 1.133,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1218,
+    "eval_loss": 1.126,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.1289,
+    "eval_loss": 1.1181,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1155,
+    "eval_loss": 1.1108,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.1007,
+    "eval_loss": 1.1041,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.0948,
+    "eval_loss": 1.097,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.1173,
+    "eval_loss": 1.0903,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.0916,
+    "eval_loss": 1.0825,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.0811,
+    "eval_loss": 1.0753,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.0461,
+    "eval_loss": 1.0677,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.0842,
+    "eval_loss": 1.061,
+    "selected_layers": [
+      2,
+      6,
+      9,
+      13,
+      14,
+      16,
+      18,
+      19,
+      23
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.4454,
+    "eval_loss": 1.5138,
+    "blocks_uploaded": 121
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.43,
+    "eval_loss": 1.5168,
+    "blocks_uploaded": 121
+  }
+]

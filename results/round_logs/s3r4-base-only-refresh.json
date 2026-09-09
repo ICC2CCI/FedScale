@@ -1,0 +1,122 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.5164,
+    "base_refreshed": false
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.2071,
+    "eval_loss": 1.5149,
+    "base_refreshed": false
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2233,
+    "eval_loss": 1.4446,
+    "base_refreshed": false
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1859,
+    "eval_loss": 1.4219,
+    "base_refreshed": false
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.2397,
+    "eval_loss": 1.2469,
+    "base_refreshed": true
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.1789,
+    "eval_loss": 1.2458,
+    "base_refreshed": false
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.1673,
+    "eval_loss": 1.2423,
+    "base_refreshed": false
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.1751,
+    "eval_loss": 1.2215,
+    "base_refreshed": false
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.171,
+    "eval_loss": 1.2086,
+    "base_refreshed": false
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.1733,
+    "eval_loss": 1.193,
+    "base_refreshed": true
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1489,
+    "eval_loss": 1.1914,
+    "base_refreshed": false
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.1594,
+    "eval_loss": 1.1892,
+    "base_refreshed": false
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1566,
+    "eval_loss": 1.1822,
+    "base_refreshed": false
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.1476,
+    "eval_loss": 1.1749,
+    "base_refreshed": false
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.1464,
+    "eval_loss": 1.1683,
+    "base_refreshed": true
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.1722,
+    "eval_loss": 1.164,
+    "base_refreshed": false
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.1431,
+    "eval_loss": 1.164,
+    "base_refreshed": false
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.1363,
+    "eval_loss": 1.1579,
+    "base_refreshed": false
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.1084,
+    "eval_loss": 1.153,
+    "base_refreshed": false
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.1566,
+    "eval_loss": 1.1482,
+    "base_refreshed": true
+  }
+]
