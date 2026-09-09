@@ -1,0 +1,26 @@
+{
+  "alpaca_gpt4_en": {
+    "file_name": "alpaca_gpt4_en_train.json"
+  },
+  "alpaca_gpt4_en_eval_frozen": {
+    "file_name": "alpaca_gpt4_en_eval.json"
+  },
+  "alpaca_gpt4_en_full": {
+    "file_name": "alpaca_gpt4_en_full_train.json"
+  },
+  "alpaca_gpt4_en_full_eval": {
+    "file_name": "alpaca_gpt4_en_full_eval.json"
+  },
+  "medical_flashcards": {
+    "file_name": "medical_flashcards_train.json"
+  },
+  "medical_flashcards_eval": {
+    "file_name": "medical_flashcards_eval.json"
+  },
+  "medical_medqa": {
+    "file_name": "medical_medqa_train.json"
+  },
+  "medical_medqa_eval": {
+    "file_name": "medical_medqa_eval.json"
+  }
+}

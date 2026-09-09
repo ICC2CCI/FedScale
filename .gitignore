@@ -156,3 +156,19 @@ configs/config-tke-b
 
 # Local zip archive used for import
 flower-llm-dev.zip
+
+# Experiment outputs (large files, never commit)
+output/
+*.pt
+*.bin
+*.safetensors
+r*-c*/
+r*-eval/
+
+# Large datasets (only medical_flashcards are committed)
+data/alpaca_gpt4_*
+data/medical_meadow_medqa.json
+data/medical_medqa_*
+
+# Model weights
+/data/models/

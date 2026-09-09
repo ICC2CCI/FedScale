@@ -1,0 +1,45 @@
+### model
+model_name_or_path: /data/models/Qwen/Qwen2.5-0.5B
+flash_attn: auto
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: medical_flashcards
+dataset_dir: /data/home/qiaoyanchen/liuchao/fedscale/flower-llm/llamafactory-local/assets/datasets
+template: qwen
+cutoff_len: 512
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### output
+output_dir: /data/home/qiaoyanchen/liuchao/fedscale/output/s1d-qwen25-0.5b-medical-flashcards
+logging_steps: 10
+save_strategy: "no"
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+skip_memory_metrics: false
+
+### train
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: adamw_torch
+fp16: true
+bf16: false
+seed: 20260831
+ddp_timeout: 180000000
+eval_strategy: steps
+eval_steps: 100
+val_size: 0.1

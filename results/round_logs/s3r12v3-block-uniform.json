@@ -1,0 +1,202 @@
+[
+  {
+    "round": 1,
+    "avg_train_loss": 1.2899,
+    "eval_loss": 1.3946,
+    "epoch": 0,
+    "slot": 0,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 129.9,
+    "pct_of_total": 20.6
+  },
+  {
+    "round": 2,
+    "avg_train_loss": 1.2653,
+    "eval_loss": 1.2804,
+    "epoch": 0,
+    "slot": 1,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 128.7,
+    "pct_of_total": 20.4
+  },
+  {
+    "round": 3,
+    "avg_train_loss": 1.2503,
+    "eval_loss": 1.2236,
+    "epoch": 0,
+    "slot": 2,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 134.0,
+    "pct_of_total": 21.3
+  },
+  {
+    "round": 4,
+    "avg_train_loss": 1.1938,
+    "eval_loss": 1.203,
+    "epoch": 0,
+    "slot": 3,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 116.5,
+    "pct_of_total": 18.5
+  },
+  {
+    "round": 5,
+    "avg_train_loss": 1.2027,
+    "eval_loss": 1.1865,
+    "epoch": 0,
+    "slot": 4,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 121.1,
+    "pct_of_total": 19.2
+  },
+  {
+    "round": 6,
+    "avg_train_loss": 1.1746,
+    "eval_loss": 1.1715,
+    "epoch": 1,
+    "slot": 0,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 126.7,
+    "pct_of_total": 20.1
+  },
+  {
+    "round": 7,
+    "avg_train_loss": 1.1643,
+    "eval_loss": 1.1559,
+    "epoch": 1,
+    "slot": 1,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 132.2,
+    "pct_of_total": 21.0
+  },
+  {
+    "round": 8,
+    "avg_train_loss": 1.1577,
+    "eval_loss": 1.1464,
+    "epoch": 1,
+    "slot": 2,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 132.9,
+    "pct_of_total": 21.1
+  },
+  {
+    "round": 9,
+    "avg_train_loss": 1.1432,
+    "eval_loss": 1.1395,
+    "epoch": 1,
+    "slot": 3,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 120.1,
+    "pct_of_total": 19.1
+  },
+  {
+    "round": 10,
+    "avg_train_loss": 1.1361,
+    "eval_loss": 1.1314,
+    "epoch": 1,
+    "slot": 4,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 118.2,
+    "pct_of_total": 18.8
+  },
+  {
+    "round": 11,
+    "avg_train_loss": 1.1187,
+    "eval_loss": 1.1259,
+    "epoch": 2,
+    "slot": 0,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 130.8,
+    "pct_of_total": 20.8
+  },
+  {
+    "round": 12,
+    "avg_train_loss": 1.1296,
+    "eval_loss": 1.1183,
+    "epoch": 2,
+    "slot": 1,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 126.7,
+    "pct_of_total": 20.1
+  },
+  {
+    "round": 13,
+    "avg_train_loss": 1.1179,
+    "eval_loss": 1.1005,
+    "epoch": 2,
+    "slot": 2,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 130.5,
+    "pct_of_total": 20.7
+  },
+  {
+    "round": 14,
+    "avg_train_loss": 1.0915,
+    "eval_loss": 1.0953,
+    "epoch": 2,
+    "slot": 3,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 119.8,
+    "pct_of_total": 19.0
+  },
+  {
+    "round": 15,
+    "avg_train_loss": 1.085,
+    "eval_loss": 1.0901,
+    "epoch": 2,
+    "slot": 4,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 122.4,
+    "pct_of_total": 19.4
+  },
+  {
+    "round": 16,
+    "avg_train_loss": 1.1089,
+    "eval_loss": 1.0857,
+    "epoch": 3,
+    "slot": 0,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 130.5,
+    "pct_of_total": 20.7
+  },
+  {
+    "round": 17,
+    "avg_train_loss": 1.0876,
+    "eval_loss": 1.0807,
+    "epoch": 3,
+    "slot": 1,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 135.8,
+    "pct_of_total": 21.5
+  },
+  {
+    "round": 18,
+    "avg_train_loss": 1.0788,
+    "eval_loss": 1.0762,
+    "epoch": 3,
+    "slot": 2,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 128.3,
+    "pct_of_total": 20.4
+  },
+  {
+    "round": 19,
+    "avg_train_loss": 1.0451,
+    "eval_loss": 1.073,
+    "epoch": 3,
+    "slot": 3,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 117.6,
+    "pct_of_total": 18.7
+  },
+  {
+    "round": 20,
+    "avg_train_loss": 1.0898,
+    "eval_loss": 1.0514,
+    "epoch": 3,
+    "slot": 4,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 118.0,
+    "pct_of_total": 18.7
+  }
+]
