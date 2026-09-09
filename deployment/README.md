@@ -12,6 +12,7 @@
 | [run-experiment.md](run-experiment.md) | 运行 S3R12v3 及其他实验的步骤 |
 | [central-server-prep.md](central-server-prep.md) | 双集群 Central Server 本机准备（MinIO Docker 等） |
 | [central-server-git-notes.md](central-server-git-notes.md) | 与 ICC 上游协作、降低 git 冲突 |
+| [dual-cluster-nodes.md](dual-cluster-nodes.md) | ICC1/ICC2/Server 节点与启动顺序 |
 
 ## 快速开始（5 步）
 

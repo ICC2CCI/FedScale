@@ -1,0 +1,19 @@
+{
+  "node": "ICC1",
+  "role": "client-0",
+  "split_method": "datasets.train_test_split",
+  "seed": 20260831,
+  "test_size": 0.5,
+  "counts": {
+    "train_total": 30176,
+    "eval_total": 3352,
+    "client0": 15088,
+    "client1": 15088
+  },
+  "paths": {
+    "model": "model/Qwen/Qwen2.5-0.5B",
+    "train": "data/medical_flashcards_train.json",
+    "eval": "data/medical_flashcards_eval.json",
+    "icc1_train": "data/splits/icc1_client0_train.json"
+  }
+}

@@ -1,0 +1,19 @@
+# accelerate_config.yaml — 8×V100 FSDP（ICC1/ICC2）
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: fp16
+fsdp_config:
+  fsdp_offload_params: false
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: Qwen2DecoderLayer
+  fsdp_use_orig_params: true
+num_processes: 8
+gpu_ids: 0,1,2,3,4,5,6,7
+machine_rank: 0
+num_machines: 1
+main_training_function: main
+rdzv_backend: static
+same_network: true
+use_cpu: false

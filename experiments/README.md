@@ -13,9 +13,12 @@
 | `run_s3r6_sgd_memory_decay.py` | S3R6 | memory + decay |
 | `run_s3r11_layer_random20.py` | S3R11 | 随机层选择 + memory + decay |
 | `run_s3r12v2_block_permutation.py` | S3R12v2 | key 级 block 排列（true 20%） |
-| `run_s3r12v3_block_uniform.py` | **S3R12v3** | **block 级均匀分片（主力算法）** |
+| `run_s3r12v3_block_uniform.py` | **S3R12v3** | **block 级均匀分片（主力算法，单机模拟）** |
+| `run_s3r12v3_fsdp.py` | **S3R12v3 FSDP** | **双集群客户端（Accelerate + FSDP + MinIO）** |
 | `run_s3r12v3_ratio.py` | S3R12v3 ratio | ratio 消融（5%/10%/30%/40%/50%） |
 | `run_fedrolex_partial_training.py` | FedRolex | 部分训练（轮训层） |
+| `server/aggregation_server.py` | Central Server | REST + block FedAvg 聚合 |
+| `shared/` | 共用 | block 选择 / protocol / MinIO / state_dict 工具 |
 
 ## 画图脚本
 

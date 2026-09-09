@@ -68,9 +68,22 @@ MinIO 账号密码见本机 `central-server.env`（不要提交到 git）。
 
 ## 待完成
 
-- [ ] 实现 `experiments/server/aggregation_server.py` 等通信层
-- [ ] 启动聚合服务并做健康检查
+- [x] 实现 `experiments/server/aggregation_server.py` 等通信层
+- [x] 实现 `experiments/run_s3r12v3_fsdp.py` 客户端
+- [ ] 从 ICC bootstrap round-0 到 MinIO，并启动 `:8080`
+- [ ] ICC 单机 FSDP 冒烟 / 三节点联调
 - [ ] （可选）监控看板
+
+## 启动聚合服务
+
+```bash
+# 1) 在 ICC 上上传初始权重
+bash scripts/bootstrap_initial_state.sh model/Qwen/Qwen2.5-0.5B http://192.168.235.42:9000
+
+# 2) 在本机
+conda activate fedscale-server
+python experiments/server/aggregation_server.py --port 8080 --minio-endpoint http://127.0.0.1:9000
+```
 
 ## 与 ICC 仓库协作（避免冲突）
 
