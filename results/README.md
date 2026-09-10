@@ -2,10 +2,24 @@
 
 ## 目录结构
 
+**新约定（推荐）**：每次双集群运行写入按时间戳命名的目录，例如 `results/202609101006/`：
+
+| 路径 | 内容 |
+|---|---|
+| `run_meta.json` / `README.md` | 本次运行元信息 |
+| `round_log.json` / `metrics.jsonl` | 逐轮 train loss、timing、传输量 |
+| `figures/` | 本轮曲线图（train / eval / 时间 / 传输 / download_mode） |
+| `logs/` | 聚合服务 + client 日志副本 |
+| `eval/eval_by_round.json` | 离线 eval_loss |
+| `results/current` | 指向最近一次运行的符号链接 |
+
+启动：`bash scripts/start_s3r12v3_fsdp_run.sh`；绘图：`python scripts/plot_s3r12v3_fsdp_run.py results/<id>`。
+
 | 子目录 | 内容 |
 |---|---|
-| [`round_logs/`](round_logs/) | 每个实验的逐轮日志（JSON 格式） |
-| [`figures/`](figures/) | 对比图（PNG） |
+| [`round_logs/`](round_logs/) | 历史单机/消融实验 JSON（旧布局，仍保留） |
+| [`figures/`](figures/) | 历史对比图（旧布局） |
+| `YYYYMMDDHHMM/` | 新布局：单次联调的完整产物 |
 
 ## round_logs
 

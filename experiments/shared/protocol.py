@@ -12,6 +12,8 @@ DEFAULT_MEMORY_DECAY = 0.9
 DEFAULT_NUM_ROUNDS = 20
 DEFAULT_NUM_CLIENTS = 2
 DEFAULT_BUCKET = "fedscale-bucket"
+# 通信/落盘精度：auto=跟随模型(global_state)浮点 dtype；也可强制 fp16/fp32/bf16（int8 预留）
+DEFAULT_TRANSFER_DTYPE = "auto"
 
 # 训练超参
 DEFAULT_LOCAL_STEPS = 30
@@ -23,6 +25,11 @@ DEFAULT_SEQ_LEN = 512
 
 def global_state_key(round_idx: int) -> str:
     return f"global_state/round-{round_idx}/state.pt"
+
+
+def global_delta_key(round_idx: int) -> str:
+    """Round N 聚合后的增量：把 global 从 round-(N-1) 更新到 round-N（仅选中 blocks）。"""
+    return f"global_delta/round-{round_idx}/blocks.pt"
 
 
 def upload_blocks_key(round_idx: int, client_id: int) -> str:

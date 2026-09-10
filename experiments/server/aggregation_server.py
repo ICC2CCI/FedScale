@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from server.block_scheduler import BlockScheduler
-from shared.block_selection import apply_block_delta
+from shared.block_selection import apply_block_delta, resolve_transfer_dtype
 from shared.minio_client import MinIOClient
 from shared.protocol import (
     DEFAULT_BUCKET,
@@ -29,7 +29,9 @@ from shared.protocol import (
     DEFAULT_NUM_CLIENTS,
     DEFAULT_NUM_ROUNDS,
     DEFAULT_SEED,
+    DEFAULT_TRANSFER_DTYPE,
     RoundPlan,
+    global_delta_key,
     global_state_key,
     plan_key,
     selected_from_jsonable,
@@ -51,6 +53,8 @@ def _round_s(x: float) -> float:
 class UploadCompleteBody(BaseModel):
     num_examples: int = Field(ge=1)
     train_loss: float = 0.0
+    # 在线 eval（客户端本地算完上报；可选）
+    eval_loss: Optional[float] = None
     # 客户端在 upload 完成前可上报的分段耗时（秒）
     timings: Dict[str, float] = Field(default_factory=dict)
 
@@ -71,6 +75,7 @@ class AggregationServer:
         coverage_h: int,
         results_dir: Path,
         init_state: Dict[str, torch.Tensor],
+        transfer_dtype_name: str = DEFAULT_TRANSFER_DTYPE,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -81,6 +86,14 @@ class AggregationServer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
         self.global_state = cpu_state(init_state)
+        self.transfer_dtype = resolve_transfer_dtype(
+            transfer_dtype_name, ref_state=self.global_state
+        )
+        logger.info(
+            "transfer_dtype=%s (arg=%s)",
+            self.transfer_dtype,
+            transfer_dtype_name,
+        )
         self.scheduler = BlockScheduler(self.global_state, seed=seed, coverage_h=coverage_h)
         self.current_round = 1
         self.lock = threading.Lock()
@@ -278,6 +291,7 @@ class AggregationServer:
             weights: List[float] = []
             deltas = []
             losses = []
+            eval_losses: List[float] = []
 
             t_dl0 = time.monotonic()
             upload_sizes_b: List[int] = []
@@ -292,17 +306,38 @@ class AggregationServer:
                     deltas.append(payload["block_delta"])
                     weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
                     losses.append(float(payload.get("train_loss", metas[cid].train_loss)))
+                    # payload 或 upload-complete body 都可带 eval
+                    ev = payload.get("eval_loss", metas[cid].eval_loss)
+                    if ev is not None:
+                        eval_losses.append(float(ev))
                 else:
                     deltas.append(payload)
                     weights.append(float(metas[cid].num_examples))
                     losses.append(float(metas[cid].train_loss))
+                    if metas[cid].eval_loss is not None:
+                        eval_losses.append(float(metas[cid].eval_loss))
             t_download = time.monotonic() - t_dl0
 
             t_apply0 = time.monotonic()
-            apply_block_delta(self.global_state, deltas, weights, selected)
+            agg_delta = apply_block_delta(
+                self.global_state,
+                deltas,
+                weights,
+                selected,
+                out_dtype=self.transfer_dtype,
+            )
             t_apply = time.monotonic() - t_apply0
 
             t_up0 = time.monotonic()
+            delta_payload = {
+                "round": int(round_idx),
+                "from_round": int(round_idx - 1),
+                "to_round": int(round_idx),
+                "block_delta": agg_delta,
+                "n_selected_blocks": int(plan.n_selected_blocks),
+                "selected_elems": int(plan.selected_elems),
+            }
+            delta_bytes = self.minio.put_torch(global_delta_key(round_idx), delta_payload)
             global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
             t_upload_global = time.monotonic() - t_up0
             t_agg_total = time.monotonic() - t_agg0
@@ -324,6 +359,7 @@ class AggregationServer:
                     str(cid): _round_s(sz / (1024 * 1024)) for cid, sz in enumerate(upload_sizes_b)
                 },
                 "upload_blocks_MiB_total": _round_s(sum(upload_sizes_b) / (1024 * 1024)),
+                "global_delta_MiB": _round_s(delta_bytes / (1024 * 1024)),
                 "global_state_MiB": _round_s(global_bytes / (1024 * 1024)),
                 "selected_elems_M": _round_s(plan.selected_elems / 1e6),
             }
@@ -343,16 +379,25 @@ class AggregationServer:
 
             avg_train = sum(losses) / max(len(losses), 1)
             client_losses = {str(cid): round(float(losses[cid]), 6) for cid in range(len(losses))}
+            avg_eval = (sum(eval_losses) / len(eval_losses)) if eval_losses else None
+            client_eval = {}
+            for cid in range(self.num_clients):
+                ev = metas[cid].eval_loss
+                if ev is not None:
+                    client_eval[str(cid)] = round(float(ev), 6)
             result = {
                 "round": round_idx,
                 "done": True,
-                "eval_loss": None,
+                "eval_loss": round(float(avg_eval), 6) if avg_eval is not None else None,
+                "client_eval_loss": client_eval,
                 "avg_train_loss": round(avg_train, 6),
                 "client_train_loss": client_losses,
                 "upload_ratio": round(plan.upload_ratio, 6),
                 "n_selected_blocks": plan.n_selected_blocks,
                 "selected_elems": plan.selected_elems,
                 "message": "aggregated",
+                "global_delta_key": global_delta_key(round_idx),
+                "global_state_key": global_state_key(round_idx),
                 "timing_s": timing_s,
             }
             entry = {
@@ -361,7 +406,8 @@ class AggregationServer:
                 "slot": plan.slot,
                 "avg_train_loss": result["avg_train_loss"],
                 "client_train_loss": client_losses,
-                "eval_loss": None,
+                "eval_loss": result["eval_loss"],
+                "client_eval_loss": client_eval,
                 "pct_of_total": round(plan.upload_ratio * 100, 2),
                 "n_selected_blocks": plan.n_selected_blocks,
                 "selected_elems_M": round(plan.selected_elems / 1e6, 3),
@@ -504,6 +550,11 @@ def parse_args() -> argparse.Namespace:
         "--results-dir",
         default=str(Path(__file__).resolve().parents[2] / "results" / "round_logs" / "s3r12v3-fsdp"),
     )
+    p.add_argument(
+        "--transfer-dtype",
+        default=DEFAULT_TRANSFER_DTYPE,
+        help="通信落盘精度: auto(跟随模型)/fp16/fp32/bf16；int8 预留",
+    )
     return p.parse_args()
 
 
@@ -528,6 +579,7 @@ def main() -> None:
         coverage_h=args.coverage_h,
         results_dir=Path(args.results_dir),
         init_state=init_state,
+        transfer_dtype_name=args.transfer_dtype,
     )
     app = build_app(server)
     logger.info("Listening on %s:%s", args.host, args.port)

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -12,6 +12,66 @@ from .protocol import DEFAULT_BLOCK_SIZE, DEFAULT_COVERAGE_H, SelectedByKey
 GroupBlocks = Dict[str, List[Tuple[str, int, int]]]
 Permutations = Dict[str, List[int]]
 BlockDelta = Dict[str, List[Tuple[int, int, torch.Tensor]]]
+
+TransferDtypeName = str  # auto | fp16 | float16 | fp32 | float32 | bf16 | bfloat16 | int8
+
+
+def infer_model_floating_dtype(state: Dict[str, torch.Tensor]) -> torch.dtype:
+    for tensor in state.values():
+        if torch.is_tensor(tensor) and tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float16
+
+
+def resolve_transfer_dtype(
+    name: TransferDtypeName,
+    *,
+    ref_dtype: Optional[torch.dtype] = None,
+    ref_state: Optional[Dict[str, torch.Tensor]] = None,
+) -> torch.dtype:
+    """解析通信精度。
+
+    - auto: 跟随 ref_dtype / ref_state 中模型浮点 dtype（通常为 fp16）
+    - fp16/fp32/bf16: 强制该精度落盘与传输
+    - int8: 预留，当前未实现
+    """
+    key = (name or "auto").strip().lower()
+    if key in ("auto", "model", "native"):
+        if ref_dtype is not None:
+            return ref_dtype
+        if ref_state is not None:
+            return infer_model_floating_dtype(ref_state)
+        return torch.float16
+    mapping = {
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "float": torch.float32,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+    }
+    if key == "int8":
+        raise NotImplementedError(
+            "transfer-dtype=int8 is reserved; use auto/fp16/fp32/bf16 for now"
+        )
+    if key not in mapping:
+        raise ValueError(f"unsupported transfer-dtype: {name}")
+    return mapping[key]
+
+
+def cast_block_delta(block_delta: BlockDelta, dtype: torch.dtype) -> BlockDelta:
+    """把 block_delta 中的 slice 转到指定通信 dtype（计算仍可在别处用 fp32）。"""
+    if dtype == torch.int8:
+        raise NotImplementedError("int8 block cast not implemented yet")
+    out: BlockDelta = {}
+    for key_name, blocks in block_delta.items():
+        out[key_name] = [
+            (s, e, slice_data.detach().to(device="cpu", dtype=dtype).contiguous())
+            for s, e, slice_data in blocks
+        ]
+    return out
 
 
 def hkdf_group_seed(epoch_seed: bytes, group_id: str) -> bytes:
@@ -86,14 +146,37 @@ def count_selected_elems(selected_by_key: SelectedByKey) -> int:
     return sum(e - s for slices in selected_by_key.values() for s, e in slices)
 
 
-def encode_block_delta(to_send: Dict[str, torch.Tensor], selected_by_key: SelectedByKey) -> BlockDelta:
+def encode_block_delta(
+    to_send: Dict[str, torch.Tensor],
+    selected_by_key: SelectedByKey,
+    *,
+    dtype: Optional[torch.dtype] = None,
+) -> BlockDelta:
+    """抽取选中 block。dtype 指定通信落盘精度；None 则保持 to_send 原 dtype。"""
     result: BlockDelta = {}
     for key_name, slices in selected_by_key.items():
         if key_name not in to_send or not to_send[key_name].is_floating_point():
             continue
         flat = to_send[key_name].contiguous().view(-1)
-        result[key_name] = [(s, e, flat[s:e].detach().cpu().clone()) for s, e in slices]
+        out_dtype = dtype if dtype is not None else to_send[key_name].dtype
+        result[key_name] = [
+            (s, e, flat[s:e].detach().to(device="cpu", dtype=out_dtype).contiguous())
+            for s, e in slices
+        ]
     return result
+
+
+def add_block_delta(state: Dict[str, torch.Tensor], block_delta: BlockDelta) -> None:
+    """原地：state[key][s:e] += delta_slice。"""
+    for key_name, blocks in block_delta.items():
+        if key_name not in state or not state[key_name].is_floating_point():
+            continue
+        flat = state[key_name].contiguous().view(-1)
+        for s, e, slice_data in blocks:
+            flat[s:e] = (flat[s:e].to(dtype=torch.float32) + slice_data.to(dtype=torch.float32)).to(
+                dtype=state[key_name].dtype
+            )
+        state[key_name] = flat.view(state[key_name].shape)
 
 
 def apply_block_delta(
@@ -101,15 +184,23 @@ def apply_block_delta(
     client_block_deltas: List[BlockDelta],
     weights: List[float],
     selected_by_key: SelectedByKey,
-) -> None:
-    """原地：global += 加权平均(block deltas)。"""
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+) -> BlockDelta:
+    """原地：global += 加权平均(block deltas)；并返回该聚合增量（供客户端增量下发）。
+
+    累加在 fp32 中做；写出的 block_delta 使用 out_dtype（默认跟随 global_state）。
+    """
     total_w = float(sum(weights))
     if total_w <= 0:
         raise ValueError("weights sum must be positive")
+    aggregated: BlockDelta = {}
     for key_name, slices in selected_by_key.items():
         if key_name not in global_state or not global_state[key_name].is_floating_point():
             continue
         gflat = global_state[key_name].contiguous().view(-1)
+        store_dtype = out_dtype if out_dtype is not None else global_state[key_name].dtype
+        out_blocks: List[Tuple[int, int, torch.Tensor]] = []
         for s, e in slices:
             acc = torch.zeros(e - s, dtype=torch.float32)
             for cid, w in enumerate(weights):
@@ -121,7 +212,13 @@ def apply_block_delta(
                         acc.add_(slice_data.to(dtype=torch.float32), alpha=float(w) / total_w)
                         break
             gflat[s:e] = (gflat[s:e].to(dtype=torch.float32) + acc).to(dtype=global_state[key_name].dtype)
+            out_blocks.append(
+                (s, e, acc.detach().to(device="cpu", dtype=store_dtype).contiguous())
+            )
+        if out_blocks:
+            aggregated[key_name] = out_blocks
         global_state[key_name] = gflat.view(global_state[key_name].shape)
+    return aggregated
 
 
 def update_block_memory(

@@ -21,10 +21,19 @@ if d:
   t=last.get("timing_s") or {}
   print("round_wall_s", t.get("round_wall_s"), "transfer", (t.get("transfer") or {}))
   print("client_train_loss", last.get("client_train_loss"))
+  clients=(t.get("clients") or {})
+  for cid, ct in sorted(clients.items()):
+    mode=ct.get("download_mode")
+    mode_s={0:"cache",1:"delta",2:"full",3:"local_base"}.get(int(round(mode)), "?") if mode is not None else "?"
+    print(f"  client{cid} mode={mode_s} download_MiB={ct.get('download_global_MiB')} post_delta_MiB={ct.get('post_delta_MiB')}")
 PY
 else
   echo "round_log.json not ready"
 fi
 echo
 echo "=== last server log lines ==="
-tail -n 15 logs/aggregation_server.log 2>/dev/null || true
+if [[ -n "${RESULTS:-}" && -f "$RESULTS/logs/aggregation_server.log" ]]; then
+  tail -n 20 "$RESULTS/logs/aggregation_server.log" || true
+else
+  tail -n 20 logs/aggregation_server.log 2>/dev/null || true
+fi
