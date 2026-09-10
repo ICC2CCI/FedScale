@@ -1,0 +1,202 @@
+[
+  {
+    "round": 1,
+    "epoch": 0,
+    "slot": 0,
+    "avg_train_loss": 2.041375,
+    "eval_loss": null,
+    "pct_of_total": 20.61,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 129.881
+  },
+  {
+    "round": 2,
+    "epoch": 0,
+    "slot": 1,
+    "avg_train_loss": 1.535986,
+    "eval_loss": null,
+    "pct_of_total": 20.42,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 128.709
+  },
+  {
+    "round": 3,
+    "epoch": 0,
+    "slot": 2,
+    "avg_train_loss": 1.426736,
+    "eval_loss": null,
+    "pct_of_total": 21.26,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 133.964
+  },
+  {
+    "round": 4,
+    "epoch": 0,
+    "slot": 3,
+    "avg_train_loss": 1.322109,
+    "eval_loss": null,
+    "pct_of_total": 18.48,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 116.476
+  },
+  {
+    "round": 5,
+    "epoch": 0,
+    "slot": 4,
+    "avg_train_loss": 1.249542,
+    "eval_loss": null,
+    "pct_of_total": 19.22,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 121.137
+  },
+  {
+    "round": 6,
+    "epoch": 1,
+    "slot": 0,
+    "avg_train_loss": 1.091235,
+    "eval_loss": null,
+    "pct_of_total": 20.1,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 126.668
+  },
+  {
+    "round": 7,
+    "epoch": 1,
+    "slot": 1,
+    "avg_train_loss": 1.054815,
+    "eval_loss": null,
+    "pct_of_total": 20.99,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 132.249
+  },
+  {
+    "round": 8,
+    "epoch": 1,
+    "slot": 2,
+    "avg_train_loss": 1.021368,
+    "eval_loss": null,
+    "pct_of_total": 21.09,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 132.905
+  },
+  {
+    "round": 9,
+    "epoch": 1,
+    "slot": 3,
+    "avg_train_loss": 0.985695,
+    "eval_loss": null,
+    "pct_of_total": 19.06,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 120.119
+  },
+  {
+    "round": 10,
+    "epoch": 1,
+    "slot": 4,
+    "avg_train_loss": 0.97271,
+    "eval_loss": null,
+    "pct_of_total": 18.76,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 118.227
+  },
+  {
+    "round": 11,
+    "epoch": 2,
+    "slot": 0,
+    "avg_train_loss": 0.968937,
+    "eval_loss": null,
+    "pct_of_total": 20.76,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 130.825
+  },
+  {
+    "round": 12,
+    "epoch": 2,
+    "slot": 1,
+    "avg_train_loss": 0.9494,
+    "eval_loss": null,
+    "pct_of_total": 20.11,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 126.697
+  },
+  {
+    "round": 13,
+    "epoch": 2,
+    "slot": 2,
+    "avg_train_loss": 0.954829,
+    "eval_loss": null,
+    "pct_of_total": 20.71,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 130.482
+  },
+  {
+    "round": 14,
+    "epoch": 2,
+    "slot": 3,
+    "avg_train_loss": 0.913165,
+    "eval_loss": null,
+    "pct_of_total": 19.0,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 119.762
+  },
+  {
+    "round": 15,
+    "epoch": 2,
+    "slot": 4,
+    "avg_train_loss": 0.917421,
+    "eval_loss": null,
+    "pct_of_total": 19.42,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 122.401
+  },
+  {
+    "round": 16,
+    "epoch": 3,
+    "slot": 0,
+    "avg_train_loss": 0.903949,
+    "eval_loss": null,
+    "pct_of_total": 20.71,
+    "n_selected_blocks": 297,
+    "selected_elems_M": 130.482
+  },
+  {
+    "round": 17,
+    "epoch": 3,
+    "slot": 1,
+    "avg_train_loss": 0.89784,
+    "eval_loss": null,
+    "pct_of_total": 21.55,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 135.784
+  },
+  {
+    "round": 18,
+    "epoch": 3,
+    "slot": 2,
+    "avg_train_loss": 0.87969,
+    "eval_loss": null,
+    "pct_of_total": 20.36,
+    "n_selected_blocks": 296,
+    "selected_elems_M": 128.306
+  },
+  {
+    "round": 19,
+    "epoch": 3,
+    "slot": 3,
+    "avg_train_loss": 0.881572,
+    "eval_loss": null,
+    "pct_of_total": 18.67,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 117.631
+  },
+  {
+    "round": 20,
+    "epoch": 3,
+    "slot": 4,
+    "avg_train_loss": 0.874933,
+    "eval_loss": null,
+    "pct_of_total": 18.72,
+    "n_selected_blocks": 272,
+    "selected_elems_M": 117.964
+  }
+]

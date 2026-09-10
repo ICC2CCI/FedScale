@@ -114,6 +114,105 @@ def wait_json(url: str, timeout_s: float = 3600.0, interval_s: float = 2.0) -> D
     raise RuntimeError(f"timeout waiting for {url}: {last_err}")
 
 
+def _broadcast_flag(accelerator, flag: int) -> int:
+    """短 collective：广播 int 状态码。0=继续, 1=成功, 2=失败。"""
+    device = accelerator.device
+    t = torch.tensor([int(flag)], device=device, dtype=torch.int64)
+    if accelerator.num_processes > 1:
+        import torch.distributed as dist
+
+        dist.broadcast(t, src=0)
+    return int(t.item())
+
+
+def run_rank0_io_with_heartbeat(
+    accelerator,
+    work_fn,
+    *,
+    interval_s: float = 2.0,
+    timeout_s: float = 3600.0,
+    label: str = "io",
+):
+    """在 rank0 上跑可能很长的网络 I/O，其它 rank 用短心跳同步，避免长 NCCL 等待。
+
+    work_fn() 仅在 main process 调用，返回任意结果；失败应抛异常。
+    """
+    import threading
+
+    box: Dict[str, Any] = {"done": False, "ok": False, "value": None, "error": None}
+
+    if accelerator.is_main_process:
+
+        def _target() -> None:
+            try:
+                box["value"] = work_fn()
+                box["ok"] = True
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+                box["ok"] = False
+            finally:
+                box["done"] = True
+
+        th = threading.Thread(target=_target, name=f"rank0-{label}", daemon=True)
+        th.start()
+    else:
+        th = None
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        flag = 0
+        if accelerator.is_main_process:
+            if box["done"]:
+                flag = 1 if box["ok"] else 2
+        flag = _broadcast_flag(accelerator, flag)
+        if flag == 1:
+            err_or_val = broadcast_object(box.get("value") if accelerator.is_main_process else None, src=0)
+            return err_or_val
+        if flag == 2:
+            err = broadcast_object(box.get("error") if accelerator.is_main_process else None, src=0)
+            if isinstance(err, Exception):
+                raise RuntimeError(f"{label} failed: {err}") from err
+            raise RuntimeError(f"{label} failed: {err}")
+        time.sleep(interval_s)
+
+    raise TimeoutError(f"{label} timed out after {timeout_s}s")
+
+
+def wait_aggregate_with_heartbeat(
+    accelerator,
+    *,
+    server: str,
+    round_idx: int,
+    poll_interval: float,
+    timeout_s: float = 3600.0,
+) -> Dict[str, Any]:
+    """全 ranks 一起短轮询等待聚合结果，避免 rank0 单线程卡 NCCL。"""
+    deadline = time.time() + timeout_s
+    last: Dict[str, Any] = {}
+    while time.time() < deadline:
+        flag = 0
+        if accelerator.is_main_process:
+            try:
+                resp = requests.get(f"{server}/api/round/{round_idx}/result", timeout=30)
+                resp.raise_for_status()
+                last = resp.json()
+                if last.get("done"):
+                    flag = 1
+                elif last.get("message") == "aggregation_failed":
+                    flag = 2
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("poll result failed: %s", exc)
+                flag = 0
+        flag = _broadcast_flag(accelerator, flag)
+        if flag == 1:
+            return broadcast_object(last if accelerator.is_main_process else None, src=0)
+        if flag == 2:
+            detail = broadcast_object(last if accelerator.is_main_process else None, src=0)
+            raise RuntimeError(f"aggregation failed: {detail}")
+        time.sleep(poll_interval)
+    raise TimeoutError(f"wait aggregate round {round_idx} timed out after {timeout_s}s")
+
+
 def train_local_steps(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -247,7 +346,15 @@ def main() -> None:
     num_examples = args.num_examples or len(dataset)
 
     while True:
-        status = wait_json(f"{server}/api/round/current", interval_s=args.poll_interval)
+        t_round0 = time.monotonic()
+        # 拉 current/plan 也可能慢：用 heartbeat，避免非 rank0 卡在长 barrier
+        status = run_rank0_io_with_heartbeat(
+            accelerator,
+            lambda: wait_json(f"{server}/api/round/current", interval_s=args.poll_interval),
+            interval_s=args.poll_interval,
+            timeout_s=3600.0,
+            label="wait-current",
+        )
         if status.get("status") == "finished":
             if is_main:
                 logger.info("Server finished all rounds")
@@ -256,27 +363,54 @@ def main() -> None:
         if is_main:
             logger.info("=== Round %s status=%s ===", round_idx, status.get("status"))
 
-        plan_raw = wait_json(f"{server}/api/round/{round_idx}/plan", interval_s=args.poll_interval)
+        plan_raw = run_rank0_io_with_heartbeat(
+            accelerator,
+            lambda: wait_json(f"{server}/api/round/{round_idx}/plan", interval_s=args.poll_interval),
+            interval_s=args.poll_interval,
+            timeout_s=3600.0,
+            label=f"wait-plan-{round_idx}",
+        )
         plan = RoundPlan.from_dict(plan_raw)
         selected = selected_from_jsonable(plan.selected_by_key)
 
-        # 下载 round-(N-1) 全局状态（仅 rank0），再广播给所有 rank 后加载进 FSDP
-        global_state = None
-        if is_main:
+        # 下载 round-(N-1) 全局状态（仅 rank0，带心跳），再加载进 FSDP
+        t_download = 0.0
+
+        def _download_global():
+            nonlocal t_download
             assert minio is not None
             prev_key = global_state_key(round_idx - 1)
             logger.info("Downloading %s", prev_key)
-            global_state = minio.get_torch(prev_key, map_location="cpu")
-            if memory is None:
-                memory = zero_state_like(global_state)
+            t0 = time.monotonic()
+            state, nbytes = minio.get_torch_with_size(prev_key, map_location="cpu")
+            t_download = time.monotonic() - t0
+            logger.info(
+                "Downloaded %s size=%.2f MiB in %.2fs",
+                prev_key,
+                nbytes / (1024 * 1024),
+                t_download,
+            )
+            return {"state": state, "bytes": float(nbytes)}
 
-        accelerator.wait_for_everyone()
-        if accelerator.num_processes > 1:
-            global_state = broadcast_object(global_state if is_main else None, src=0)
+        dl = run_rank0_io_with_heartbeat(
+            accelerator,
+            _download_global if is_main else (lambda: None),
+            interval_s=args.poll_interval,
+            timeout_s=3600.0,
+            label=f"download-global-{round_idx}",
+        )
+        global_state = dl["state"] if isinstance(dl, dict) else dl
+        download_bytes = float(dl.get("bytes", 0.0)) if isinstance(dl, dict) else 0.0
+        if is_main and memory is None:
+            memory = zero_state_like(global_state)
+
+        t_load0 = time.monotonic()
         # 不要 unwrap，保留 FSDP 包装
         load_full_state_fsdp(model, global_state)
         accelerator.wait_for_everyone()
+        t_broadcast_load = time.monotonic() - t_load0
 
+        t_train0 = time.monotonic()
         train_loss = train_local_steps(
             model=model,
             dataloader=loader,
@@ -287,15 +421,19 @@ def main() -> None:
             grad_accum=args.grad_accum,
         )
         accelerator.wait_for_everyone()
+        t_train = time.monotonic() - t_train0
 
         full_state = get_full_state_fsdp(model)
-        if is_main:
-            assert minio is not None and global_state is not None and memory is not None and full_state is not None
-            delta = sub_state(full_state, global_state)
-            to_send = add_state(delta, memory)
-            block_delta = encode_block_delta(to_send, selected)
-            memory = update_block_memory(to_send, selected, args.memory_decay)
+        mem_box: List[Any] = [memory]
 
+        def _upload_and_notify():
+            assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
+            t_enc0 = time.monotonic()
+            delta = sub_state(full_state, global_state)
+            to_send = add_state(delta, mem_box[0])
+            block_delta = encode_block_delta(to_send, selected)
+            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
+            t_encode = time.monotonic() - t_enc0
             payload = {
                 "block_delta": block_delta,
                 "num_examples": int(num_examples),
@@ -311,28 +449,80 @@ def main() -> None:
                 plan.upload_ratio * 100,
                 train_loss,
             )
-            minio.put_torch(up_key, payload)
+            t_up0 = time.monotonic()
+            upload_bytes = minio.put_torch(up_key, payload)
+            t_upload = time.monotonic() - t_up0
+            logger.info(
+                "Uploaded %s size=%.2f MiB in %.2fs",
+                up_key,
+                upload_bytes / (1024 * 1024),
+                t_upload,
+            )
+
+            timings = {
+                "download_global_s": round(t_download, 3),
+                "download_global_MiB": round(download_bytes / (1024 * 1024), 3),
+                "broadcast_load_s": round(t_broadcast_load, 3),
+                "train_local_s": round(t_train, 3),
+                "encode_delta_s": round(t_encode, 3),
+                "upload_minio_s": round(t_upload, 3),
+                "upload_blocks_MiB": round(upload_bytes / (1024 * 1024), 3),
+            }
+            t_notify0 = time.monotonic()
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/upload-complete",
-                json={"num_examples": int(num_examples), "train_loss": float(train_loss)},
+                json={
+                    "num_examples": int(num_examples),
+                    "train_loss": float(train_loss),
+                    "timings": timings,
+                },
                 timeout=60,
             )
             resp.raise_for_status()
+            timings["notify_server_s"] = round(time.monotonic() - t_notify0, 3)
+            return timings
 
-            # 等待聚合完成
-            while True:
-                result = wait_json(f"{server}/api/round/{round_idx}/result", interval_s=args.poll_interval)
-                if result.get("done"):
-                    logger.info("Round %s aggregated: %s", round_idx, result)
-                    break
-                if result.get("message") == "aggregation_failed":
-                    raise RuntimeError(f"aggregation failed: {result}")
-                time.sleep(args.poll_interval)
+        pre_wait_timings = run_rank0_io_with_heartbeat(
+            accelerator,
+            _upload_and_notify if is_main else (lambda: {}),
+            interval_s=args.poll_interval,
+            timeout_s=3600.0,
+            label=f"upload-{round_idx}",
+        )
+        memory = mem_box[0]
+
+        t_wait0 = time.monotonic()
+        result = wait_aggregate_with_heartbeat(
+            accelerator,
+            server=server,
+            round_idx=round_idx,
+            poll_interval=args.poll_interval,
+            timeout_s=3600.0,
+        )
+        if is_main:
+            t_wait = time.monotonic() - t_wait0
+            full_timings = {
+                **(pre_wait_timings or {}),
+                "wait_aggregate_s": round(t_wait, 3),
+                "round_total_s": round(time.monotonic() - t_round0, 3),
+            }
+            logger.info(
+                "Round %s done timing_s=%s server_timing=%s",
+                round_idx,
+                full_timings,
+                result.get("timing_s"),
+            )
+            try:
+                treq = requests.post(
+                    f"{server}/api/round/{round_idx}/client/{args.client_id}/timing",
+                    json={"timings": full_timings},
+                    timeout=30,
+                )
+                treq.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to report client timing: %s", exc)
 
         accelerator.wait_for_everyone()
-        # 轻微同步，避免主进程仍在上传时其他 rank 抢跑下一轮
-        time.sleep(0.5 if not is_main else 0.0)
-
     if is_main:
         logger.info("Client %s done", args.client_id)
 

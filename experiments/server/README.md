@@ -41,5 +41,14 @@ python experiments/server/aggregation_server.py \
 - `GET  /health`
 - `GET  /api/round/current`
 - `GET  /api/round/{N}/plan`
-- `POST /api/round/{N}/client/{C}/upload-complete`
-- `GET  /api/round/{N}/result`
+- `POST /api/round/{N}/client/{C}/upload-complete`（可附带客户端分段 `timings`）
+- `POST /api/round/{N}/client/{C}/timing`（聚合后补报完整客户端耗时）
+- `GET  /api/round/{N}/result`（含 `timing_s`）
+
+`results/.../round_log.json` 每轮会写入 `timing_s`：轮次墙钟、等客户端、上传先后差、汇聚下载/FedAvg/上传全局、以及各 client 分段耗时。
+
+## 韧性（根治相关）
+
+- MinIO 客户端：长 read timeout、multipart、失败指数退避重试
+- FSDP 客户端：下载/上传/等聚合用 **短心跳 broadcast**，避免 rank0 做网络 I/O 时其它 rank 卡死在长 NCCL barrier
+- 聚合服务：`FEDSCALE_CLIENT_UPLOAD_TIMEOUT_S`（默认 1800）内未收齐上传则 `aggregation_failed`，客户端可快速退出

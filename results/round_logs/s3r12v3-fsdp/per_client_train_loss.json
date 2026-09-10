@@ -1,0 +1,167 @@
+{
+  "source": "aggregation_server.log Upload complete (last per round)",
+  "icc1_client0": [
+    {
+      "round": 1,
+      "train_loss": 2.0323
+    },
+    {
+      "round": 2,
+      "train_loss": 1.537
+    },
+    {
+      "round": 3,
+      "train_loss": 1.4149
+    },
+    {
+      "round": 4,
+      "train_loss": 1.3184
+    },
+    {
+      "round": 5,
+      "train_loss": 1.2664
+    },
+    {
+      "round": 6,
+      "train_loss": 1.0802
+    },
+    {
+      "round": 7,
+      "train_loss": 1.065
+    },
+    {
+      "round": 8,
+      "train_loss": 1.0271
+    },
+    {
+      "round": 9,
+      "train_loss": 0.9719
+    },
+    {
+      "round": 10,
+      "train_loss": 0.9795
+    },
+    {
+      "round": 11,
+      "train_loss": 0.9783
+    },
+    {
+      "round": 12,
+      "train_loss": 0.9466
+    },
+    {
+      "round": 13,
+      "train_loss": 0.9456
+    },
+    {
+      "round": 14,
+      "train_loss": 0.9122
+    },
+    {
+      "round": 15,
+      "train_loss": 0.915
+    },
+    {
+      "round": 16,
+      "train_loss": 0.8992
+    },
+    {
+      "round": 17,
+      "train_loss": 0.8984
+    },
+    {
+      "round": 18,
+      "train_loss": 0.8778
+    },
+    {
+      "round": 19,
+      "train_loss": 0.8795
+    },
+    {
+      "round": 20,
+      "train_loss": 0.8679
+    }
+  ],
+  "icc2_client1": [
+    {
+      "round": 1,
+      "train_loss": 2.0505
+    },
+    {
+      "round": 2,
+      "train_loss": 1.5349
+    },
+    {
+      "round": 3,
+      "train_loss": 1.4386
+    },
+    {
+      "round": 4,
+      "train_loss": 1.3258
+    },
+    {
+      "round": 5,
+      "train_loss": 1.2327
+    },
+    {
+      "round": 6,
+      "train_loss": 1.1023
+    },
+    {
+      "round": 7,
+      "train_loss": 1.0446
+    },
+    {
+      "round": 8,
+      "train_loss": 1.0156
+    },
+    {
+      "round": 9,
+      "train_loss": 0.9994
+    },
+    {
+      "round": 10,
+      "train_loss": 0.9659
+    },
+    {
+      "round": 11,
+      "train_loss": 0.9596
+    },
+    {
+      "round": 12,
+      "train_loss": 0.9522
+    },
+    {
+      "round": 13,
+      "train_loss": 0.9641
+    },
+    {
+      "round": 14,
+      "train_loss": 0.9142
+    },
+    {
+      "round": 15,
+      "train_loss": 0.9198
+    },
+    {
+      "round": 16,
+      "train_loss": 0.9087
+    },
+    {
+      "round": 17,
+      "train_loss": 0.8973
+    },
+    {
+      "round": 18,
+      "train_loss": 0.8816
+    },
+    {
+      "round": 19,
+      "train_loss": 0.882
+    },
+    {
+      "round": 20,
+      "train_loss": 0.8819
+    }
+  ]
+}

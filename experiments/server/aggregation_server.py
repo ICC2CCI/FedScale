@@ -4,8 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,9 +40,25 @@ from shared.state_dict_utils import cpu_state, floating_elem_count
 logger = logging.getLogger("aggregation_server")
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _round_s(x: float) -> float:
+    return round(float(x), 3)
+
+
 class UploadCompleteBody(BaseModel):
     num_examples: int = Field(ge=1)
     train_loss: float = 0.0
+    # 客户端在 upload 完成前可上报的分段耗时（秒）
+    timings: Dict[str, float] = Field(default_factory=dict)
+
+
+class ClientTimingBody(BaseModel):
+    """聚合完成后客户端补报完整 round 耗时。"""
+
+    timings: Dict[str, float] = Field(default_factory=dict)
 
 
 class AggregationServer:
@@ -69,13 +88,32 @@ class AggregationServer:
         self.round_results: Dict[int, Dict[str, Any]] = {}
         self.round_plans: Dict[int, RoundPlan] = {}
         self.round_log: List[Dict[str, Any]] = []
+        self.round_meta: Dict[int, Dict[str, Any]] = {}
         self._aggregating = False
+        # 本轮打开后，若超过该时间仍未收齐客户端上传，则标记失败（避免对端无限等待）
+        self.client_upload_timeout_s = float(os.environ.get("FEDSCALE_CLIENT_UPLOAD_TIMEOUT_S", "1800"))
 
         # 写入 round-0 初始全局状态 + 第 1 轮 plan
         if not self.minio.exists(global_state_key(0)):
             logger.info("Uploading initial global_state/round-0/state.pt")
             self.minio.put_torch(global_state_key(0), self.global_state)
         self._ensure_plan(1)
+        self._mark_round_open(1)
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+
+    def _mark_round_open(self, round_idx: int) -> None:
+        meta = self.round_meta.setdefault(round_idx, {})
+        if "opened_mono" not in meta:
+            meta["opened_mono"] = time.monotonic()
+            meta["opened_at"] = _utc_now_iso()
+            meta["client_upload_mono"] = {}
+            meta["client_timings"] = {}
+
+    def _find_log_entry(self, round_idx: int) -> Optional[Dict[str, Any]]:
+        for entry in self.round_log:
+            if int(entry.get("round", -1)) == round_idx:
+                return entry
+        return None
 
     def _ensure_plan(self, round_idx: int) -> RoundPlan:
         if round_idx in self.round_plans:
@@ -127,16 +165,22 @@ class AggregationServer:
         with self.lock:
             if round_idx != self.current_round:
                 raise HTTPException(409, f"expected round {self.current_round}, got {round_idx}")
+            self._mark_round_open(round_idx)
             bucket = self.round_uploads.setdefault(round_idx, {})
             bucket[client_id] = body
+            meta = self.round_meta[round_idx]
+            meta["client_upload_mono"][client_id] = time.monotonic()
+            if body.timings:
+                meta["client_timings"][client_id] = dict(body.timings)
             logger.info(
-                "Upload complete round=%s client=%s (%s/%s) loss=%.4f n=%s",
+                "Upload complete round=%s client=%s (%s/%s) loss=%.4f n=%s timings=%s",
                 round_idx,
                 client_id,
                 len(bucket),
                 self.num_clients,
                 body.train_loss,
                 body.num_examples,
+                {k: _round_s(v) for k, v in (body.timings or {}).items()},
             )
             if len(bucket) >= self.num_clients and round_idx not in self.round_results and not self._aggregating:
                 self._aggregating = True
@@ -145,6 +189,30 @@ class AggregationServer:
         if should_aggregate:
             threading.Thread(target=self._aggregate_round, args=(round_idx,), daemon=True).start()
         return {"accepted": True, "received": len(self.round_uploads.get(round_idx, {}))}
+
+    def report_client_timing(self, round_idx: int, client_id: int, body: ClientTimingBody) -> Dict[str, Any]:
+        if client_id < 0 or client_id >= self.num_clients:
+            raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
+        if round_idx < 1 or round_idx > self.num_rounds:
+            raise HTTPException(404, f"round {round_idx} out of range")
+        with self.lock:
+            meta = self.round_meta.setdefault(round_idx, {"client_timings": {}})
+            prev = dict(meta.get("client_timings", {}).get(client_id, {}))
+            prev.update({k: float(v) for k, v in body.timings.items()})
+            meta.setdefault("client_timings", {})[client_id] = prev
+            entry = self._find_log_entry(round_idx)
+            if entry is not None:
+                timing = entry.setdefault("timing_s", {})
+                clients = timing.setdefault("clients", {})
+                clients[str(client_id)] = {k: _round_s(v) for k, v in prev.items()}
+                self._write_round_log()
+            logger.info(
+                "Client timing round=%s client=%s timings=%s",
+                round_idx,
+                client_id,
+                {k: _round_s(v) for k, v in prev.items()},
+            )
+        return {"accepted": True}
 
     def get_result(self, round_idx: int) -> Dict[str, Any]:
         with self.lock:
@@ -158,16 +226,68 @@ class AggregationServer:
                 "message": "waiting for clients / aggregation",
             }
 
+    def _watchdog_loop(self) -> None:
+        while True:
+            try:
+                self._check_upload_timeouts()
+            except Exception:
+                logger.exception("upload timeout watchdog error")
+            time.sleep(5.0)
+
+    def _check_upload_timeouts(self) -> None:
+        with self.lock:
+            round_idx = self.current_round
+            if round_idx < 1 or round_idx > self.num_rounds:
+                return
+            if round_idx in self.round_results or self._aggregating:
+                return
+            meta = self.round_meta.get(round_idx) or {}
+            opened = meta.get("opened_mono")
+            if opened is None:
+                return
+            elapsed = time.monotonic() - float(opened)
+            if elapsed < self.client_upload_timeout_s:
+                return
+            bucket = self.round_uploads.get(round_idx, {})
+            if len(bucket) >= self.num_clients:
+                return
+            missing = [cid for cid in range(self.num_clients) if cid not in bucket]
+            logger.error(
+                "Round %s upload timeout after %.0fs; received=%s missing=%s",
+                round_idx,
+                elapsed,
+                sorted(bucket.keys()),
+                missing,
+            )
+            self.round_results[round_idx] = {
+                "round": round_idx,
+                "done": False,
+                "message": "aggregation_failed",
+                "reason": "client_upload_timeout",
+                "missing_clients": missing,
+                "elapsed_s": _round_s(elapsed),
+            }
+            self._aggregating = False
+
     def _aggregate_round(self, round_idx: int) -> None:
         try:
+            t_agg0 = time.monotonic()
             plan = self._ensure_plan(round_idx)
             selected = selected_from_jsonable(plan.selected_by_key)
             metas = self.round_uploads[round_idx]
             weights: List[float] = []
             deltas = []
             losses = []
+
+            t_dl0 = time.monotonic()
+            upload_sizes_b: List[int] = []
             for cid in range(self.num_clients):
-                payload = self.minio.get_torch(upload_blocks_key(round_idx, cid), map_location="cpu")
+                key = upload_blocks_key(round_idx, cid)
+                try:
+                    upload_sizes_b.append(self.minio.object_size(key))
+                except Exception:
+                    upload_sizes_b.append(0)
+                payload = self.minio.get_torch(key, map_location="cpu")
                 if isinstance(payload, dict) and "block_delta" in payload:
                     deltas.append(payload["block_delta"])
                     weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
@@ -176,42 +296,108 @@ class AggregationServer:
                     deltas.append(payload)
                     weights.append(float(metas[cid].num_examples))
                     losses.append(float(metas[cid].train_loss))
+            t_download = time.monotonic() - t_dl0
 
+            t_apply0 = time.monotonic()
             apply_block_delta(self.global_state, deltas, weights, selected)
-            self.minio.put_torch(global_state_key(round_idx), self.global_state)
+            t_apply = time.monotonic() - t_apply0
+
+            t_up0 = time.monotonic()
+            global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
+            t_upload_global = time.monotonic() - t_up0
+            t_agg_total = time.monotonic() - t_agg0
+
+            with self.lock:
+                meta = self.round_meta.setdefault(round_idx, {})
+                opened_mono = float(meta.get("opened_mono", t_agg0))
+                upload_monos = dict(meta.get("client_upload_mono", {}))
+                client_timings = {
+                    str(cid): {k: _round_s(v) for k, v in timings.items()}
+                    for cid, timings in dict(meta.get("client_timings", {})).items()
+                }
+
+            first_upload = min(upload_monos.values()) if upload_monos else t_agg0
+            last_upload = max(upload_monos.values()) if upload_monos else t_agg0
+            finished_mono = time.monotonic()
+            transfer = {
+                "upload_blocks_MiB_per_client": {
+                    str(cid): _round_s(sz / (1024 * 1024)) for cid, sz in enumerate(upload_sizes_b)
+                },
+                "upload_blocks_MiB_total": _round_s(sum(upload_sizes_b) / (1024 * 1024)),
+                "global_state_MiB": _round_s(global_bytes / (1024 * 1024)),
+                "selected_elems_M": _round_s(plan.selected_elems / 1e6),
+            }
+            timing_s = {
+                "opened_at": meta.get("opened_at"),
+                "finished_at": _utc_now_iso(),
+                "round_wall_s": _round_s(finished_mono - opened_mono),
+                "wait_all_clients_s": _round_s(last_upload - opened_mono),
+                "client_upload_gap_s": _round_s(last_upload - first_upload),
+                "agg_download_uploads_s": _round_s(t_download),
+                "agg_apply_s": _round_s(t_apply),
+                "agg_upload_global_s": _round_s(t_upload_global),
+                "agg_total_s": _round_s(t_agg_total),
+                "transfer": transfer,
+                "clients": client_timings,
+            }
 
             avg_train = sum(losses) / max(len(losses), 1)
+            client_losses = {str(cid): round(float(losses[cid]), 6) for cid in range(len(losses))}
             result = {
                 "round": round_idx,
                 "done": True,
                 "eval_loss": None,
                 "avg_train_loss": round(avg_train, 6),
+                "client_train_loss": client_losses,
                 "upload_ratio": round(plan.upload_ratio, 6),
                 "n_selected_blocks": plan.n_selected_blocks,
                 "selected_elems": plan.selected_elems,
                 "message": "aggregated",
+                "timing_s": timing_s,
             }
             entry = {
                 "round": round_idx,
                 "epoch": plan.epoch,
                 "slot": plan.slot,
                 "avg_train_loss": result["avg_train_loss"],
+                "client_train_loss": client_losses,
                 "eval_loss": None,
                 "pct_of_total": round(plan.upload_ratio * 100, 2),
                 "n_selected_blocks": plan.n_selected_blocks,
                 "selected_elems_M": round(plan.selected_elems / 1e6, 3),
+                "timing_s": timing_s,
             }
             with self.lock:
                 self.round_results[round_idx] = result
                 self.round_log.append(entry)
                 self._write_round_log()
+                self._append_metrics_jsonl(entry)
                 if round_idx < self.num_rounds:
                     self.current_round = round_idx + 1
                     self._ensure_plan(self.current_round)
+                    self._mark_round_open(self.current_round)
                 else:
                     self.current_round = self.num_rounds + 1
                 self._aggregating = False
-            logger.info("Aggregated round %s avg_train=%.4f ratio=%.2f%%", round_idx, avg_train, plan.upload_ratio * 100)
+            logger.info(
+                "Aggregated round %s avg_train=%.4f ratio=%.2f%% transfer=%s timing=%s",
+                round_idx,
+                avg_train,
+                plan.upload_ratio * 100,
+                transfer,
+                {
+                    k: timing_s[k]
+                    for k in (
+                        "round_wall_s",
+                        "wait_all_clients_s",
+                        "client_upload_gap_s",
+                        "agg_download_uploads_s",
+                        "agg_apply_s",
+                        "agg_upload_global_s",
+                        "agg_total_s",
+                    )
+                },
+            )
         except Exception:
             logger.exception("Aggregation failed for round %s", round_idx)
             with self.lock:
@@ -225,6 +411,11 @@ class AggregationServer:
     def _write_round_log(self) -> None:
         path = self.results_dir / "round_log.json"
         path.write_text(json.dumps(self.round_log, indent=2), encoding="utf-8")
+
+    def _append_metrics_jsonl(self, entry: Dict[str, Any]) -> None:
+        path = self.results_dir / "metrics.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def load_initial_state(args: argparse.Namespace, minio: MinIOClient) -> Dict[str, torch.Tensor]:
@@ -282,6 +473,10 @@ def build_app(server: AggregationServer) -> FastAPI:
     @app.post("/api/round/{round_idx}/client/{client_id}/upload-complete")
     def upload_complete(round_idx: int, client_id: int, body: UploadCompleteBody) -> Dict[str, Any]:
         return server.upload_complete(round_idx, client_id, body)
+
+    @app.post("/api/round/{round_idx}/client/{client_id}/timing")
+    def client_timing(round_idx: int, client_id: int, body: ClientTimingBody) -> Dict[str, Any]:
+        return server.report_client_timing(round_idx, client_id, body)
 
     @app.get("/api/round/{round_idx}/result")
     def round_result(round_idx: int) -> Dict[str, Any]:
