@@ -48,6 +48,7 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
     "eval": [
         "eval_path",
         "eval_max_batches",
+        "eval_every_n_rounds",
     ],
     "sync": [
         "min_clients_to_aggregate",

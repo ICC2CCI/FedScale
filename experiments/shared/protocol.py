@@ -36,6 +36,21 @@ def upload_blocks_key(round_idx: int, client_id: int) -> str:
     return f"uploads/round-{round_idx}/client-{client_id}/blocks.pt"
 
 
+def upload_block_key(round_idx: int, client_id: int, block_idx: int) -> str:
+    """流式：单个 block 的上传 key（per-block pipeline）。"""
+    return f"uploads/round-{round_idx}/client-{client_id}/block-{block_idx}.pt"
+
+
+def agg_block_key(round_idx: int, block_idx: int) -> str:
+    """流式：server 聚合后单个 block 的 delta key（client 可逐 block 下载）。"""
+    return f"global_delta/round-{round_idx}/block-{block_idx}.pt"
+
+
+def agg_block_done_key(round_idx: int) -> str:
+    """流式：标记本轮所有 block 聚合完成的哨兵 key。"""
+    return f"global_delta/round-{round_idx}/_done"
+
+
 def plan_key(round_idx: int) -> str:
     return f"plans/round-{round_idx}/plan.json"
 
@@ -51,6 +66,8 @@ class RoundPlan:
     n_selected_blocks: int
     selected_elems: int
     total_elems: int
+    # 流式 per-block pipeline：有序 block 列表，每项 [global_idx, key_name, start, end]
+    block_list: List[List[int]] = field(default_factory=list)
 
     @property
     def upload_ratio(self) -> float:
@@ -75,6 +92,7 @@ class RoundPlan:
             n_selected_blocks=int(data["n_selected_blocks"]),
             selected_elems=int(data["selected_elems"]),
             total_elems=int(data["total_elems"]),
+            block_list=[list(b) for b in data.get("block_list", [])],
         )
 
 

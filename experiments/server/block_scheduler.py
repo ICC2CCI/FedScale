@@ -1,7 +1,7 @@
 """RoundPlan / block mask 调度（从 S3R12v3 提取；ALG-2 支持多 slot）。"""
 from __future__ import annotations
 
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 import torch
 
@@ -67,6 +67,13 @@ class BlockScheduler:
             )
         selected_elems = count_selected_elems(selected)
         n_blocks = sum(len(v) for v in selected.values())
+        # 流式：给每个选中 block 分配全局索引（block_list: [[gidx, key_name, start, end], ...]）
+        block_list: List[List[int]] = []
+        gidx = 0
+        for key_name, slices in selected.items():
+            for s, e in slices:
+                block_list.append([gidx, key_name, s, e])
+                gidx += 1
         return RoundPlan(
             round=round_idx,
             epoch=epoch,
@@ -77,6 +84,7 @@ class BlockScheduler:
             n_selected_blocks=n_blocks,
             selected_elems=selected_elems,
             total_elems=self.total_elems,
+            block_list=block_list,
         )
 
 

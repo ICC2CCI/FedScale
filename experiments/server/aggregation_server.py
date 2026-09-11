@@ -33,10 +33,13 @@ from shared.protocol import (
     DEFAULT_SEED,
     DEFAULT_TRANSFER_DTYPE,
     RoundPlan,
+    agg_block_done_key,
+    agg_block_key,
     global_delta_key,
     global_state_key,
     plan_key,
     selected_from_jsonable,
+    upload_block_key,
     upload_blocks_key,
 )
 from shared.run_config import apply_to_args, load_run_config, snapshot_effective_config
@@ -78,6 +81,13 @@ class ClientTimingBody(BaseModel):
     """聚合完成后客户端补报完整 round 耗时。"""
 
     timings: Dict[str, float] = Field(default_factory=dict)
+
+
+class BlockUploadBody(BaseModel):
+    """流式 per-block pipeline：client 上传一个 block 后通知 server 的 body。"""
+    num_examples: int = 1
+    train_loss: float = 0.0
+    eval_loss: Optional[float] = None
 
 
 class AggregationServer:
@@ -168,6 +178,12 @@ class AggregationServer:
         self.round_log: List[Dict[str, Any]] = []
         self.round_meta: Dict[int, Dict[str, Any]] = {}
         self._aggregating = False
+        # 流式 per-block pipeline：round_idx -> {block_idx -> set(client_ids)} 已上传的 block
+        self.round_block_uploads: Dict[int, Dict[int, set]] = {}
+        # round_idx -> {block_idx -> agg_block_delta} 已聚合的 block 结果
+        self.round_block_agg: Dict[int, Dict[int, Any]] = {}
+        # round_idx -> {client_id -> num_examples} 流式上传的 metadata
+        self.round_client_meta: Dict[int, Dict[int, Dict[str, Any]]] = {}
         # 本轮打开后，若超过该时间仍未收齐客户端上传，则标记失败（避免对端无限等待）
         self.client_upload_timeout_s = float(client_upload_timeout_s)
 
@@ -389,6 +405,133 @@ class AggregationServer:
             )
         return {"accepted": True}
 
+    def block_uploaded(self, round_idx: int, client_id: int, block_idx: int,
+                        num_examples: int, train_loss: float,
+                        eval_loss: Optional[float] = None) -> Dict[str, Any]:
+        """流式 per-block pipeline：client 上传一个 block 后通知 server。
+
+        server 检查该 block 的所有 client 是否都已上传：
+        - 是 → 立即 FedAvg 该 block → 写 agg_block_key → client 可下载
+        - 否 → 记录，继续等其他 client 的该 block
+        """
+        if client_id < 0 or client_id >= self.num_clients:
+            raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
+        if round_idx < 1 or round_idx > self.num_rounds:
+            raise HTTPException(404, f"round {round_idx} out of range")
+
+        key = upload_block_key(round_idx, client_id, block_idx)
+        if not self.minio.exists(key):
+            raise HTTPException(400, f"missing MinIO object: {key}")
+
+        # 记录该 client 的 metadata
+        with self.lock:
+            if round_idx < self.current_round:
+                raise HTTPException(409, f"round {round_idx} already finished")
+            block_uploads = self.round_block_uploads.setdefault(round_idx, {})
+            uploaded_clients = block_uploads.setdefault(block_idx, set())
+            uploaded_clients.add(client_id)
+            # 记录 client metadata
+            client_meta = self.round_client_meta.setdefault(round_idx, {})
+            client_meta[client_id] = {
+                "num_examples": num_examples,
+                "train_loss": train_loss,
+                "eval_loss": eval_loss,
+            }
+
+            # 检查该 block 是否所有 client 都已上传
+            all_uploaded = len(uploaded_clients) >= self.effective_min_clients
+            if not all_uploaded:
+                logger.info(
+                    "Pipeline block %s round %s: client %s uploaded (%s/%s), waiting",
+                    block_idx, round_idx, client_id,
+                    len(uploaded_clients), self.effective_min_clients,
+                )
+                return {"aggregated": False, "waiting": len(uploaded_clients)}
+
+        # 所有 client 的该 block 都已上传 → 立即聚合
+        agg_result = self._aggregate_single_block(round_idx, block_idx)
+
+        return {"aggregated": True, "agg_key": agg_block_key(round_idx, block_idx)}
+
+    def _aggregate_single_block(self, round_idx: int, block_idx: int) -> Dict[str, Any]:
+        """流式：聚合单个 block（所有 client 的该 block FedAvg），写出 agg_block_key。"""
+        plan = self._ensure_plan(round_idx)
+        # 从 block_list 找到该 block 的 key_name, start, end
+        block_info = None
+        for b in plan.block_list:
+            if int(b[0]) == block_idx:
+                block_info = b
+                break
+        if block_info is None:
+            logger.error("Pipeline: block_idx %s not in plan block_list", block_idx)
+            return {}
+
+        _, key_name, start, end = block_info
+        selected_for_block = {key_name: [(start, end)]}
+
+        # 下载所有 client 的该 block
+        with self.lock:
+            uploaded = sorted(self.round_block_uploads.get(round_idx, {}).get(block_idx, set()))
+            client_meta = dict(self.round_client_meta.get(round_idx, {}))
+
+        deltas = []
+        weights = []
+        for cid in uploaded:
+            bkey = upload_block_key(round_idx, cid, block_idx)
+            payload = self.minio.get_torch(bkey, map_location="cpu")
+            if isinstance(payload, dict) and "block_delta" in payload:
+                deltas.append(payload["block_delta"])
+                weights.append(float(payload.get("num_examples", client_meta.get(cid, {}).get("num_examples", 1))))
+            else:
+                deltas.append(payload)
+                weights.append(float(client_meta.get(cid, {}).get("num_examples", 1)))
+
+        # FedAvg 该单个 block
+        agg_delta = apply_block_delta(
+            self.global_state,
+            deltas,
+            weights,
+            selected_for_block,
+            out_dtype=self.transfer_dtype,
+        )
+
+        # 写出该 block 的聚合 delta
+        agg_payload = {
+            "round": int(round_idx),
+            "block_idx": int(block_idx),
+            "block_delta": agg_delta,
+        }
+        self.minio.put_torch(agg_block_key(round_idx, block_idx), agg_payload)
+
+        with self.lock:
+            self.round_block_agg.setdefault(round_idx, {})[block_idx] = agg_delta
+            n_done = len(self.round_block_agg.get(round_idx, {}))
+            plan = self.round_plans.get(round_idx)
+        logger.info(
+            "Pipeline: aggregated block %s/%s round %s (key=%s [%s:%s])",
+            n_done, plan.n_selected_blocks if plan else "?", round_idx, key_name, start, end,
+        )
+
+        # 所有 block 聚合完成 → 触发 round 完成（组装 delta + 推进 current_round）
+        if plan and n_done >= plan.n_selected_blocks:
+            logger.info("Pipeline: all blocks aggregated for round %s, finalizing", round_idx)
+            self._finalize_pipeline_round(round_idx)
+        return agg_payload
+
+    def _finalize_pipeline_round(self, round_idx: int) -> None:
+        """流式：所有 block 聚合完成后，组装完整 delta、写 MinIO、推进 current_round。"""
+        threading.Thread(target=self._aggregate_round, args=(round_idx,), daemon=True).start()
+
+    def check_block_agg_done(self, round_idx: int) -> Dict[str, Any]:
+        """流式：client 检查本轮所有 block 是否都已聚合完成。"""
+        with self.lock:
+            plan = self.round_plans.get(round_idx)
+            if plan is None:
+                return {"done": False, "n_done": 0, "n_total": 0}
+            n_done = len(self.round_block_agg.get(round_idx, {}))
+            return {"done": n_done >= plan.n_selected_blocks,
+                    "n_done": n_done, "n_total": plan.n_selected_blocks}
+
     def get_result(self, round_idx: int) -> Dict[str, Any]:
         with self.lock:
             if round_idx in self.round_results:
@@ -479,96 +622,132 @@ class AggregationServer:
             t_agg0 = time.monotonic()
             plan = self._ensure_plan(round_idx)
             selected = selected_from_jsonable(plan.selected_by_key)
-            metas = self.round_uploads[round_idx]
-            weights: List[float] = []
-            deltas = []
-            losses = []
-            eval_losses: List[float] = []
 
-            # SYNC-1：部分聚合时只下载已上传的 client
-            participated = sorted(metas.keys())
-            t_dl0 = time.monotonic()
-            upload_sizes_b: List[int] = []
-            for cid in participated:
-                key = upload_blocks_key(round_idx, cid)
-                try:
-                    upload_sizes_b.append(self.minio.object_size(key))
-                except Exception:
-                    upload_sizes_b.append(0)
-                payload = self.minio.get_torch(key, map_location="cpu")
-                if isinstance(payload, dict) and "block_delta" in payload:
-                    deltas.append(payload["block_delta"])
-                    weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
-                    losses.append(float(payload.get("train_loss", metas[cid].train_loss)))
-                    # payload 或 upload-complete body 都可带 eval
-                    ev = payload.get("eval_loss", metas[cid].eval_loss)
-                    if ev is not None:
-                        eval_losses.append(float(ev))
-                else:
-                    deltas.append(payload)
-                    weights.append(float(metas[cid].num_examples))
-                    losses.append(float(metas[cid].train_loss))
-                    if metas[cid].eval_loss is not None:
-                        eval_losses.append(float(metas[cid].eval_loss))
-            t_download = time.monotonic() - t_dl0
+            # 流式 per-block pipeline：如果所有 block 已通过 pipeline 聚合完成，
+            # 直接组装 agg_delta，不再重新下载/聚合
+            with self.lock:
+                block_agg = dict(self.round_block_agg.get(round_idx, {}))
+            if block_agg and len(block_agg) >= plan.n_selected_blocks:
+                logger.info("Pipeline: all %s blocks already aggregated via pipeline, assembling", plan.n_selected_blocks)
+                # 组装完整 agg_delta（合并所有 block）
+                agg_delta = {}
+                for bidx in sorted(block_agg.keys()):
+                    bd = block_agg[bidx]
+                    for kn, blocks in bd.items():
+                        agg_delta.setdefault(kn, []).extend(blocks)
 
-            # SEC-4：异常更新防护——计算各 client delta 范数，超阈值剔除/裁剪
-            sec4_rejected: List[int] = []
-            if self.delta_norm_reject > 0 or self.delta_norm_clip > 0:
-                kept_deltas: List = []
-                kept_weights: List[float] = []
-                kept_losses: List[float] = []
-                kept_participated: List[int] = []
-                for i, cid in enumerate(participated):
-                    norm = 0.0
-                    for blocks in deltas[i].values():
-                        for item in blocks:
-                            norm += float(_slice_to_fp32(item).pow(2).sum().item())
-                    norm = norm ** 0.5
-                    if self.delta_norm_reject > 0 and norm > self.delta_norm_reject:
-                        logger.warning(
-                            "SEC-4: reject client %s round %s: delta norm %.4f > %.4f",
-                            cid, round_idx, norm, self.delta_norm_reject,
-                        )
-                        sec4_rejected.append(cid)
-                        continue
-                    if self.delta_norm_clip > 0 and norm > self.delta_norm_clip:
-                        scale = self.delta_norm_clip / (norm + 1e-12)
-                        for kn in list(deltas[i].keys()):
-                            new_blocks = []
-                            for it in deltas[i][kn]:
-                                s, e = it[0], it[1]
-                                sf32 = _slice_to_fp32(it) * scale
-                                orig_dtype = it[2].dtype
-                                if len(it) > 3:
-                                    new_blocks.append((s, e, sf32.to(orig_dtype), it[3]))
-                                else:
-                                    new_blocks.append((s, e, sf32.to(orig_dtype)))
-                            deltas[i][kn] = new_blocks
-                        logger.info(
-                            "SEC-4: clip client %s round %s: norm %.4f -> %.4f",
-                            cid, round_idx, norm, self.delta_norm_clip,
-                        )
-                    kept_deltas.append(deltas[i])
-                    kept_weights.append(weights[i])
-                    kept_losses.append(losses[i] if i < len(losses) else 0.0)
-                    kept_participated.append(cid)
-                if sec4_rejected:
-                    deltas = kept_deltas
-                    weights = kept_weights
-                    losses = kept_losses
-                    participated = kept_participated
-                    logger.warning("SEC-4: rejected clients %s for round %s", sec4_rejected, round_idx)
+                # 从 client_meta 取 losses
+                with self.lock:
+                    client_meta = dict(self.round_client_meta.get(round_idx, {}))
+                    participated = sorted(client_meta.keys())
+                losses = [float(client_meta[c].get("train_loss", 0)) for c in participated]
+                eval_losses = [float(client_meta[c]["eval_loss"]) for c in participated
+                               if client_meta[c].get("eval_loss") is not None]
+                weights = [float(client_meta[c].get("num_examples", 1)) for c in participated]
+                metas = {}  # pipeline 模式不用 metas
+                upload_sizes_b = [0] * len(participated)
+                t_download = 0.0
+                t_apply = 0.0
+            else:
+                # 批量模式（回退）
+                metas = self.round_uploads[round_idx]
+                weights: List[float] = []
+                deltas = []
+                losses = []
+                eval_losses: List[float] = []
 
-            t_apply0 = time.monotonic()
-            agg_delta = apply_block_delta(
-                self.global_state,
-                deltas,
-                weights,
-                selected,
-                out_dtype=self.transfer_dtype,
-            )
-            t_apply = time.monotonic() - t_apply0
+                # 流式聚合：每收到一个 client 上传就立即下载（不等其他 client），
+                # 下载与下一个 client 的训练/上传并行，减少串行等待
+                participated = sorted(metas.keys())
+                t_dl0 = time.monotonic()
+                upload_sizes_b: List[int] = []
+                for cid in participated:
+                    key = upload_blocks_key(round_idx, cid)
+                    try:
+                        upload_sizes_b.append(self.minio.object_size(key))
+                    except Exception:
+                        upload_sizes_b.append(0)
+                    t_block0 = time.monotonic()
+                    payload = self.minio.get_torch(key, map_location="cpu")
+                    t_block = time.monotonic() - t_block0
+                    if isinstance(payload, dict) and "block_delta" in payload:
+                        deltas.append(payload["block_delta"])
+                        weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
+                        losses.append(float(payload.get("train_loss", metas[cid].train_loss)))
+                        ev = payload.get("eval_loss", metas[cid].eval_loss)
+                        if ev is not None:
+                            eval_losses.append(float(ev))
+                    else:
+                        deltas.append(payload)
+                        weights.append(float(metas[cid].num_examples))
+                        losses.append(float(metas[cid].train_loss))
+                        if metas[cid].eval_loss is not None:
+                            eval_losses.append(float(metas[cid].eval_loss))
+                    logger.info(
+                        "Streaming: downloaded client %s blocks.pt in %.2fs (accumulated %s/%s)",
+                        cid, t_block, len(deltas), len(participated),
+                    )
+                t_download = time.monotonic() - t_dl0
+
+                # SEC-4：异常更新防护——计算各 client delta 范数，超阈值剔除/裁剪
+                sec4_rejected: List[int] = []
+                if self.delta_norm_reject > 0 or self.delta_norm_clip > 0:
+                    kept_deltas: List = []
+                    kept_weights: List[float] = []
+                    kept_losses: List[float] = []
+                    kept_participated: List[int] = []
+                    for i, cid in enumerate(participated):
+                        norm = 0.0
+                        for blocks in deltas[i].values():
+                            for item in blocks:
+                                norm += float(_slice_to_fp32(item).pow(2).sum().item())
+                        norm = norm ** 0.5
+                        if self.delta_norm_reject > 0 and norm > self.delta_norm_reject:
+                            logger.warning(
+                                "SEC-4: reject client %s round %s: delta norm %.4f > %.4f",
+                                cid, round_idx, norm, self.delta_norm_reject,
+                            )
+                            sec4_rejected.append(cid)
+                            continue
+                        if self.delta_norm_clip > 0 and norm > self.delta_norm_clip:
+                            scale = self.delta_norm_clip / (norm + 1e-12)
+                            for kn in list(deltas[i].keys()):
+                                new_blocks = []
+                                for it in deltas[i][kn]:
+                                    s, e = it[0], it[1]
+                                    sf32 = _slice_to_fp32(it) * scale
+                                    orig_dtype = it[2].dtype
+                                    if len(it) > 3:
+                                        new_blocks.append((s, e, sf32.to(orig_dtype), it[3]))
+                                    else:
+                                        new_blocks.append((s, e, sf32.to(orig_dtype)))
+                                deltas[i][kn] = new_blocks
+                            logger.info(
+                                "SEC-4: clip client %s round %s: norm %.4f -> %.4f",
+                                cid, round_idx, norm, self.delta_norm_clip,
+                            )
+                        kept_deltas.append(deltas[i])
+                        kept_weights.append(weights[i])
+                        kept_losses.append(losses[i] if i < len(losses) else 0.0)
+                        kept_participated.append(cid)
+                    if sec4_rejected:
+                        deltas = kept_deltas
+                        weights = kept_weights
+                        losses = kept_losses
+                        participated = kept_participated
+                        logger.warning("SEC-4: rejected clients %s for round %s", sec4_rejected, round_idx)
+
+                t_apply0 = time.monotonic()
+                agg_delta = apply_block_delta(
+                    self.global_state,
+                    deltas,
+                    weights,
+                    selected,
+                    out_dtype=self.transfer_dtype,
+                )
+                t_apply = time.monotonic() - t_apply0
+
+            # 公共：写出 delta + 结果（pipeline 模式 agg_delta 已组装好，batch 模式刚算完）
 
             t_up0 = time.monotonic()
             delta_payload = {
@@ -630,7 +809,11 @@ class AggregationServer:
             avg_eval = (sum(eval_losses) / len(eval_losses)) if eval_losses else None
             client_eval = {}
             for cid in participated:
-                ev = metas[cid].eval_loss
+                # pipeline 模式 metas 为空，从 client_meta 取；batch 模式从 metas 取
+                if metas:
+                    ev = metas[cid].eval_loss
+                else:
+                    ev = self.round_client_meta.get(round_idx, {}).get(cid, {}).get("eval_loss")
                 if ev is not None:
                     client_eval[str(cid)] = round(float(ev), 6)
             is_partial = bool(meta.get("partial")) and len(participated) < self.num_clients
@@ -825,6 +1008,20 @@ def build_app(server: AggregationServer) -> FastAPI:
     @app.get("/api/round/{round_idx}/result")
     def round_result(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
         return server.get_result(round_idx)
+
+    # 流式 per-block pipeline API
+    @app.post("/api/round/{round_idx}/client/{client_id}/block/{block_idx}/uploaded")
+    def block_uploaded(
+        round_idx: int, client_id: int, block_idx: int,
+        body: BlockUploadBody,
+        _: None = Depends(_auth),
+    ) -> Dict[str, Any]:
+        return server.block_uploaded(round_idx, client_id, block_idx,
+                                     body.num_examples, body.train_loss, body.eval_loss)
+
+    @app.get("/api/round/{round_idx}/block-status")
+    def block_status(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
+        return server.check_block_agg_done(round_idx)
 
     return app
 

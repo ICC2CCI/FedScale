@@ -28,12 +28,13 @@ train:
 io:
   skip_round0_download: true
   online_eval: true
-  write_full_global_every_n_rounds: 1   # IO-1: 1=每轮都写; 5/10=每 N 轮; 0=只写 round-0 与最终轮
+  write_full_global_every_n_rounds: 0   # IO-1: 0=只写 round-0 与最终轮，中间只写 delta（client 固定+MinIO 稳定时用）
   client_upload_timeout_s: 1800
 
 eval:
   eval_path: data/medical_flashcards_eval.json
   eval_max_batches: 0
+  eval_every_n_rounds: 5   # eval 频率：1=每轮(默认,~10s/轮)；5=每5轮一次(省时间)；round 1 始终 eval
 
 # P1 起（SYNC-1/SEC-0/RES-1）用到的字段，P0 阶段可忽略
 sync:

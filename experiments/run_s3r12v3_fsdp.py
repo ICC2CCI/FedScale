@@ -53,9 +53,12 @@ from shared.protocol import (  # noqa: E402
     DEFAULT_SEQ_LEN,
     DEFAULT_TRANSFER_DTYPE,
     RoundPlan,
+    agg_block_done_key,
+    agg_block_key,
     global_delta_key,
     global_state_key,
     selected_from_jsonable,
+    upload_block_key,
     upload_blocks_key,
 )
 from shared.run_config import apply_to_args, load_run_config  # noqa: E402
@@ -350,6 +353,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="在线 eval 最多 batch 数；0=全集",
     )
+    p.add_argument(
+        "--eval-every-n-rounds",
+        type=int,
+        default=1,
+        help="eval 频率：1=每轮(默认)；5=每5轮一次(省~10s/轮)；round 1 始终 eval",
+    )
     # SEC-0：控制面 token
     p.add_argument(
         "--auth-token",
@@ -539,6 +548,8 @@ def main() -> None:
         )
         plan = RoundPlan.from_dict(plan_raw)
         selected = selected_from_jsonable(plan.selected_by_key)
+        # 流式 pipeline：plan 带 block_list 时用 per-block 上传+下载
+        use_pipeline = bool(plan.block_list)
 
         # OPS-3：Client 选择。未选中则跳过训练，但仍对齐 delta 并等待聚合结果
         selected_client_ids = plan_raw.get("selected_client_ids")
@@ -696,9 +707,14 @@ def main() -> None:
         t_train = time.monotonic() - t_train0
 
         # 在线 eval（本地训练后），全 ranks 参与 FSDP 前向
+        # 优化：eval_every_n_rounds 控制频率，默认每轮，可设 5 表示每 5 轮 eval 一次（省 ~10s/轮）
+        do_eval_this_round = (
+            eval_loader is not None
+            and (args.eval_every_n_rounds <= 0 or round_idx % args.eval_every_n_rounds == 0 or round_idx == 1)
+        )
         eval_loss_val: Optional[float] = None
         t_eval = 0.0
-        if eval_loader is not None:
+        if do_eval_this_round:
             t_eval0 = time.monotonic()
             eval_loss_val = eval_local_batches(
                 model, eval_loader, accelerator, max_batches=args.eval_max_batches
@@ -711,7 +727,110 @@ def main() -> None:
         full_state = get_full_state_fsdp(model)
         mem_box: List[Any] = [memory]
 
-        def _upload_and_notify():
+        def _pipeline_upload_and_apply():
+            """流式 per-block pipeline：逐 block 上传，聚合好的立即下载 apply。"""
+            assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
+            t_enc0 = time.monotonic()
+            delta = sub_state(full_state, global_state)
+            to_send = add_state(delta, mem_box[0])
+            assert transfer_dtype is not None
+            block_delta = encode_block_delta(to_send, selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
+            t_encode = time.monotonic() - t_enc0
+
+            # 逐 block 上传并通知 server
+            logger.info("Pipeline: uploading %s blocks (ratio=%.2f%%)", plan.n_selected_blocks, plan.upload_ratio * 100)
+            t_up0 = time.monotonic()
+            total_upload_bytes = 0
+            for binfo in plan.block_list:
+                gidx, key_name, start, end = binfo[0], binfo[1], binfo[2], binfo[3]
+                # 取出该 block 的 delta slice
+                single_block_delta = {}
+                if key_name in block_delta:
+                    for s, e, slice_data in block_delta[key_name]:
+                        if s == start and e == end:
+                            single_block_delta[key_name] = [(s, e, slice_data)]
+                            break
+                block_payload = {
+                    "block_delta": single_block_delta,
+                    "num_examples": int(num_examples),
+                    "train_loss": float(train_loss),
+                    "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                    "client_id": int(args.client_id),
+                    "round": int(round_idx),
+                    "block_idx": int(gidx),
+                }
+                bkey = upload_block_key(round_idx, args.client_id, gidx)
+                total_upload_bytes += minio.put_torch(bkey, block_payload)
+                # 通知 server 该 block 已上传
+                resp = requests.post(
+                    f"{server}/api/round/{round_idx}/client/{args.client_id}/block/{gidx}/uploaded",
+                    json={
+                        "num_examples": int(num_examples),
+                        "train_loss": float(train_loss),
+                        "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                    },
+                    timeout=30,
+                    headers=auth_headers,
+                )
+                resp.raise_for_status()
+                rj = resp.json()
+                if rj.get("aggregated"):
+                    # server 已聚合该 block，立即下载 apply（与后续 block 上传并行）
+                    agg_payload = minio.get_torch(agg_block_key(round_idx, gidx), map_location="cpu")
+                    add_block_delta(local_global, agg_payload["block_delta"])
+                    logger.info("Pipeline: applied block %s immediately", gidx)
+            t_upload = time.monotonic() - t_up0
+
+            # 所有 block 上传完，等剩余未聚合的 block 完成
+            t_wait0 = time.monotonic()
+            applied_blocks = set()
+            # 轮询 block-status，下载尚未 apply 的 block
+            deadline = time.time() + 3600.0
+            while time.time() < deadline:
+                resp = requests.get(
+                    f"{server}/api/round/{round_idx}/block-status",
+                    timeout=30, headers=auth_headers,
+                )
+                resp.raise_for_status()
+                status = resp.json()
+                if status.get("done"):
+                    break
+                time.sleep(args.poll_interval)
+            t_wait = time.monotonic() - t_wait0
+
+            # 下载所有尚未 apply 的聚合 block
+            t_post0 = time.monotonic()
+            post_bytes = 0
+            for binfo in plan.block_list:
+                gidx = binfo[0]
+                agg_key = agg_block_key(round_idx, gidx)
+                if minio.exists(agg_key):
+                    payload, nbytes = minio.get_torch_with_size(agg_key, map_location="cpu")
+                    add_block_delta(local_global, payload["block_delta"])
+                    post_bytes += nbytes
+            local_version = round_idx
+            t_post = time.monotonic() - t_post0
+            logger.info("Pipeline: all blocks done, applied remaining in %.2fs", t_post)
+
+            mode_code = {"cache": 0.0, "delta": 1.0, "full": 2.0, "local_base": 3.0}.get(download_mode, 2.0)
+            timings = {
+                "download_mode": mode_code,
+                "download_global_s": round(t_download, 3),
+                "download_global_MiB": round(download_bytes / (1024 * 1024), 3),
+                "broadcast_load_s": round(t_broadcast_load, 3),
+                "train_local_s": round(t_train, 3),
+                "eval_local_s": round(t_eval, 3),
+                "encode_delta_s": round(t_encode, 3),
+                "upload_minio_s": round(t_upload, 3),
+                "upload_blocks_MiB": round(total_upload_bytes / (1024 * 1024), 3),
+                "pipeline_wait_agg_s": round(t_wait, 3),
+                "pipeline_post_apply_s": round(t_post, 3),
+            }
+            return timings
+
+        def _batch_upload_and_notify():
+            """批量模式（回退）：打包成一个 blocks.pt 上传。"""
             assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
             t_enc0 = time.monotonic()
             delta = sub_state(full_state, global_state)
@@ -731,28 +850,13 @@ def main() -> None:
             up_key = upload_blocks_key(round_idx, args.client_id)
             logger.info(
                 "Uploading %s blocks=%s ratio=%.2f%% train_loss=%.4f eval_loss=%s",
-                up_key,
-                plan.n_selected_blocks,
-                plan.upload_ratio * 100,
-                train_loss,
-                f"{eval_loss_val:.4f}" if eval_loss_val is not None else "null",
+                up_key, plan.n_selected_blocks, plan.upload_ratio * 100, train_loss,
+                f"{eval_loss_val:.4f}" if eval_loss_val is not None else "skip",
             )
             t_up0 = time.monotonic()
             upload_bytes = minio.put_torch(up_key, payload)
             t_upload = time.monotonic() - t_up0
-            logger.info(
-                "Uploaded %s size=%.2f MiB in %.2fs",
-                up_key,
-                upload_bytes / (1024 * 1024),
-                t_upload,
-            )
-
-            mode_code = {
-                "cache": 0.0,
-                "delta": 1.0,
-                "full": 2.0,
-                "local_base": 3.0,
-            }.get(download_mode, 2.0)
+            mode_code = {"cache": 0.0, "delta": 1.0, "full": 2.0, "local_base": 3.0}.get(download_mode, 2.0)
             timings = {
                 "download_mode": mode_code,
                 "download_global_s": round(t_download, 3),
@@ -765,26 +869,22 @@ def main() -> None:
                 "upload_blocks_MiB": round(upload_bytes / (1024 * 1024), 3),
             }
             t_notify0 = time.monotonic()
-            body = {
-                "num_examples": int(num_examples),
-                "train_loss": float(train_loss),
-                "timings": timings,
-            }
+            body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings}
             if eval_loss_val is not None:
                 body["eval_loss"] = float(eval_loss_val)
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/upload-complete",
-                json=body,
-                timeout=60,
-                headers=auth_headers,
+                json=body, timeout=60, headers=auth_headers,
             )
             resp.raise_for_status()
             timings["notify_server_s"] = round(time.monotonic() - t_notify0, 3)
             return timings
 
+        # 执行上传（pipeline 或 batch）
+        upload_fn = _pipeline_upload_and_apply if use_pipeline else _batch_upload_and_notify
         pre_wait_timings = run_rank0_io_with_heartbeat(
             accelerator,
-            _upload_and_notify if is_main else (lambda: {}),
+            upload_fn if is_main else (lambda: {}),
             interval_s=args.poll_interval,
             timeout_s=3600.0,
             label=f"upload-{round_idx}",
@@ -801,48 +901,47 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("RES-2: failed to persist memory: %s", exc)
 
-        t_wait0 = time.monotonic()
-        result = wait_aggregate_with_heartbeat(
-            accelerator,
-            server=server,
-            round_idx=round_idx,
-            poll_interval=args.poll_interval,
-            timeout_s=3600.0,
-            headers=auth_headers,
-        )
-        t_wait = time.monotonic() - t_wait0
-
-        # 聚合完成后立刻打上本轮 global_delta，下一轮即可 cache/少下载
-        def _apply_post_aggregate_delta():
-            nonlocal local_global, local_version
-            assert minio is not None
-            if local_global is None or local_version != round_idx - 1:
-                return {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}
-            dkey = global_delta_key(round_idx)
-            if not minio.exists(dkey):
-                logger.warning("Missing %s after aggregate; next round may full-download", dkey)
-                return {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}
-            t_d0 = time.monotonic()
-            payload, nbytes = minio.get_torch_with_size(dkey, map_location="cpu")
-            add_block_delta(local_global, payload["block_delta"])
-            local_version = round_idx
-            dt = time.monotonic() - t_d0
-            logger.info(
-                "Post-aggregate applied %s size=%.2f MiB in %.2fs (now version=%s)",
-                dkey,
-                nbytes / (1024 * 1024),
-                dt,
-                local_version,
+        if use_pipeline:
+            # pipeline 模式：block 已在上传过程中逐个 apply，只需等 server 标记 round 完成
+            t_wait0 = time.monotonic()
+            result = wait_aggregate_with_heartbeat(
+                accelerator, server=server, round_idx=round_idx,
+                poll_interval=args.poll_interval, timeout_s=3600.0, headers=auth_headers,
             )
-            return {"applied": 1.0, "bytes": float(nbytes), "seconds": float(dt)}
+            t_wait = time.monotonic() - t_wait0
+            post = {"applied": 1.0, "bytes": 0.0, "seconds": 0.0}
+        else:
+            t_wait0 = time.monotonic()
+            result = wait_aggregate_with_heartbeat(
+                accelerator, server=server, round_idx=round_idx,
+                poll_interval=args.poll_interval, timeout_s=3600.0, headers=auth_headers,
+            )
+            t_wait = time.monotonic() - t_wait0
 
-        post = run_rank0_io_with_heartbeat(
-            accelerator,
-            _apply_post_aggregate_delta if is_main else (lambda: {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}),
-            interval_s=args.poll_interval,
-            timeout_s=3600.0,
-            label=f"apply-delta-{round_idx}",
-        )
+            def _apply_post_aggregate_delta():
+                nonlocal local_global, local_version
+                assert minio is not None
+                if local_global is None or local_version != round_idx - 1:
+                    return {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}
+                dkey = global_delta_key(round_idx)
+                if not minio.exists(dkey):
+                    logger.warning("Missing %s after aggregate; next round may full-download", dkey)
+                    return {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}
+                t_d0 = time.monotonic()
+                payload, nbytes = minio.get_torch_with_size(dkey, map_location="cpu")
+                add_block_delta(local_global, payload["block_delta"])
+                local_version = round_idx
+                dt = time.monotonic() - t_d0
+                logger.info("Post-aggregate applied %s size=%.2f MiB in %.2fs (now version=%s)",
+                            dkey, nbytes / (1024 * 1024), dt, local_version)
+                return {"applied": 1.0, "bytes": float(nbytes), "seconds": float(dt)}
+
+            post = run_rank0_io_with_heartbeat(
+                accelerator,
+                _apply_post_aggregate_delta if is_main else (lambda: {"applied": 0.0, "bytes": 0.0, "seconds": 0.0}),
+                interval_s=args.poll_interval, timeout_s=3600.0,
+                label=f"apply-delta-{round_idx}",
+            )
 
         if is_main:
             full_timings = {
