@@ -3,7 +3,7 @@
 - **状态**：planned
 - **创建**：2026-09-08
 - **更新**：2026-09-08
-- **关联**：`docs/exe-plans/active/2026-09-04-s3r12v3-block-uniform.md`
+- **关联**：`docs/exec-plans/completed/2026-09-04-s3r12v3-block-uniform.md`；未实现项见 `docs/exec-plans/active/2026-09-11-dual-cluster-to-production.md`（SEC-1~3）
 
 ## 1. 背景与威胁模型
 

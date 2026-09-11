@@ -3,8 +3,8 @@
 - **状态**：done
 - **创建**：2026-09-04
 - **更新**：2026-09-04
-- **关联**：`docs/exe-plans/active/2026-09-02-three-scenario-loss-comparison.md`
-- **前序**：`docs/exe-plans/active/2026-09-04-s3r12v2-block-permutation.md`（S3R12v2，key 级选择）
+- **关联**：`docs/exec-plans/completed/2026-09-02-three-scenario-loss-comparison.md`
+- **前序**：`docs/exec-plans/completed/2026-09-04-s3r12v2-block-permutation.md`（S3R12v2，key 级选择）
 - **灵感来源**：`FedScale_Public_Block_Mask_Implementation_Spec_v1.docx`（分层随机排列 + 无放回轮转）
 
 ## 1. 背景

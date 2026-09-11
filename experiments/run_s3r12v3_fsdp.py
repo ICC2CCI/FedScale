@@ -44,6 +44,7 @@ from shared.block_selection import (  # noqa: E402
 from shared.minio_client import MinIOClient  # noqa: E402
 from shared.protocol import (  # noqa: E402
     DEFAULT_BATCH,
+    DEFAULT_BLOCK_SIZE,
     DEFAULT_BUCKET,
     DEFAULT_GRAD_ACCUM,
     DEFAULT_LOCAL_STEPS,
@@ -57,6 +58,7 @@ from shared.protocol import (  # noqa: E402
     selected_from_jsonable,
     upload_blocks_key,
 )
+from shared.run_config import apply_to_args, load_run_config  # noqa: E402
 from shared.state_dict_utils import (  # noqa: E402
     add_state,
     broadcast_object,
@@ -112,12 +114,12 @@ class ChatDataset(torch.utils.data.Dataset):
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-def wait_json(url: str, timeout_s: float = 3600.0, interval_s: float = 2.0) -> Dict[str, Any]:
+def wait_json(url: str, timeout_s: float = 3600.0, interval_s: float = 2.0, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     deadline = time.time() + timeout_s
     last_err: Optional[Exception] = None
     while time.time() < deadline:
         try:
-            resp = requests.get(url, timeout=30)
+            resp = requests.get(url, timeout=30, headers=headers)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
@@ -197,6 +199,7 @@ def wait_aggregate_with_heartbeat(
     round_idx: int,
     poll_interval: float,
     timeout_s: float = 3600.0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """全 ranks 一起短轮询等待聚合结果，避免 rank0 单线程卡 NCCL。"""
     deadline = time.time() + timeout_s
@@ -205,7 +208,7 @@ def wait_aggregate_with_heartbeat(
         flag = 0
         if accelerator.is_main_process:
             try:
-                resp = requests.get(f"{server}/api/round/{round_idx}/result", timeout=30)
+                resp = requests.get(f"{server}/api/round/{round_idx}/result", timeout=30, headers=headers)
                 resp.raise_for_status()
                 last = resp.json()
                 if last.get("done"):
@@ -300,6 +303,7 @@ def eval_local_batches(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="S3R12v3 FSDP federated client")
+    p.add_argument("--config", default="", help="run 配置 YAML（CLI 覆盖 yaml；CFG-1）")
     p.add_argument("--client-id", type=int, required=True)
     p.add_argument("--server-url", required=True)
     p.add_argument("--minio-endpoint", required=True)
@@ -315,6 +319,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=DEFAULT_LR)
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
+    p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     p.add_argument("--poll-interval", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=20260831)
     p.add_argument(
@@ -345,12 +350,44 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="在线 eval 最多 batch 数；0=全集",
     )
+    # SEC-0：控制面 token
+    p.add_argument(
+        "--auth-token",
+        default="",
+        help="控制面共享 token；非空时所有 /api/** 请求带 Authorization: Bearer <token>",
+    )
+    # RES-2：client memory 持久化目录
+    p.add_argument(
+        "--client-state-dir",
+        default="",
+        help="客户端持久化目录（memory + 本地全局版本）；空=只在内存（旧行为）",
+    )
+    p.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="从 --client-state-dir 恢复 memory / local_global（RES-2）",
+    )
     return p.parse_args()
+
+
+def _auth_headers(token: str) -> Dict[str, str]:
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    # CFG-1：yaml 覆盖 argparse 默认值，CLI 显式参数再覆盖 yaml
+    cfg = load_run_config(args.config)
+    apply_to_args(
+        args, cfg,
+        skip=("client_id", "server_url", "minio_endpoint", "minio_access_key",
+              "minio_secret_key", "minio_bucket", "model_path", "data_path",
+              "num_examples", "config", "client_state_dir", "resume", "poll_interval"),
+    )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     from accelerate import Accelerator
@@ -358,6 +395,9 @@ def main() -> None:
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum)
     rank = accelerator.process_index
     is_main = accelerator.is_main_process
+
+    # SEC-0：控制面 token（非空时所有 /api/** 带 Bearer）
+    auth_headers = _auth_headers(args.auth_token)
 
     torch.manual_seed(args.seed + args.client_id * 17 + rank)
 
@@ -429,6 +469,11 @@ def main() -> None:
     local_global: Optional[Dict[str, Any]] = None
     local_version: Optional[int] = None
     transfer_dtype = None  # 首轮拿到 global_state 后按 --transfer-dtype 解析
+    # RES-2：客户端状态持久化目录
+    client_state_dir: Optional[Path] = None
+    if is_main and args.client_state_dir:
+        client_state_dir = Path(args.client_state_dir)
+        client_state_dir.mkdir(parents=True, exist_ok=True)
     if is_main:
         minio = MinIOClient(
             endpoint=args.minio_endpoint,
@@ -442,6 +487,14 @@ def main() -> None:
             args.skip_round0_download,
             args.online_eval and eval_loader is not None,
         )
+        # RES-2：恢复 memory + local_global
+        if args.resume and client_state_dir is not None and (client_state_dir / "memory.pt").exists():
+            try:
+                mem = torch.load(client_state_dir / "memory.pt", map_location="cpu", weights_only=False)
+                memory = mem
+                logger.info("RES-2: restored client memory from %s", client_state_dir / "memory.pt")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RES-2: failed to restore memory: %s", exc)
 
     # 首轮：用本地基地模型作 round-0，避免再下 942MiB
     # 注意：FSDP FULL_STATE_DICT 是集合通信，必须所有 rank 同步调用，不能丢进 rank0 线程
@@ -464,7 +517,7 @@ def main() -> None:
         # 拉 current/plan 也可能慢：用 heartbeat，避免非 rank0 卡在长 barrier
         status = run_rank0_io_with_heartbeat(
             accelerator,
-            lambda: wait_json(f"{server}/api/round/current", interval_s=args.poll_interval),
+            lambda: wait_json(f"{server}/api/round/current", interval_s=args.poll_interval, headers=auth_headers),
             interval_s=args.poll_interval,
             timeout_s=3600.0,
             label="wait-current",
@@ -479,13 +532,27 @@ def main() -> None:
 
         plan_raw = run_rank0_io_with_heartbeat(
             accelerator,
-            lambda: wait_json(f"{server}/api/round/{round_idx}/plan", interval_s=args.poll_interval),
+            lambda: wait_json(f"{server}/api/round/{round_idx}/plan", interval_s=args.poll_interval, headers=auth_headers),
             interval_s=args.poll_interval,
             timeout_s=3600.0,
             label=f"wait-plan-{round_idx}",
         )
         plan = RoundPlan.from_dict(plan_raw)
         selected = selected_from_jsonable(plan.selected_by_key)
+
+        # OPS-3：Client 选择。未选中则跳过训练，但仍对齐 delta 并等待聚合结果
+        selected_client_ids = plan_raw.get("selected_client_ids")
+        am_selected = (
+            selected_client_ids is None
+            or int(args.client_id) in set(int(c) for c in selected_client_ids)
+        )
+        if not am_selected and is_main:
+            logger.info(
+                "OPS-3: client %s NOT selected for round %s (selected=%s); skip training, stay aligned",
+                args.client_id,
+                round_idx,
+                selected_client_ids,
+            )
 
         # 同步到 round-(N-1) 全局状态：优先增量 delta，失败/断档回退全量
         t_download = 0.0
@@ -578,6 +645,42 @@ def main() -> None:
         load_full_state_fsdp(model, global_state)
         accelerator.wait_for_everyone()
         t_broadcast_load = time.monotonic() - t_load0
+
+        if not am_selected:
+            # OPS-3：未选中——不训练/不上传，只等聚合后对齐 delta
+            if is_main:
+                logger.info("OPS-3: skipping train/upload for round %s", round_idx)
+            t_wait0 = time.monotonic()
+            result = wait_aggregate_with_heartbeat(
+                accelerator,
+                server=server,
+                round_idx=round_idx,
+                poll_interval=args.poll_interval,
+                timeout_s=3600.0,
+                headers=auth_headers,
+            )
+            t_wait = time.monotonic() - t_wait0
+            # 对齐 delta（与下方 _apply_post_aggregate_delta 同逻辑）
+            def _skip_apply_delta():
+                nonlocal local_global, local_version
+                assert minio is not None
+                if local_global is None or local_version != round_idx - 1:
+                    return
+                dkey = global_delta_key(round_idx)
+                if not minio.exists(dkey):
+                    return
+                payload, _ = minio.get_torch_with_size(dkey, map_location="cpu")
+                add_block_delta(local_global, payload["block_delta"])
+                local_version = round_idx
+            run_rank0_io_with_heartbeat(
+                accelerator,
+                _skip_apply_delta if is_main else (lambda: None),
+                interval_s=args.poll_interval,
+                timeout_s=3600.0,
+                label=f"skip-apply-delta-{round_idx}",
+            )
+            accelerator.wait_for_everyone()
+            continue
 
         t_train0 = time.monotonic()
         train_loss = train_local_steps(
@@ -673,6 +776,7 @@ def main() -> None:
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/upload-complete",
                 json=body,
                 timeout=60,
+                headers=auth_headers,
             )
             resp.raise_for_status()
             timings["notify_server_s"] = round(time.monotonic() - t_notify0, 3)
@@ -687,6 +791,16 @@ def main() -> None:
         )
         memory = mem_box[0]
 
+        # RES-2：每轮把 memory + local_version 持久化到本地
+        if is_main and client_state_dir is not None and memory is not None:
+            try:
+                torch.save(memory, client_state_dir / "memory.pt")
+                (client_state_dir / "local_version.txt").write_text(
+                    str(local_version if local_version is not None else -1)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RES-2: failed to persist memory: %s", exc)
+
         t_wait0 = time.monotonic()
         result = wait_aggregate_with_heartbeat(
             accelerator,
@@ -694,6 +808,7 @@ def main() -> None:
             round_idx=round_idx,
             poll_interval=args.poll_interval,
             timeout_s=3600.0,
+            headers=auth_headers,
         )
         t_wait = time.monotonic() - t_wait0
 
@@ -749,6 +864,7 @@ def main() -> None:
                     f"{server}/api/round/{round_idx}/client/{args.client_id}/timing",
                     json={"timings": {k: float(v) for k, v in full_timings.items() if isinstance(v, (int, float))}},
                     timeout=30,
+                    headers=auth_headers,
                 )
                 treq.raise_for_status()
             except Exception as exc:  # noqa: BLE001

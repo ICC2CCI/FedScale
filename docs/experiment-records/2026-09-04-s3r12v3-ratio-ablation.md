@@ -3,8 +3,8 @@
 - **状态**：done
 - **创建**：2026-09-04
 - **更新**：2026-09-04
-- **关联**：`docs/exe-plans/active/2026-09-04-s3r12v3-block-uniform.md`（S3R12v3 基线 20%）
-- **关联**：`docs/exe-plans/active/2026-09-02-three-scenario-loss-comparison.md`
+- **关联**：`docs/exec-plans/completed/2026-09-04-s3r12v3-block-uniform.md`（S3R12v3 基线 20%）
+- **关联**：`docs/exec-plans/completed/2026-09-02-three-scenario-loss-comparison.md`
 
 ## 1. 背景
 

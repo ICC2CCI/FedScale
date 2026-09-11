@@ -6,7 +6,7 @@
 - **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`
 - **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分内容已过时，以本文为准）。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分内容已过时，以本文为准）。执行跟踪：已落地部分见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md)；未完成项见 [active TODO](../exec-plans/active/2026-09-11-dual-cluster-to-production.md)。
 
 ---
 
@@ -217,15 +217,22 @@ ICC1                         Server                         ICC2
 
 ## 9. 本轮联调默认参数（便于对照结果）
 
-| 项 | 值 |
-|----|-----|
-| 模型 | Qwen2.5-0.5B |
-| 客户端数 / 轮数 | 2 / 20 |
-| 上传比例 | ≈20% blocks（S3R12v3） |
-| 传输精度 | fp16 |
-| 本地步数 | 与脚本配置一致（联调约 30 step/轮） |
-| 结果目录示例 | `results/202609101345/` |
-| 画图 | `python scripts/plot_s3r12v3_fsdp_run.py results/<id>` |
+> 配置已迁移到 YAML 驱动（CFG-1/CFG-2）。下表是 `configs/s3r12v3-fsdp-run.yaml` 的默认值；改 yaml 即可换参，**不要再只改 `RATIO`**（已加启动校验，`ratio` 与 `coverage_h` 不一致会拒绝启动）。
+
+| 项 | 值 | 配置来源 |
+|----|-----|---------|
+| 模型 | Qwen2.5-0.5B | `nodes.yaml` 每端 `model_path` |
+| 客户端数 / 轮数 | 2 / 20 | yaml `federated.num_clients` / `num_rounds` |
+| 上传比例 | ≈20% blocks | 由 `federated.coverage_h=5` 决定（≈1/H）；改 H=10→10%、H=20→5%、H=2→50% |
+| 多 slot | `slots_per_round=1` | 设 2 + H=5 → ≈40%（ALG-2） |
+| 传输精度 | fp16 | yaml `federated.transfer_dtype`（也支持 int8，SCALE-2） |
+| 本地步数 | 30 step/轮 | yaml `train.local_steps`；`nodes.yaml` 可 per-client 覆盖（TRAIN-1） |
+| 全量写盘频率 | 每轮 | yaml `io.write_full_global_every_n_rounds`（5/10/0 减负，IO-1） |
+| 写盘超参 | timeout 1800s | yaml `io.client_upload_timeout_s` |
+| 鉴权 | 关 | yaml `security.auth_token`（非空启用 Bearer，SEC-0） |
+| 结果目录示例 | `results/202609101345/`（内含 `run.yaml` + `run_meta.json`） | — |
+| 画图 | `python scripts/plot_s3r12v3_fsdp_run.py results/<id>` | — |
+| 实时监控 | `bash scripts/check_rerun_status.sh --watch`（OPS-1） | — |
 
 ---
 

@@ -53,25 +53,67 @@ def resolve_transfer_dtype(
         "bfloat16": torch.bfloat16,
     }
     if key == "int8":
-        raise NotImplementedError(
-            "transfer-dtype=int8 is reserved; use auto/fp16/fp32/bf16 for now"
-        )
+        return _resolve_int8_dtype()
     if key not in mapping:
         raise ValueError(f"unsupported transfer-dtype: {name}")
     return mapping[key]
 
 
+def _resolve_int8_dtype() -> torch.dtype:
+    # int8 用 torch.int8 存储量化值；scale 由 encode 时 per-block 计算
+    # 返回 int8 只是占位标记（实际编码在 encode_int8_block_delta 中处理）
+    return torch.int8
+
+
+def _quantize_int8_block(t: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    """对称量化到 int8：返回 (quantized_int8, scale)。
+
+    scale = max(abs(t)) / 127；反量化 = int8 * scale。
+    """
+    t32 = t.to(dtype=torch.float32)
+    amax = float(t32.abs().max().item())
+    if amax == 0.0:
+        return torch.zeros_like(t32, dtype=torch.int8), 0.0
+    scale = amax / 127.0
+    q = torch.round(t32 / scale).clamp(-127, 127).to(dtype=torch.int8)
+    return q, scale
+
+
+def _dequantize_int8_block(q: torch.Tensor, scale: float) -> torch.Tensor:
+    if scale == 0.0:
+        return torch.zeros_like(q, dtype=torch.float32)
+    return q.to(dtype=torch.float32) * scale
+
+
 def cast_block_delta(block_delta: BlockDelta, dtype: torch.dtype) -> BlockDelta:
-    """把 block_delta 中的 slice 转到指定通信 dtype（计算仍可在别处用 fp32）。"""
+    """把 block_delta 中的 slice 转到指定通信 dtype（计算仍可在别处用 fp32）。
+
+    int8: 对称量化，scale 存为元组第 4 元素 (s, e, q_int8, scale)。
+    """
     if dtype == torch.int8:
-        raise NotImplementedError("int8 block cast not implemented yet")
-    out: BlockDelta = {}
+        out: BlockDelta = {}
+        for key_name, blocks in block_delta.items():
+            out[key_name] = []
+            for s, e, slice_data in blocks:
+                q, scale = _quantize_int8_block(slice_data)
+                out[key_name].append((s, e, q, scale))  # type: ignore[arg-type]
+        return out
+    out: BlockDelta = {}  # type: ignore[no-redef]
     for key_name, blocks in block_delta.items():
         out[key_name] = [
             (s, e, slice_data.detach().to(device="cpu", dtype=dtype).contiguous())
             for s, e, slice_data in blocks
         ]
     return out
+
+
+def _slice_to_fp32(item: Tuple) -> torch.Tensor:
+    """把 block slice 元组还原成 fp32（处理 int8 反量化）。"""
+    slice_data = item[2]
+    if slice_data.dtype == torch.int8:
+        scale = float(item[3]) if len(item) > 3 else 0.0
+        return _dequantize_int8_block(slice_data, scale)
+    return slice_data.to(dtype=torch.float32)
 
 
 def hkdf_group_seed(epoch_seed: bytes, group_id: str) -> bytes:
@@ -152,28 +194,39 @@ def encode_block_delta(
     *,
     dtype: Optional[torch.dtype] = None,
 ) -> BlockDelta:
-    """抽取选中 block。dtype 指定通信落盘精度；None 则保持 to_send 原 dtype。"""
+    """抽取选中 block。dtype 指定通信落盘精度；None 则保持 to_send 原 dtype。
+
+    int8: 对称量化 per-block，scale 存为元组第 4 元素。
+    """
     result: BlockDelta = {}
     for key_name, slices in selected_by_key.items():
         if key_name not in to_send or not to_send[key_name].is_floating_point():
             continue
         flat = to_send[key_name].contiguous().view(-1)
         out_dtype = dtype if dtype is not None else to_send[key_name].dtype
-        result[key_name] = [
-            (s, e, flat[s:e].detach().to(device="cpu", dtype=out_dtype).contiguous())
-            for s, e in slices
-        ]
+        if out_dtype == torch.int8:
+            result[key_name] = []
+            for s, e in slices:
+                q, scale = _quantize_int8_block(flat[s:e])
+                result[key_name].append((s, e, q.detach().to(device="cpu").contiguous(), scale))  # type: ignore[arg-type]
+        else:
+            result[key_name] = [
+                (s, e, flat[s:e].detach().to(device="cpu", dtype=out_dtype).contiguous())
+                for s, e in slices
+            ]
     return result
 
 
 def add_block_delta(state: Dict[str, torch.Tensor], block_delta: BlockDelta) -> None:
-    """原地：state[key][s:e] += delta_slice。"""
+    """原地：state[key][s:e] += delta_slice（支持 int8 反量化）。"""
     for key_name, blocks in block_delta.items():
         if key_name not in state or not state[key_name].is_floating_point():
             continue
         flat = state[key_name].contiguous().view(-1)
-        for s, e, slice_data in blocks:
-            flat[s:e] = (flat[s:e].to(dtype=torch.float32) + slice_data.to(dtype=torch.float32)).to(
+        for item in blocks:
+            s, e = item[0], item[1]
+            slice_fp32 = _slice_to_fp32(item)
+            flat[s:e] = (flat[s:e].to(dtype=torch.float32) + slice_fp32).to(
                 dtype=state[key_name].dtype
             )
         state[key_name] = flat.view(state[key_name].shape)
@@ -207,14 +260,20 @@ def apply_block_delta(
                 if cid >= len(client_block_deltas):
                     continue
                 blocks = client_block_deltas[cid].get(key_name, [])
-                for ss, ee, slice_data in blocks:
-                    if ss == s and ee == e:
-                        acc.add_(slice_data.to(dtype=torch.float32), alpha=float(w) / total_w)
+                for item in blocks:
+                    if item[0] == s and item[1] == e:
+                        slice_fp32 = _slice_to_fp32(item)
+                        acc.add_(slice_fp32, alpha=float(w) / total_w)
                         break
             gflat[s:e] = (gflat[s:e].to(dtype=torch.float32) + acc).to(dtype=global_state[key_name].dtype)
-            out_blocks.append(
-                (s, e, acc.detach().to(device="cpu", dtype=store_dtype).contiguous())
-            )
+            # 写出聚合增量：int8 时反量化目标在客户端 add_block_delta 处理，这里仍按 store_dtype
+            if store_dtype == torch.int8:
+                q, scale = _quantize_int8_block(acc)
+                out_blocks.append((s, e, q.detach().to(device="cpu").contiguous(), scale))  # type: ignore[arg-type]
+            else:
+                out_blocks.append(
+                    (s, e, acc.detach().to(device="cpu", dtype=store_dtype).contiguous())
+                )
         if out_blocks:
             aggregated[key_name] = out_blocks
         global_state[key_name] = gflat.view(global_state[key_name].shape)

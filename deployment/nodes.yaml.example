@@ -1,0 +1,37 @@
+# 节点清单（拓扑与超参分离，CFG-3）
+#
+# cp deployment/nodes.yaml.example deployment/nodes.yaml
+# 修改主机 / 路径 / 凭证；nodes.yaml 已 gitignore，勿提交。
+# MinIO 凭证优先从环境变量读，不写死在这里。
+
+central:
+  server_url: "http://192.168.235.42:8080"
+  minio_endpoint: "http://192.168.235.42:9000"
+  # MinIO 凭证：优先用 ${MINIO_ROOT_USER} / ${MINIO_ROOT_PASSWORD} 环境变量
+  # 这里只放占位，启动脚本会注入
+  minio_access_key: "${MINIO_ROOT_USER}"
+  minio_secret_key: "${MINIO_ROOT_PASSWORD}"
+  minio_bucket: "fedscale-bucket"
+  aggregation_port: 8080
+
+clients:
+  - client_id: 0
+    ssh: "pcl@192.168.206.116"
+    repo: "~/liuchao/fedscale-icc-1"
+    conda_env: "flwr-ft"
+    model_path: "model/Qwen/Qwen2.5-0.5B"
+    data_path: "data/splits/icc1_client0_train.json"
+    accelerate_config: "configs/accelerate_config.yaml"
+    main_process_port: 29510
+    # TRAIN-1：per-client 训练超参覆盖（可省略，省略则用 run yaml 全局默认）
+    # local_steps: 30
+
+  - client_id: 1
+    ssh: "pcl@192.168.205.130"
+    repo: "~/liuchao/fedscale-icc-2"
+    conda_env: "flwr-ft"
+    model_path: "model/Qwen/Qwen2.5-0.5B"
+    data_path: "data/splits/client1_train.json"
+    accelerate_config: "configs/accelerate_config.yaml"
+    main_process_port: 29511
+    # local_steps: 10

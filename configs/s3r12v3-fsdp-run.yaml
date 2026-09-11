@@ -1,0 +1,52 @@
+# S3R12v3 FSDP 双集群联调 run 配置（三端共用）
+#
+# 用法：
+#   Server / Client 都接受 --config configs/s3r12v3-fsdp-run.yaml
+#   CLI 参数覆盖 yaml；yaml 优先于 argparse 默认值
+#   启动脚本会读这份 yaml 并把它写入 results/<run_id>/run.yaml，保证可复现
+#
+# `ratio` 只作展示：ratio ≈ slots_per_round / coverage_h，不得单独驱动调度。
+# 真正决定每轮上传量的是 coverage_h（配合 slots_per_round）。
+
+federated:
+  num_clients: 2
+  num_rounds: 20
+  coverage_h: 10         # 真正决定每轮上传 ≈ 1/H；本次联调用 10（≈10%）
+  slots_per_round: 1     # 预留；P0 先写 1，ALG-2 再实现 >1（如 40%=H5×2slot）
+  seed: 20260831
+  transfer_dtype: fp16
+  memory_decay: 0.9
+  block_size: 524288
+
+train:
+  local_steps: 30
+  batch_size: 8
+  grad_accum: 2
+  lr: 1.0e-5
+  seq_len: 512
+
+io:
+  skip_round0_download: true
+  online_eval: true
+  write_full_global_every_n_rounds: 1   # IO-1: 1=每轮都写; 5/10=每 N 轮; 0=只写 round-0 与最终轮
+  client_upload_timeout_s: 1800
+
+eval:
+  eval_path: data/medical_flashcards_eval.json
+  eval_max_batches: 0
+
+# P1 起（SYNC-1/SEC-0/RES-1）用到的字段，P0 阶段可忽略
+sync:
+  min_clients_to_aggregate: 0   # 0=必须等齐 num_clients（旧行为）；>0=最低人数即可聚合
+  round_deadline_s: 0           # 0=仅用 client_upload_timeout_s；>0=本轮聚合宽限上限
+
+security:
+  auth_token: ""                # 空字符串=不鉴权（联调）；非空则要求 Authorization: Bearer <token>
+  tls: false                    # true 时客户端用 https://
+
+resume:
+  resume_from_round: 0          # 0=不续训；>0=从该 round 恢复（需 MinIO 中已有该轮 delta/state）
+
+# 运维（OPS-1/2），P2/P3 用
+ops:
+  minio_retention_recent_uploads: 0   # 0=不清理；>0=保留最近 K 轮 uploads

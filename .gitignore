@@ -178,6 +178,7 @@ data/medical_medqa_*
 /tools/minio/
 /logs/
 deployment/central-server.env
+deployment/nodes.yaml
 
 # Dual-cluster per-run artifacts (keep results/README + round_logs/figures history)
 /results/20*/

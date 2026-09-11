@@ -3,7 +3,7 @@
 - **状态**：done
 - **创建**：2026-09-02
 - **更新**：2026-09-02
-- **关联**：`docs/exe-plans/active/2026-09-02-three-scenario-loss-comparison.md`（三场景主计划）
+- **关联**：`docs/exec-plans/completed/2026-09-02-three-scenario-loss-comparison.md`（三场景主计划）
 
 ## 背景
 
