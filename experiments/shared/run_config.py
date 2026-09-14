@@ -31,6 +31,8 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "transfer_dtype",
         "memory_decay",
         "block_size",
+        "compressor",
+        "rho",
     ],
     "train": [
         "local_steps",
@@ -57,6 +59,8 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
     "security": [
         "auth_token",
         "tls",
+        "sec_upload_privacy",
+        "tls_no_verify",
     ],
     "resume": [
         "resume_from_round",
@@ -124,25 +128,17 @@ def _coerce(value: Any, ref: Any) -> Any:
 
 
 def _arg_was_set(args: Any, key: str, parser=None) -> bool:
-    """判断 argparse 是否显式传了该参数。
+    """判断 argparse 是否显式传了该参数。始终看 sys.argv，不依赖 parser。"""
+    import sys
 
-    优先用 parser 的解析记录；若没传 parser，则对布尔 BooleanOptionalAction 用「非默认」启发，
-    其余类型无法区分 default vs 显式传同值——此时保守地认为「未显式传」，让 yaml 覆盖默认。
-    """
-    if parser is not None:
-        # argparse 在 3.9+ 暴露 _get_values；这里用更稳的方式：检查 sys.argv 里的 flag
-        import sys
-
-        flags = {a.lstrip("-") for a in sys.argv[1:]}
-        flags_dashed = {a for a in sys.argv[1:] if a.startswith("-")}
-        # 支持 --num-rounds / --num_rounds 两种风格
-        if key in flags or key.replace("_", "-") in flags:
+    dashed = key.replace("_", "-")
+    names = {key, dashed, f"no-{dashed}"}
+    for a in sys.argv[1:]:
+        if not a.startswith("-"):
+            continue
+        name = a.lstrip("-").split("=", 1)[0]
+        if name in names or name.replace("-", "_") == key:
             return True
-        for a in flags_dashed:
-            name = a.lstrip("-")
-            if name == key or name == key.replace("_", "-"):
-                return True
-        return False
     return False
 
 

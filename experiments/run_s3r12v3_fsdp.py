@@ -27,6 +27,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+# SEC-5：TLS 证书验证开关（自签名证书时设为 False）
+_REQUESTS_VERIFY: bool = True
+
+
+def _set_requests_verify(verify: bool) -> None:
+    global _REQUESTS_VERIFY
+    _REQUESTS_VERIFY = bool(verify)
+    if not _REQUESTS_VERIFY:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
@@ -37,9 +48,21 @@ sys.path.insert(0, str(EXPERIMENTS_DIR))
 
 from shared.block_selection import (  # noqa: E402
     add_block_delta,
+    build_group_blocks,
     encode_block_delta,
     resolve_transfer_dtype,
     update_block_memory,
+)
+from shared.block_crypto import (  # noqa: E402
+    derive_round_key,
+    encode_sec_block_payload,
+    pad_slice,
+)
+from shared.block_vote import (  # noqa: E402
+    block_energies,
+    flatten_group_blocks,
+    select_topk_indices,
+    selected_from_flat,
 )
 from shared.minio_client import MinIOClient  # noqa: E402
 from shared.protocol import (  # noqa: E402
@@ -55,6 +78,7 @@ from shared.protocol import (  # noqa: E402
     RoundPlan,
     agg_block_done_key,
     agg_block_key,
+    epoch_seed_from_plan,
     global_delta_key,
     global_state_key,
     selected_from_jsonable,
@@ -122,7 +146,7 @@ def wait_json(url: str, timeout_s: float = 3600.0, interval_s: float = 2.0, head
     last_err: Optional[Exception] = None
     while time.time() < deadline:
         try:
-            resp = requests.get(url, timeout=30, headers=headers)
+            resp = requests.get(url, timeout=30, headers=headers, verify=_REQUESTS_VERIFY)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
@@ -211,7 +235,7 @@ def wait_aggregate_with_heartbeat(
         flag = 0
         if accelerator.is_main_process:
             try:
-                resp = requests.get(f"{server}/api/round/{round_idx}/result", timeout=30, headers=headers)
+                resp = requests.get(f"{server}/api/round/{round_idx}/result", timeout=30, headers=headers, verify=_REQUESTS_VERIFY)
                 resp.raise_for_status()
                 last = resp.json()
                 if last.get("done"):
@@ -323,6 +347,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    p.add_argument(
+        "--compressor",
+        default="public_random",
+        choices=["public_random", "block_vote_lag", "block_topk", "dense"],
+    )
+    p.add_argument("--rho", type=float, default=0.0, help="vote/topk 比例；0 表示跟随 yaml/coverage")
     p.add_argument("--poll-interval", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=20260831)
     p.add_argument(
@@ -365,6 +395,20 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="控制面共享 token；非空时所有 /api/** 请求带 Authorization: Bearer <token>",
     )
+    # SEC-1/2/3：上传隐私（gidx 化 + 加密 + 末 block 填充）
+    p.add_argument(
+        "--sec-upload-privacy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
+    )
+    # SEC-5：TLS（自签名证书时跳过验证）
+    p.add_argument(
+        "--tls-no-verify",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="SEC-5: 跳过 TLS 证书验证（自签名证书时用）；生产环境应改用 CA 签名证书",
+    )
     # RES-2：client memory 持久化目录
     p.add_argument(
         "--client-state-dir",
@@ -398,6 +442,9 @@ def main() -> None:
               "num_examples", "config", "client_state_dir", "resume", "poll_interval"),
     )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # SEC-5：TLS 证书验证（自签名证书时跳过）
+    _set_requests_verify(not args.tls_no_verify)
 
     from accelerate import Accelerator
 
@@ -549,7 +596,10 @@ def main() -> None:
         plan = RoundPlan.from_dict(plan_raw)
         selected = selected_from_jsonable(plan.selected_by_key)
         # 流式 pipeline：plan 带 block_list 时用 per-block 上传+下载
-        use_pipeline = bool(plan.block_list)
+        use_pipeline = bool(plan.block_list) and str(getattr(args, "compressor", "public_random")) not in {
+            "block_topk",
+            "dense",
+        }
 
         # OPS-3：Client 选择。未选中则跳过训练，但仍对齐 delta 并等待聚合结果
         selected_client_ids = plan_raw.get("selected_client_ids")
@@ -729,19 +779,38 @@ def main() -> None:
 
         def _pipeline_upload_and_apply():
             """流式 per-block pipeline：逐 block 上传，聚合好的立即下载 apply。"""
+            nonlocal local_global, local_version
             assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
             t_enc0 = time.monotonic()
             delta = sub_state(full_state, global_state)
             to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
-            block_delta = encode_block_delta(to_send, selected, dtype=transfer_dtype)
-            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
+            groups = build_group_blocks(to_send, block_size=args.block_size)
+            flat = flatten_group_blocks(groups)
+            energies = block_energies(to_send, flat)
+            compressor = str(getattr(args, "compressor", "public_random") or "public_random")
+            rho = float(getattr(args, "rho", 0.0) or 0.0)
+            if rho <= 0:
+                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
+            local_selected = selected
+            if compressor == "block_topk":
+                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
+            elif compressor == "dense":
+                local_selected = selected_from_flat(flat, range(len(flat)))
+            block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
             t_encode = time.monotonic() - t_enc0
 
             # 逐 block 上传并通知 server
             logger.info("Pipeline: uploading %s blocks (ratio=%.2f%%)", plan.n_selected_blocks, plan.upload_ratio * 100)
             t_up0 = time.monotonic()
             total_upload_bytes = 0
+            applied_blocks = set()
+            # SEC-2：派生 per-round 密钥（与 server 一致）
+            round_key = (
+                derive_round_key(epoch_seed_from_plan(plan.seed, plan.epoch), round_idx)
+                if args.sec_upload_privacy else b""
+            )
             for binfo in plan.block_list:
                 gidx, key_name, start, end = binfo[0], binfo[1], binfo[2], binfo[3]
                 # 取出该 block 的 delta slice
@@ -751,15 +820,35 @@ def main() -> None:
                         if s == start and e == end:
                             single_block_delta[key_name] = [(s, e, slice_data)]
                             break
-                block_payload = {
-                    "block_delta": single_block_delta,
-                    "num_examples": int(num_examples),
-                    "train_loss": float(train_loss),
-                    "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
-                    "client_id": int(args.client_id),
-                    "round": int(round_idx),
-                    "block_idx": int(gidx),
-                }
+                if args.sec_upload_privacy:
+                    # SEC-1/2/3：gidx 化 + 加密 + 末 block 填充
+                    slice_data = single_block_delta.get(key_name, [(0, 0, torch.zeros(1, dtype=transfer_dtype) if transfer_dtype else torch.zeros(1))])[0][2]
+                    is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
+                    scale = None
+                    if is_int8_item:
+                        # int8 时 slice 在元组第 3 位，scale 在第 4 位
+                        for it in block_delta.get(key_name, []):
+                            if it[0] == start and it[1] == end and len(it) > 3:
+                                scale = float(it[3]); break
+                    real_len = int(end - start)
+                    block_payload = encode_sec_block_payload(
+                        gidx, slice_data, round_key,
+                        real_len=real_len, is_int8=is_int8_item, scale=scale,
+                        block_size=args.block_size,
+                        num_examples=int(num_examples),
+                        train_loss=float(train_loss),
+                        eval_loss=float(eval_loss_val) if eval_loss_val is not None else None,
+                    )
+                else:
+                    block_payload = {
+                        "block_delta": single_block_delta,
+                        "num_examples": int(num_examples),
+                        "train_loss": float(train_loss),
+                        "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                        "client_id": int(args.client_id),
+                        "round": int(round_idx),
+                        "block_idx": int(gidx),
+                    }
                 bkey = upload_block_key(round_idx, args.client_id, gidx)
                 total_upload_bytes += minio.put_torch(bkey, block_payload)
                 # 通知 server 该 block 已上传
@@ -769,9 +858,11 @@ def main() -> None:
                         "num_examples": int(num_examples),
                         "train_loss": float(train_loss),
                         "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                        "block_energies": energies if int(gidx) == 0 else [],
                     },
                     timeout=30,
                     headers=auth_headers,
+                    verify=_REQUESTS_VERIFY,
                 )
                 resp.raise_for_status()
                 rj = resp.json()
@@ -779,18 +870,18 @@ def main() -> None:
                     # server 已聚合该 block，立即下载 apply（与后续 block 上传并行）
                     agg_payload = minio.get_torch(agg_block_key(round_idx, gidx), map_location="cpu")
                     add_block_delta(local_global, agg_payload["block_delta"])
+                    applied_blocks.add(int(gidx))
                     logger.info("Pipeline: applied block %s immediately", gidx)
             t_upload = time.monotonic() - t_up0
 
             # 所有 block 上传完，等剩余未聚合的 block 完成
             t_wait0 = time.monotonic()
-            applied_blocks = set()
             # 轮询 block-status，下载尚未 apply 的 block
             deadline = time.time() + 3600.0
             while time.time() < deadline:
                 resp = requests.get(
                     f"{server}/api/round/{round_idx}/block-status",
-                    timeout=30, headers=auth_headers,
+                    timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
                 )
                 resp.raise_for_status()
                 status = resp.json()
@@ -803,11 +894,14 @@ def main() -> None:
             t_post0 = time.monotonic()
             post_bytes = 0
             for binfo in plan.block_list:
-                gidx = binfo[0]
+                gidx = int(binfo[0])
+                if gidx in applied_blocks:
+                    continue
                 agg_key = agg_block_key(round_idx, gidx)
                 if minio.exists(agg_key):
                     payload, nbytes = minio.get_torch_with_size(agg_key, map_location="cpu")
                     add_block_delta(local_global, payload["block_delta"])
+                    applied_blocks.add(gidx)
                     post_bytes += nbytes
             local_version = round_idx
             t_post = time.monotonic() - t_post0
@@ -836,17 +930,66 @@ def main() -> None:
             delta = sub_state(full_state, global_state)
             to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
-            block_delta = encode_block_delta(to_send, selected, dtype=transfer_dtype)
-            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
+            groups = build_group_blocks(to_send, block_size=args.block_size)
+            flat = flatten_group_blocks(groups)
+            energies = block_energies(to_send, flat)
+            compressor = str(getattr(args, "compressor", "public_random") or "public_random")
+            rho = float(getattr(args, "rho", 0.0) or 0.0)
+            if rho <= 0:
+                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
+            local_selected = selected
+            if compressor == "block_topk":
+                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
+            elif compressor == "dense":
+                local_selected = selected_from_flat(flat, range(len(flat)))
+            block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
             t_encode = time.monotonic() - t_enc0
-            payload = {
-                "block_delta": block_delta,
-                "num_examples": int(num_examples),
-                "train_loss": float(train_loss),
-                "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
-                "client_id": int(args.client_id),
-                "round": int(round_idx),
-            }
+            if args.sec_upload_privacy:
+                # SEC-1/2/3：批量模式也用 SEC 编码（每个 block 一个 SEC payload，打包成 list）
+                round_key = derive_round_key(epoch_seed_from_plan(plan.seed, plan.epoch), round_idx)
+                sec_blocks = []
+                for binfo in plan.block_list:
+                    gidx, key_name, start, end = binfo[0], binfo[1], binfo[2], binfo[3]
+                    slice_data = None
+                    scale = None
+                    if key_name in block_delta:
+                        for s, e, sd in block_delta[key_name]:
+                            if s == start and e == end:
+                                slice_data = sd; break
+                    if slice_data is None:
+                        slice_data = torch.zeros(end - start, dtype=transfer_dtype or torch.float16)
+                    is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
+                    if is_int8_item:
+                        for it in block_delta.get(key_name, []):
+                            if it[0] == start and it[1] == end and len(it) > 3:
+                                scale = float(it[3]); break
+                    sec_blocks.append(encode_sec_block_payload(
+                        gidx, slice_data, round_key,
+                        real_len=int(end - start), is_int8=is_int8_item, scale=scale,
+                        block_size=args.block_size,
+                        num_examples=int(num_examples),
+                        train_loss=float(train_loss),
+                        eval_loss=float(eval_loss_val) if eval_loss_val is not None else None,
+                    ))
+                payload = {
+                    "v": 1,  # SEC-1/2/3 批量格式标记
+                    "sec_blocks": sec_blocks,
+                    "num_examples": int(num_examples),
+                    "train_loss": float(train_loss),
+                    "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                    "client_id": int(args.client_id),
+                    "round": int(round_idx),
+                }
+            else:
+                payload = {
+                    "block_delta": block_delta,
+                    "num_examples": int(num_examples),
+                    "train_loss": float(train_loss),
+                    "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
+                    "client_id": int(args.client_id),
+                    "round": int(round_idx),
+                }
             up_key = upload_blocks_key(round_idx, args.client_id)
             logger.info(
                 "Uploading %s blocks=%s ratio=%.2f%% train_loss=%.4f eval_loss=%s",
@@ -869,12 +1012,12 @@ def main() -> None:
                 "upload_blocks_MiB": round(upload_bytes / (1024 * 1024), 3),
             }
             t_notify0 = time.monotonic()
-            body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings}
+            body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings, "block_energies": energies}
             if eval_loss_val is not None:
                 body["eval_loss"] = float(eval_loss_val)
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/upload-complete",
-                json=body, timeout=60, headers=auth_headers,
+                json=body, timeout=60, headers=auth_headers, verify=_REQUESTS_VERIFY,
             )
             resp.raise_for_status()
             timings["notify_server_s"] = round(time.monotonic() - t_notify0, 3)
@@ -964,6 +1107,7 @@ def main() -> None:
                     json={"timings": {k: float(v) for k, v in full_timings.items() if isinstance(v, (int, float))}},
                     timeout=30,
                     headers=auth_headers,
+                    verify=_REQUESTS_VERIFY,
                 )
                 treq.raise_for_status()
             except Exception as exc:  # noqa: BLE001

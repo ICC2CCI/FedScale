@@ -22,6 +22,11 @@ from pydantic import BaseModel, Field
 
 from server.block_scheduler import BlockScheduler
 from shared.block_selection import apply_block_delta, resolve_transfer_dtype, _slice_to_fp32
+from shared.block_crypto import (
+    SEC_PAYLOAD_VERSION,
+    decode_sec_block_payload,
+    is_sec_payload,
+)
 from shared.minio_client import MinIOClient
 from shared.protocol import (
     DEFAULT_BUCKET,
@@ -35,6 +40,7 @@ from shared.protocol import (
     RoundPlan,
     agg_block_done_key,
     agg_block_key,
+    epoch_seed_from_plan,
     global_delta_key,
     global_state_key,
     plan_key,
@@ -75,6 +81,7 @@ class UploadCompleteBody(BaseModel):
     eval_loss: Optional[float] = None
     # 客户端在 upload 完成前可上报的分段耗时（秒）
     timings: Dict[str, float] = Field(default_factory=dict)
+    block_energies: List[float] = Field(default_factory=list)
 
 
 class ClientTimingBody(BaseModel):
@@ -88,6 +95,7 @@ class BlockUploadBody(BaseModel):
     num_examples: int = 1
     train_loss: float = 0.0
     eval_loss: Optional[float] = None
+    block_energies: List[float] = Field(default_factory=list)
 
 
 class AggregationServer:
@@ -115,6 +123,9 @@ class AggregationServer:
         selected_client_ids: Optional[List[int]] = None,
         delta_norm_clip: float = 0.0,
         delta_norm_reject: float = 0.0,
+        compressor: str = "public_random",
+        rho: float = 0.0,
+        sec_upload_privacy: bool = False,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -142,7 +153,11 @@ class AggregationServer:
             coverage_h=coverage_h,
             block_size=block_size,
             slots_per_round=self.slots_per_round,
+            compressor=compressor,
+            rho=rho,
         )
+        self.compressor = self.scheduler.compressor
+        self.rho = self.scheduler.rho
         # IO-1：全量 global_state 写盘频率
         # 1=每轮都写（旧行为/联调兜底）；N>1=每 N 轮写一次；0=只写 round-0 与最终一轮
         self.write_full_global_every_n_rounds = int(write_full_global_every_n_rounds)
@@ -169,6 +184,10 @@ class AggregationServer:
         # SEC-4：异常更新防护。delta_norm_clip>0 时裁剪；delta_norm_reject>0 时范数超过即剔除该 client
         self.delta_norm_clip = float(delta_norm_clip or 0.0)
         self.delta_norm_reject = float(delta_norm_reject or 0.0)
+        # SEC-1/2/3：上传隐私（gidx 化 + 加密 + 末 block 填充）
+        # server 端只做"解码"：从 SEC payload 还原出 block_delta。
+        # 兼容旧格式：若 payload 不是 SEC 格式，走旧路径。
+        self.sec_upload_privacy = bool(sec_upload_privacy)
 
         self.current_round = 1
         self.lock = threading.Lock()
@@ -256,6 +275,8 @@ class AggregationServer:
             "transfer_dtype": str(self.transfer_dtype).replace("torch.", ""),
             "block_size": self.block_size,
             "memory_decay": self.memory_decay,
+            "compressor": self.compressor,
+            "rho": self.rho,
             "write_full_global_every_n_rounds": self.write_full_global_every_n_rounds,
             "min_clients_to_aggregate": self.effective_min_clients,
             "client_upload_timeout_s": self.client_upload_timeout_s,
@@ -295,6 +316,67 @@ class AggregationServer:
             plan.upload_ratio * 100,
         )
         return plan
+
+    def _ingest_energies(self, energies: List[float]) -> None:
+        if not energies:
+            return
+        self.scheduler.ingest_energy(torch.tensor(energies, dtype=torch.float32))
+
+    def _round_key_for(self, round_idx: int) -> bytes:
+        """SEC-2：从 plan 的 (seed, epoch) 派生 per-round 密钥。"""
+        plan = self._ensure_plan(round_idx)
+        from shared.block_crypto import derive_round_key
+
+        epoch_seed = epoch_seed_from_plan(plan.seed, plan.epoch)
+        return derive_round_key(epoch_seed, round_idx)
+
+    def _decode_sec_to_block_delta(
+        self, payload: Any, round_idx: int
+    ) -> Any:
+        """SEC-1/2/3：把 SEC 格式 payload 还原成 block_delta dict。
+
+        输入可能是：
+        - SEC pipeline 格式 (v=1, enc_gidx)：单个 block
+        - SEC batch 格式 (v=1, sec_blocks)：所有 block 的 list
+        - 旧格式：{block_delta: {key_name: [(s,e,slice),...]}, ...}
+
+        返回统一格式：block_delta dict = {key_name: [(start, end, slice), ...]}
+        （兼容 apply_block_delta 的输入）
+        """
+        # 旧格式：直接取 block_delta
+        if isinstance(payload, dict) and "block_delta" in payload and not is_sec_payload(payload):
+            return payload["block_delta"]
+        # SEC batch 格式：sec_blocks 列表
+        if isinstance(payload, dict) and payload.get("v") == 1 and "sec_blocks" in payload:
+            round_key = self._round_key_for(round_idx)
+            block_delta: Dict[str, list] = {}
+            for sec_item in payload["sec_blocks"]:
+                gidx, slice_data, real_len, is_int8, scale = decode_sec_block_payload(sec_item, round_key)
+                kn, s, e = self.scheduler.gidx_map.get(int(gidx), ("", 0, 0))
+                if not kn:
+                    continue
+                if is_int8:
+                    item = (s, e, slice_data, scale) if scale is not None else (s, e, slice_data)
+                else:
+                    item = (s, e, slice_data)
+                block_delta.setdefault(kn, []).append(item)
+            return block_delta
+        # 单个 SEC payload（pipeline per-block 上传）
+        if is_sec_payload(payload):
+            round_key = self._round_key_for(round_idx)
+            gidx, slice_data, real_len, is_int8, scale = decode_sec_block_payload(payload, round_key)
+            kn, s, e = self.scheduler.gidx_map.get(int(gidx), ("", 0, 0))
+            if not kn:
+                logger.warning("SEC: gidx %s not in gidx_map", gidx)
+                return {}
+            # 还原 int8 元组格式（与旧格式一致）
+            if is_int8:
+                item = (s, e, slice_data, scale) if scale is not None else (s, e, slice_data)
+            else:
+                item = (s, e, slice_data)
+            return {kn: [item]}
+        # 其他情况：原样返回（可能是 batch 模式的旧 payload）
+        return payload
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
@@ -350,6 +432,7 @@ class AggregationServer:
             meta["client_upload_mono"][client_id] = time.monotonic()
             if body.timings:
                 meta["client_timings"][client_id] = dict(body.timings)
+            self._ingest_energies(body.block_energies)
             logger.info(
                 "Upload complete round=%s client=%s (%s/%s, min=%s) loss=%.4f n=%s timings=%s",
                 round_idx,
@@ -407,7 +490,8 @@ class AggregationServer:
 
     def block_uploaded(self, round_idx: int, client_id: int, block_idx: int,
                         num_examples: int, train_loss: float,
-                        eval_loss: Optional[float] = None) -> Dict[str, Any]:
+                        eval_loss: Optional[float] = None,
+                        block_energies: Optional[List[float]] = None) -> Dict[str, Any]:
         """流式 per-block pipeline：client 上传一个 block 后通知 server。
 
         server 检查该 block 的所有 client 是否都已上传：
@@ -437,6 +521,7 @@ class AggregationServer:
                 "train_loss": train_loss,
                 "eval_loss": eval_loss,
             }
+            self._ingest_energies(block_energies or [])
 
             # 检查该 block 是否所有 client 都已上传
             all_uploaded = len(uploaded_clients) >= self.effective_min_clients
@@ -479,7 +564,12 @@ class AggregationServer:
         for cid in uploaded:
             bkey = upload_block_key(round_idx, cid, block_idx)
             payload = self.minio.get_torch(bkey, map_location="cpu")
-            if isinstance(payload, dict) and "block_delta" in payload:
+            # SEC-1/2/3：兼容 SEC 格式（v=1）与旧格式
+            if is_sec_payload(payload):
+                bd = self._decode_sec_to_block_delta(payload, round_idx)
+                deltas.append(bd)
+                weights.append(float(payload.get("num_examples", client_meta.get(cid, {}).get("num_examples", 1))))
+            elif isinstance(payload, dict) and "block_delta" in payload:
                 deltas.append(payload["block_delta"])
                 weights.append(float(payload.get("num_examples", client_meta.get(cid, {}).get("num_examples", 1))))
             else:
@@ -670,7 +760,15 @@ class AggregationServer:
                     t_block0 = time.monotonic()
                     payload = self.minio.get_torch(key, map_location="cpu")
                     t_block = time.monotonic() - t_block0
-                    if isinstance(payload, dict) and "block_delta" in payload:
+                    # SEC-1/2/3：兼容 SEC 格式（v=1, pipeline 单 block 或 batch sec_blocks）与旧格式
+                    if isinstance(payload, dict) and payload.get("v") == 1:
+                        deltas.append(self._decode_sec_to_block_delta(payload, round_idx))
+                        weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
+                        losses.append(float(payload.get("train_loss", metas[cid].train_loss)))
+                        ev = payload.get("eval_loss", metas[cid].eval_loss)
+                        if ev is not None:
+                            eval_losses.append(float(ev))
+                    elif isinstance(payload, dict) and "block_delta" in payload:
                         deltas.append(payload["block_delta"])
                         weights.append(float(payload.get("num_examples", metas[cid].num_examples)))
                         losses.append(float(payload.get("train_loss", metas[cid].train_loss)))
@@ -738,6 +836,23 @@ class AggregationServer:
                         logger.warning("SEC-4: rejected clients %s for round %s", sec4_rejected, round_idx)
 
                 t_apply0 = time.monotonic()
+                if self.compressor in {"block_topk", "dense"}:
+                    selected = {}
+                    seen: Dict[str, set] = {}
+                    for delta in deltas:
+                        for kn, blocks in delta.items():
+                            bucket = selected.setdefault(kn, [])
+                            seen_key = seen.setdefault(kn, set())
+                            for item in blocks:
+                                pair = (int(item[0]), int(item[1]))
+                                if pair not in seen_key:
+                                    seen_key.add(pair)
+                                    bucket.append(pair)
+                    logger.info(
+                        "compressor=%s using union of uploaded blocks keys=%s",
+                        self.compressor,
+                        len(selected),
+                    )
                 agg_delta = apply_block_delta(
                     self.global_state,
                     deltas,
@@ -1016,8 +1131,10 @@ def build_app(server: AggregationServer) -> FastAPI:
         body: BlockUploadBody,
         _: None = Depends(_auth),
     ) -> Dict[str, Any]:
-        return server.block_uploaded(round_idx, client_id, block_idx,
-                                     body.num_examples, body.train_loss, body.eval_loss)
+        return server.block_uploaded(
+            round_idx, client_id, block_idx,
+            body.num_examples, body.train_loss, body.eval_loss, body.block_energies,
+        )
 
     @app.get("/api/round/{round_idx}/block-status")
     def block_status(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
@@ -1040,6 +1157,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ratio", type=float, default=0.2, help="informational; 不单独驱动调度，用 --coverage-h")
     p.add_argument("--coverage-h", type=int, default=DEFAULT_COVERAGE_H)
     p.add_argument("--slots-per-round", type=int, default=1, help="每轮选几个 slot（ALG-2，>1 如 40%%=H5×2）")
+    p.add_argument(
+        "--compressor",
+        default="public_random",
+        choices=["public_random", "block_vote_lag", "block_topk", "dense"],
+        help="block 选择器：随机公共 mask / 滞后能量投票 / 本地 topk / 稠密",
+    )
+    p.add_argument("--rho", type=float, default=0.0, help="vote/topk 选择比例；0 则用 1/coverage_h")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
@@ -1122,6 +1246,13 @@ def parse_args() -> argparse.Namespace:
     # SEC-5：TLS
     p.add_argument("--tls-cert", default="", help="SEC-5: TLS 证书路径；启用 https 控制面")
     p.add_argument("--tls-key", default="", help="SEC-5: TLS 私钥路径")
+    # SEC-1/2/3：上传隐私（gidx 化 + 加密 + 末 block 填充）
+    p.add_argument(
+        "--sec-upload-privacy",
+        action="store_true",
+        default=False,
+        help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
+    )
     return p.parse_args()
 
 
@@ -1179,6 +1310,9 @@ def main() -> None:
         selected_client_ids=sel_ids,
         delta_norm_clip=args.delta_norm_clip,
         delta_norm_reject=args.delta_norm_reject,
+        compressor=args.compressor,
+        rho=args.rho,
+        sec_upload_privacy=args.sec_upload_privacy,
     )
     # CFG-1：把生效的 run.yaml 写入 results 目录，保证可复现
     try:

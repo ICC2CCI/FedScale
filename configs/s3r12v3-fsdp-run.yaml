@@ -44,6 +44,7 @@ sync:
 security:
   auth_token: ""                # 空字符串=不鉴权（联调）；非空则要求 Authorization: Bearer <token>
   tls: false                    # true 时客户端用 https://
+  sec_upload_privacy: true      # SEC-1/2/3: true=上传 payload 不含 key_name + gidx 加密 + 末 block 填充
 
 resume:
   resume_from_round: 0          # 0=不续训；>0=从该 round 恢复（需 MinIO 中已有该轮 delta/state）

@@ -55,6 +55,16 @@ def plan_key(round_idx: int) -> str:
     return f"plans/round-{round_idx}/plan.json"
 
 
+def epoch_seed_from_plan(seed: int, epoch: int) -> bytes:
+    """从 (seed, epoch) 派生 epoch_seed——server 与 client 独立计算得到相同值。
+
+    与 block_selection.build_permutations 内部公式一致，SEC-2 用它派生 per-round 密钥。
+    """
+    import hashlib
+
+    return hashlib.sha256(f"FedScale-BlockMask-v1|{seed}|{epoch}".encode("utf-8")).digest()
+
+
 @dataclass
 class RoundPlan:
     round: int

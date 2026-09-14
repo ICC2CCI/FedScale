@@ -22,6 +22,11 @@ if [[ ! -f "$NODES_FILE" ]]; then
 fi
 yaml_load "$RUN_CONFIG" "YCFG_"
 
+# yaml 的 coverage_h 是真开关；central-server.env 残留的 RATIO 不得否决本次 run
+if [[ -n "${YCFG_COVERAGE_H:-}" ]]; then
+  unset RATIO
+fi
+
 # --- run 标识 ---
 RUN_ID="${RUN_ID:-$(TZ=Asia/Shanghai date +%Y%m%d%H%M)}"
 RUN_DIR="${ROOT}/results/${RUN_ID}"
@@ -36,6 +41,8 @@ SEED="$(yaml_get YCFG_ SEED 20260831)"
 TRANSFER_DTYPE="$(yaml_get YCFG_ TRANSFER_DTYPE fp16)"
 MEMORY_DECAY="$(yaml_get YCFG_ MEMORY_DECAY 0.9)"
 BLOCK_SIZE="$(yaml_get YCFG_ BLOCK_SIZE 524288)"
+COMPRESSOR="$(yaml_get YCFG_ COMPRESSOR public_random)"
+RHO="$(yaml_get YCFG_ RHO 0.0)"
 LOCAL_STEPS="$(yaml_get YCFG_ LOCAL_STEPS 30)"
 BATCH_SIZE="$(yaml_get YCFG_ BATCH_SIZE 8)"
 GRAD_ACCUM="$(yaml_get YCFG_ GRAD_ACCUM 2)"
@@ -48,6 +55,8 @@ EVAL_MAX_BATCHES="$(yaml_get YCFG_ EVAL_MAX_BATCHES 0)"
 SKIP_ROUND0="$(yaml_get YCFG_ SKIP_ROUND0_DOWNLOAD true)"
 ONLINE_EVAL="$(yaml_get YCFG_ ONLINE_EVAL true)"
 AUTH_TOKEN="${AUTH_TOKEN:-$(yaml_get YCFG_ AUTH_TOKEN '')}"
+TLS_ENABLED="$(yaml_get YCFG_ TLS false)"
+SEC_UPLOAD_PRIVACY="$(yaml_get YCFG_ SEC_UPLOAD_PRIVACY false)"
 
 # 允许 env 覆盖 yaml（联调快速调参）
 NUM_CLIENTS="${NUM_CLIENTS_ENV:-$NUM_CLIENTS}"
@@ -99,6 +108,8 @@ cat > "${RUN_DIR}/run_meta.json" <<EOF
   "transfer_dtype": "${TRANSFER_DTYPE}",
   "memory_decay": ${MEMORY_DECAY},
   "block_size": ${BLOCK_SIZE},
+  "compressor": "${COMPRESSOR}",
+  "rho": ${RHO},
   "local_steps": ${LOCAL_STEPS},
   "batch_size": ${BATCH_SIZE},
   "grad_accum": ${GRAD_ACCUM},
@@ -116,7 +127,7 @@ echo "${RUN_DIR}" > "${ROOT}/logs/current_rerun_results_dir.txt"
 ln -sfn "${RUN_DIR}" "${ROOT}/results/current"
 echo "RUN_DIR=${RUN_DIR}"
 echo "  coverage_h=${COVERAGE_H} slots=${SLOTS_PER_ROUND} (~$(python3 -c "print(round($SLOTS_PER_ROUND/$COVERAGE_H*100,1))")%)"
-echo "  local_steps=${LOCAL_STEPS} lr=${LR} write_full_every=${WRITE_FULL_EVERY_N}"
+echo "  compressor=${COMPRESSOR} rho=${RHO} local_steps=${LOCAL_STEPS} lr=${LR} write_full_every=${WRITE_FULL_EVERY_N}"
 
 SSH=(ssh -i "${HOME}/.ssh/id_ed25519" -o StrictHostKeyChecking=no -o BatchMode=yes)
 
@@ -145,6 +156,32 @@ skip_round0_flag="--skip-round0-download" ; [[ "$SKIP_ROUND0" == "false" ]] && s
 online_eval_flag="--online-eval" ; [[ "$ONLINE_EVAL" == "false" ]] && online_eval_flag="--no-online-eval"
 auth_flag=""
 [[ -n "$AUTH_TOKEN" ]] && auth_flag="--auth-token ${AUTH_TOKEN}"
+sec_privacy_flag=""
+[[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && sec_privacy_flag="--sec-upload-privacy"
+
+# SEC-5：TLS 证书（自签名，自动生成/复用）
+TLS_CERT="" ; TLS_KEY=""
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  TLS_CERT="${ROOT}/deployment/tls/server.crt"
+  TLS_KEY="${ROOT}/deployment/tls/server.key"
+  if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    mkdir -p "${ROOT}/deployment/tls"
+    openssl req -x509 -newkey rsa:2048 -keyout "$TLS_KEY" -out "$TLS_CERT" \
+      -days 365 -nodes -subj "/CN=$(hostname -I | awk '{print $1}')" \
+      -addext "subjectAltName=IP:127.0.0.1,IP:$(hostname -I | awk '{print $1}')" 2>/dev/null
+    echo "SEC-5: generated self-signed cert at ${TLS_CERT}"
+  fi
+  tls_flag="--tls-cert ${TLS_CERT} --tls-key ${TLS_KEY}"
+  SERVER_SCHEME="https"
+  MINIO_SERVER_SCHEME="https"
+  # MinIO 需要单独配 TLS（此处假设 MinIO 已配好 TLS 或通过反向代理）
+  # 当前先用 http 连 MinIO（本地回环），仅控制面走 TLS
+  MINIO_SERVER_ENDPOINT="http://127.0.0.1:9000"
+else
+  tls_flag=""
+  SERVER_SCHEME="http"
+  MINIO_SERVER_ENDPOINT="http://127.0.0.1:9000"
+fi
 
 export MINIO_ROOT_USER MINIO_ROOT_PASSWORD MINIO_BUCKET
 
@@ -153,7 +190,7 @@ nohup /home/pcllgr/miniconda3/envs/fedscale-server/bin/python \
   --config "$RUN_CONFIG" \
   --host 0.0.0.0 \
   --port "${AGGREGATION_PORT:-8080}" \
-  --minio-endpoint http://127.0.0.1:9000 \
+  --minio-endpoint "${MINIO_SERVER_ENDPOINT}" \
   --minio-access-key "${MINIO_ROOT_USER}" \
   --minio-secret-key "${MINIO_ROOT_PASSWORD}" \
   --minio-bucket "${MINIO_BUCKET}" \
@@ -165,25 +202,30 @@ nohup /home/pcllgr/miniconda3/envs/fedscale-server/bin/python \
   --transfer-dtype "${TRANSFER_DTYPE}" \
   --memory-decay "${MEMORY_DECAY}" \
   --block-size "${BLOCK_SIZE}" \
+  --compressor "${COMPRESSOR}" \
+  --rho "${RHO}" \
   --write-full-global-every-n-rounds "${WRITE_FULL_EVERY_N}" \
   --client-upload-timeout-s "${UPLOAD_TIMEOUT_S}" \
   ${auth_flag} \
+  ${sec_privacy_flag} \
+  ${tls_flag} \
   --results-dir "${RUN_DIR}" \
   > "${RUN_DIR}/logs/aggregation_server.log" 2>&1 &
 echo $! > "${ROOT}/logs/aggregation_server.pid"
 ln -sfn "${RUN_DIR}/logs/aggregation_server.log" "${ROOT}/logs/aggregation_server.log"
 
 for i in $(seq 1 30); do
-  if curl -fsS --max-time 2 "http://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current" >/dev/null 2>&1; then
+  if curl -fsS --max-time 2 "${SERVER_SCHEME}://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current"; echo
+curl -fsS "${SERVER_SCHEME}://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current"; echo
 echo "aggregation_server pid=$(cat "${ROOT}/logs/aggregation_server.pid")"
 
 # --- clients (CFG-3: 从 nodes.yaml 循环拉起) ---
 # 用 server conda env 的 python（有 pyyaml）；系统 python3 可能没装
+CLIENT_CONFIG="configs/$(basename "${RUN_CONFIG}")"
 NODES_PY="${NODES_PY:-/home/pcllgr/miniconda3/envs/fedscale-server/bin/python}"
 "$NODES_PY" - "$NODES_FILE" <<'PYNODE' > "${RUN_DIR}/logs/client_launch_plan.json"
 import sys, yaml, json
@@ -215,6 +257,12 @@ for p in plans:
  SERVER_URL="${SERVER_URL}"
  MINIO_CLIENT_ENDPOINT="${MINIO_ENDPOINT}"
 
+# SEC-5：TLS 时把 SERVER_URL / MINIO_CLIENT_ENDPOINT 的 scheme 强制改成 https
+if [[ "$TLS_ENABLED" == "true" ]]; then
+  SERVER_URL="${SERVER_URL/http:\/\//https:\/\/}"
+  # MinIO 本地仍用 http（MinIO TLS 需单独配置），只有控制面走 TLS
+fi
+
 for plan_json in "${CLIENT_PLANS[@]}"; do
   CID=$(echo "$plan_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['client_id'])")
   SSH_HOST=$(echo "$plan_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh'])")
@@ -233,6 +281,10 @@ for plan_json in "${CLIENT_PLANS[@]}"; do
   # SEC-0：MinIO 凭证用环境变量传到远端，不出现在 ps 可见的命令行里
   AUTH_FLAG=""
   [[ -n "$AUTH_TOKEN" ]] && AUTH_FLAG="--auth-token ${AUTH_TOKEN}"
+  SEC_PRIVACY_FLAG=""
+  [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && SEC_PRIVACY_FLAG="--sec-upload-privacy"
+  TLS_NO_VERIFY_FLAG="--no-tls-no-verify"
+  [[ "$TLS_ENABLED" == "true" ]] && TLS_NO_VERIFY_FLAG="--tls-no-verify"
 
   echo "Launching client ${CID} on ${SSH_HOST}..."
   "${SSH[@]}" "${SSH_HOST}" "bash -s" <<EOF
@@ -248,7 +300,7 @@ export MINIO_ROOT_USER='${MINIO_ROOT_USER}'
 export MINIO_ROOT_PASSWORD='${MINIO_ROOT_PASSWORD}'
 nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   experiments/run_s3r12v3_fsdp.py \\
-  --config configs/s3r12v3-fsdp-run.yaml \\
+  --config ${CLIENT_CONFIG} \\
   --client-id ${CID} \\
   --server-url ${SERVER_URL} \\
   --minio-endpoint ${MINIO_CLIENT_ENDPOINT} \\
@@ -260,6 +312,8 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   --seed ${SEED} \\
   --transfer-dtype ${TRANSFER_DTYPE} \\
   --memory-decay ${MEMORY_DECAY} \\
+  --compressor ${COMPRESSOR} \\
+  --rho ${RHO} \\
   --local-steps ${LOCAL_STEPS} \\
   --batch-size ${BATCH_SIZE} \\
   --grad-accum ${GRAD_ACCUM} \\
@@ -271,6 +325,8 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   ${online_eval_flag} \\
   ${PER_CLIENT_STEPS_FLAG} \\
   ${AUTH_FLAG} \\
+  ${SEC_PRIVACY_FLAG} \\
+  ${TLS_NO_VERIFY_FLAG} \\
   > logs/client${CID}_fsdp.log 2>&1 &
 echo \$! > logs/client${CID}_fsdp.pid
 echo "ICC${CID} started pid=\$(cat logs/client${CID}_fsdp.pid)"
