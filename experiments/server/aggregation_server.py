@@ -126,6 +126,7 @@ class AggregationServer:
         compressor: str = "public_random",
         rho: float = 0.0,
         sec_upload_privacy: bool = False,
+        scale1_no_resident_global: bool = False,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -189,6 +190,8 @@ class AggregationServer:
         # server 端只做"解码"：从 SEC payload 还原出 block_delta。
         # 兼容旧格式：若 payload 不是 SEC 格式，走旧路径。
         self.sec_upload_privacy = bool(sec_upload_privacy)
+        # SCALE-1：不常驻 global_state（7B+ 开启省内存）
+        self.scale1_no_resident_global = bool(scale1_no_resident_global)
 
         self.current_round = 1
         self.lock = threading.Lock()
@@ -218,14 +221,18 @@ class AggregationServer:
             self.current_round = 1
             self._ensure_plan(1)
             self._mark_round_open(1)
-        # SCALE-1：释放 global_state，不常驻内存
+        # SCALE-1：释放 global_state，不常驻内存（仅 scale1_no_resident_global=true 时）
         # scheduler 已构建好 gidx_map，后续聚合用 compute_weighted_block_delta（不需要 global_state）
         # 写全量 checkpoint 时用 _rebuild_global_state 从 MinIO 重建
-        logger.info(
-            "SCALE-1: releasing global_state from memory (was %.1f MB)",
-            sum(v.numel() * v.element_size() for v in self.global_state.values()) / 1024 / 1024,
-        )
-        self.global_state = {}
+        if self.scale1_no_resident_global:
+            logger.info(
+                "SCALE-1: releasing global_state from memory (was %.1f MB)",
+                sum(v.numel() * v.element_size() for v in self.global_state.values()) / 1024 / 1024,
+            )
+            self.global_state = {}
+        else:
+            # 原版：常驻 global_state，用 apply_block_delta
+            pass
         self._write_run_meta()
         threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
@@ -585,13 +592,15 @@ class AggregationServer:
                 deltas.append(payload)
                 weights.append(float(client_meta.get(cid, {}).get("num_examples", 1)))
 
-        # SCALE-1：FedAvg 该单个 block（不需要 global_state，只算加权平均）
-        agg_delta = compute_weighted_block_delta(
-            deltas,
-            weights,
-            selected_for_block,
-            out_dtype=self.transfer_dtype,
-        )
+        # SCALE-1：FedAvg 该单个 block
+        if self.scale1_no_resident_global:
+            agg_delta = compute_weighted_block_delta(
+                deltas, weights, selected_for_block, out_dtype=self.transfer_dtype,
+            )
+        else:
+            agg_delta = apply_block_delta(
+                self.global_state, deltas, weights, selected_for_block, out_dtype=self.transfer_dtype,
+            )
 
         # 写出该 block 的聚合 delta
         agg_payload = {
@@ -889,12 +898,14 @@ class AggregationServer:
                         len(selected),
                     )
                 # SCALE-1：只计算加权平均，不修改 global_state
-                agg_delta = compute_weighted_block_delta(
-                    deltas,
-                    weights,
-                    selected,
-                    out_dtype=self.transfer_dtype,
-                )
+                if self.scale1_no_resident_global:
+                    agg_delta = compute_weighted_block_delta(
+                        deltas, weights, selected, out_dtype=self.transfer_dtype,
+                    )
+                else:
+                    agg_delta = apply_block_delta(
+                        self.global_state, deltas, weights, selected, out_dtype=self.transfer_dtype,
+                    )
                 t_apply = time.monotonic() - t_apply0
 
             # 公共：写出 delta + 结果（pipeline 模式 agg_delta 已组装好，batch 模式刚算完）
@@ -913,12 +924,13 @@ class AggregationServer:
             wrote_full_global = self._should_write_full_global(round_idx)
             global_bytes = 0
             if wrote_full_global:
-                # SCALE-1：不常驻 global_state，需要时从 MinIO 重建
-                # 从最近的 checkpoint 加载，apply 从那时到本轮的所有 delta
-                global_state = self._rebuild_global_state(round_idx)
-                global_bytes = self.minio.put_torch(global_state_key(round_idx), global_state)
-                # 重建后释放，不常驻
-                del global_state
+                # SCALE-1：不常驻 global_state 时从 MinIO 重建；否则直接写常驻的 global_state
+                if self.scale1_no_resident_global:
+                    global_state = self._rebuild_global_state(round_idx)
+                    global_bytes = self.minio.put_torch(global_state_key(round_idx), global_state)
+                    del global_state
+                else:
+                    global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
             else:
                 logger.info("IO-1: skip writing full global_state for round %s", round_idx)
             t_upload_global = time.monotonic() - t_up0
@@ -1293,6 +1305,13 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
     )
+    # SCALE-1：server 不常驻 global_state
+    p.add_argument(
+        "--scale1-no-resident-global",
+        action="store_true",
+        default=False,
+        help="SCALE-1: server 不常驻 global_state（7B+ 开启省内存）",
+    )
     return p.parse_args()
 
 
@@ -1353,6 +1372,7 @@ def main() -> None:
         compressor=args.compressor,
         rho=args.rho,
         sec_upload_privacy=args.sec_upload_privacy,
+        scale1_no_resident_global=args.scale1_no_resident_global,
     )
     # CFG-1：把生效的 run.yaml 写入 results 目录，保证可复现
     try:

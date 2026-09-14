@@ -57,6 +57,8 @@ ONLINE_EVAL="$(yaml_get YCFG_ ONLINE_EVAL true)"
 AUTH_TOKEN="${AUTH_TOKEN:-$(yaml_get YCFG_ AUTH_TOKEN '')}"
 TLS_ENABLED="$(yaml_get YCFG_ TLS false)"
 SEC_UPLOAD_PRIVACY="$(yaml_get YCFG_ SEC_UPLOAD_PRIVACY false)"
+SCALE1_NO_RESIDENT="$(yaml_get YCFG_ SCALE1_NO_RESIDENT_GLOBAL false)"
+SCALE3_SHARDED="$(yaml_get YCFG_ SCALE3_SHARDED_EXTRACT false)"
 
 # 允许 env 覆盖 yaml（联调快速调参）
 NUM_CLIENTS="${NUM_CLIENTS_ENV:-$NUM_CLIENTS}"
@@ -158,6 +160,8 @@ auth_flag=""
 [[ -n "$AUTH_TOKEN" ]] && auth_flag="--auth-token ${AUTH_TOKEN}"
 sec_privacy_flag=""
 [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && sec_privacy_flag="--sec-upload-privacy"
+scale1_flag=""
+[[ "$SCALE1_NO_RESIDENT" == "true" ]] && scale1_flag="--scale1-no-resident-global"
 
 # SEC-5：TLS 证书（自签名，自动生成/复用）
 TLS_CERT="" ; TLS_KEY=""
@@ -208,6 +212,7 @@ nohup /home/pcllgr/miniconda3/envs/fedscale-server/bin/python \
   --client-upload-timeout-s "${UPLOAD_TIMEOUT_S}" \
   ${auth_flag} \
   ${sec_privacy_flag} \
+  ${scale1_flag} \
   ${tls_flag} \
   --results-dir "${RUN_DIR}" \
   > "${RUN_DIR}/logs/aggregation_server.log" 2>&1 &
@@ -283,6 +288,8 @@ for plan_json in "${CLIENT_PLANS[@]}"; do
   [[ -n "$AUTH_TOKEN" ]] && AUTH_FLAG="--auth-token ${AUTH_TOKEN}"
   SEC_PRIVACY_FLAG=""
   [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && SEC_PRIVACY_FLAG="--sec-upload-privacy"
+  SCALE3_FLAG="--no-scale3-sharded-extract"
+  [[ "$SCALE3_SHARDED" == "true" ]] && SCALE3_FLAG="--scale3-sharded-extract"
   TLS_NO_VERIFY_FLAG="--no-tls-no-verify"
   [[ "$TLS_ENABLED" == "true" ]] && TLS_NO_VERIFY_FLAG="--tls-no-verify"
 
@@ -326,6 +333,7 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   ${PER_CLIENT_STEPS_FLAG} \\
   ${AUTH_FLAG} \\
   ${SEC_PRIVACY_FLAG} \\
+  ${SCALE3_FLAG} \\
   ${TLS_NO_VERIFY_FLAG} \\
   > logs/client${CID}_fsdp.log 2>&1 &
 echo \$! > logs/client${CID}_fsdp.pid

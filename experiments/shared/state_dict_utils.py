@@ -184,6 +184,8 @@ def get_sharded_block_delta(
 
     # SCALE-3 核心路径：逐 FSDP unit unshard
     selected_set = set(selected_by_key.keys())
+    new_memory = memory if is_main else memory
+    processed_keys: set = set()  # 防止重复处理（顶层 FSDP unit 包含所有子 unit 的参数）
 
     for fsdp_unit in fsdp_units:
         # summon_full_params 是 collective，所有 rank 都要执行
@@ -208,25 +210,20 @@ def get_sharded_block_delta(
         try:
             if is_main:
                 # 只有 rank0 有 local_global / memory，做 delta 提取
-                # FSDP unit 的 named_parameters() 返回的是相对于该 unit 的 key
-                # 需要构建完整 key（与 local_global 的 key 一致）
-                # 方法：用 model.named_parameters() 遍历，找到属于该 fsdp_unit 的参数
-                # 但更简单：直接用 module prefix + param name
-                # FSDP 的 fsdp_unit 可能是顶层（key 带 model. 前缀）或子层（key 不带前缀）
-                # 用 module 的 _fully_sharded_module_name 或遍历 parent 构建
-                # 最简单：遍历 model 的所有 named_parameters，检查 id 匹配
                 unit_param_ids = set(id(p) for _, p in fsdp_unit.named_parameters(recurse=True))
                 for full_name, param in model.named_parameters():
                     if id(param) not in unit_param_ids:
                         continue
                     clean_name = _strip_orig_mod_prefix(full_name)
-                    if clean_name not in selected_set:
-                        continue
+                    if clean_name in processed_keys:
+                        continue  # 已被子 FSDP unit 处理过
+                    processed_keys.add(clean_name)
                     if not param.is_floating_point():
                         continue
                     flat = param.data.contiguous().view(-1).to(dtype=torch.float32)
                     lg = local_global.get(clean_name)
                     mem = memory.get(clean_name)
+                    # delta = full - local_global（与 pipe2 原版一致：先 fp32 相减，再转回 fp16）
                     if lg is not None:
                         lg_flat = lg.contiguous().view(-1).to(dtype=torch.float32)
                         if flat.numel() != lg_flat.numel():
@@ -235,38 +232,50 @@ def get_sharded_block_delta(
                                 clean_name, flat.numel(), lg_flat.numel(),
                             )
                             continue
-                        flat = flat - lg_flat
+                        delta_flat = (flat - lg_flat).to(dtype=param.dtype).to(dtype=torch.float32)
+                    else:
+                        delta_flat = flat.clone()
+                    # to_send = delta + memory（与 pipe2 原版一致：fp16 相加后转 fp32）
                     if mem is not None:
                         mem_flat = mem.contiguous().view(-1).to(dtype=torch.float32)
-                        if flat.numel() == mem_flat.numel():
-                            flat = flat + mem_flat
-                    # 提取选中的 block
-                    out_dtype = transfer_dtype if transfer_dtype is not None else param.dtype
-                    blocks: List[Tuple] = []
-                    for s, e in selected_by_key[clean_name]:
-                        slice_data = flat[s:e]
-                        if out_dtype == torch.int8:
-                            from shared.block_selection import _quantize_int8_block
-                            q, scale = _quantize_int8_block(slice_data)
-                            blocks.append((s, e, q.detach().to(device="cpu").contiguous(), scale))
+                        if delta_flat.numel() == mem_flat.numel():
+                            to_send_flat = (delta_flat.to(dtype=param.dtype) + mem_flat.to(dtype=param.dtype)).to(dtype=torch.float32)
                         else:
-                            blocks.append((s, e, slice_data.detach().to(device="cpu", dtype=out_dtype).contiguous()))
-                    block_delta[clean_name] = blocks
+                            to_send_flat = delta_flat
+                    else:
+                        to_send_flat = delta_flat
+
+                    # 提取选中的 block
+                    if clean_name in selected_set:
+                        out_dtype = transfer_dtype if transfer_dtype is not None else param.dtype
+                        blocks: List[Tuple] = []
+                        for s, e in selected_by_key[clean_name]:
+                            slice_data = to_send_flat[s:e]
+                            if out_dtype == torch.int8:
+                                from shared.block_selection import _quantize_int8_block
+                                q, scale = _quantize_int8_block(slice_data)
+                                blocks.append((s, e, q.detach().to(device="cpu").contiguous(), scale))
+                            else:
+                                blocks.append((s, e, slice_data.detach().to(device="cpu", dtype=out_dtype).contiguous()))
+                        block_delta[clean_name] = blocks
+
+                    # 更新 memory: 已上传 block 置 0，其余保留，再 * decay
+                    # 与原版 update_block_memory 语义一致
+                    if mem is not None:
+                        mem_updated = to_send_flat.clone()
+                        if clean_name in selected_by_key:
+                            for s, e in selected_by_key[clean_name]:
+                                mem_updated[s:e] = 0.0
+                        new_memory[clean_name] = (mem_updated * memory_decay).to(dtype=mem.dtype).view(mem.shape)
+                    else:
+                        # 首轮 memory 为 0，创建新 memory
+                        mem_updated = to_send_flat.clone()
+                        if clean_name in selected_by_key:
+                            for s, e in selected_by_key[clean_name]:
+                                mem_updated[s:e] = 0.0
+                        new_memory[clean_name] = (mem_updated * memory_decay).to(dtype=param.dtype).view(param.shape)
         finally:
             cm.__exit__(None, None, None)
-
-    # 更新 memory（只在 rank0）
-    if is_main:
-        from shared.block_selection import update_block_memory
-        # 需要完整的 to_send 来更新 memory，但不想 gather 完整 state
-        # memory 更新逻辑：已上传 block 置 0，其余保留，再 * decay
-        # 这里用 local_global + memory 近似（因为 to_send = delta + memory = (full - local_global) + memory）
-        # 但我们没有 full_state... 需要另一种方式
-        # 实际上 update_block_memory 只需要 to_send 和 selected_by_key
-        # to_send = (full - local_global) + memory
-        # 但我们没有 full_state
-        # 替代方案：直接更新 memory 的选中 block 为 0，其余 * decay
-        new_memory = _update_memory_sharded(memory, selected_by_key, memory_decay)
 
     return block_delta, new_memory
 

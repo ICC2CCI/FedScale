@@ -508,6 +508,13 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
     )
+    # SCALE-3：逐 FSDP unit 提取 delta
+    p.add_argument(
+        "--scale3-sharded-extract",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="SCALE-3: 逐 FSDP unit 提取 delta（7B+ 开启省内存）；false=原版 full gather",
+    )
     # SEC-5：TLS（自签名证书时跳过验证）
     p.add_argument(
         "--tls-no-verify",
@@ -883,7 +890,7 @@ def main() -> None:
         # SCALE-3：逐 FSDP unit 提取 block delta，不 gather 完整 state
         # 这是 collective op，所有 rank 同步执行
         # public_random compressor 不需要 energies；其他 compressor 回退到 full state
-        use_scale3 = str(getattr(args, "compressor", "public_random") or "public_random") in ("public_random", "dense")
+        use_scale3 = args.scale3_sharded_extract and str(getattr(args, "compressor", "public_random") or "public_random") in ("public_random", "dense")
         block_delta: Dict[str, Any] = {}
         full_state: Optional[Dict[str, torch.Tensor]] = None
 
@@ -965,14 +972,19 @@ def main() -> None:
                             break
                 if args.sec_upload_privacy:
                     # SEC-1/2/3：gidx 化 + 加密 + 末 block 填充
-                    slice_data = single_block_delta.get(key_name, [(0, 0, torch.zeros(1, dtype=transfer_dtype) if transfer_dtype else torch.zeros(1))])[0][2]
-                    is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
-                    scale = None
-                    if is_int8_item:
-                        # int8 时 slice 在元组第 3 位，scale 在第 4 位
-                        for it in nonlocal_block_delta.get(key_name, []):
-                            if it[0] == start and it[1] == end and len(it) > 3:
-                                scale = float(it[3]); break
+                    if key_name not in single_block_delta or not single_block_delta[key_name]:
+                        # 该 block 未在 block_delta 中（可能 key 不匹配），用全 0 delta
+                        slice_data = torch.zeros(end - start, dtype=transfer_dtype or torch.float16)
+                        is_int8_item = False
+                        scale = None
+                    else:
+                        slice_data = single_block_delta[key_name][0][2]
+                        is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
+                        scale = None
+                        if is_int8_item:
+                            for it in nonlocal_block_delta.get(key_name, []):
+                                if it[0] == start and it[1] == end and len(it) > 3:
+                                    scale = float(it[3]); break
                     real_len = int(end - start)
                     block_payload = encode_sec_block_payload(
                         gidx, slice_data, round_key,

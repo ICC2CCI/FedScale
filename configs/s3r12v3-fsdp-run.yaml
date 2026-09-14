@@ -44,7 +44,11 @@ sync:
 security:
   auth_token: ""                # 空字符串=不鉴权（联调）；非空则要求 Authorization: Bearer <token>
   tls: false                    # true 时客户端用 https://
-  sec_upload_privacy: true      # SEC-1/2/3: true=上传 payload 不含 key_name + gidx 加密 + 末 block 填充
+  sec_upload_privacy: false     # SEC-1/2/3: true=上传隐私（gidx+加密+填充）；false=原版格式（0.5B 默认关闭，7B+ 按需开启）
+
+scale:
+  scale1_no_resident_global: false  # SCALE-1: true=server 不常驻 global_state（7B+ 开启省内存）；false=原版（0.5B 默认）
+  scale3_sharded_extract: false     # SCALE-3: true=client 逐 FSDP unit 提取 delta（7B+ 开启省内存）；false=原版 full gather
 
 resume:
   resume_from_round: 0          # 0=不续训；>0=从该 round 恢复（需 MinIO 中已有该轮 delta/state）
