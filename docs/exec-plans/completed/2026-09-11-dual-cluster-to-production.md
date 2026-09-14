@@ -1,6 +1,6 @@
 # 双集群联调 → 真实联邦训练 TODO
 
-- **状态**：completed（切片 A–J 已落地；SEC-1/2/3/5 已实现并验证）
+- **状态**：completed（切片 A–J 已落地；SEC-0~5 + SCALE-1/3 全部实现并验证）
 - **创建**：2026-09-11
 - **更新**：2026-09-11
 - **当前阶段**：配置化 + 真实联邦能力已具备，等待双集群实跑验证
@@ -62,7 +62,7 @@
 | SEC-1 | P3 | done | 上传不传 `key_name`（block_id） | 安全方案 §5.1 |
 | SEC-2 | P3 | done | block_id 加密 | SEC-1 |
 | SEC-3 | P3 | done | 末 block 填充到统一大小 | SEC-1 |
-| SCALE-1 | P2 | designed | Server 流式按 block 聚合，不整模常驻 | IO-1 |
+| SCALE-1 | P2 | done | Server 流式按 block 聚合，不整模常驻 | IO-1 |
 | SCALE-2 | P2 | done | 通信精度 int8（现为占位） | — |
 | SCALE-3 | P2 | done | Client 尽量保持 FSDP 分片，只 apply delta | — |
 | DATA-1 | P2 | done | 非 IID / 不等分数据切分可配置 | CFG-1 |

@@ -280,6 +280,48 @@ def apply_block_delta(
     return aggregated
 
 
+def compute_weighted_block_delta(
+    client_block_deltas: List[BlockDelta],
+    weights: List[float],
+    selected_by_key: SelectedByKey,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+) -> BlockDelta:
+    """SCALE-1：只计算加权平均 block delta，不修改 global_state。
+
+    与 apply_block_delta 相同的聚合逻辑，但不需要 global_state 参数，
+    也不原地修改任何 state。适用于 server 不常驻 global_state 的场景。
+    """
+    total_w = float(sum(weights))
+    if total_w <= 0:
+        raise ValueError("weights sum must be positive")
+    store_dtype = out_dtype if out_dtype is not None else torch.float16
+    aggregated: BlockDelta = {}
+    for key_name, slices in selected_by_key.items():
+        out_blocks: List[Tuple[int, int, torch.Tensor]] = []
+        for s, e in slices:
+            acc = torch.zeros(e - s, dtype=torch.float32)
+            for cid, w in enumerate(weights):
+                if cid >= len(client_block_deltas):
+                    continue
+                blocks = client_block_deltas[cid].get(key_name, [])
+                for item in blocks:
+                    if item[0] == s and item[1] == e:
+                        slice_fp32 = _slice_to_fp32(item)
+                        acc.add_(slice_fp32, alpha=float(w) / total_w)
+                        break
+            if store_dtype == torch.int8:
+                q, scale = _quantize_int8_block(acc)
+                out_blocks.append((s, e, q.detach().to(device="cpu").contiguous(), scale))  # type: ignore[arg-type]
+            else:
+                out_blocks.append(
+                    (s, e, acc.detach().to(device="cpu", dtype=store_dtype).contiguous())
+                )
+        if out_blocks:
+            aggregated[key_name] = out_blocks
+    return aggregated
+
+
 def update_block_memory(
     to_send: Dict[str, torch.Tensor],
     selected_by_key: SelectedByKey,
