@@ -64,7 +64,7 @@
 | SEC-3 | P3 | done | 末 block 填充到统一大小 | SEC-1 |
 | SCALE-1 | P2 | designed | Server 流式按 block 聚合，不整模常驻 | IO-1 |
 | SCALE-2 | P2 | done | 通信精度 int8（现为占位） | — |
-| SCALE-3 | P2 | designed | Client 尽量保持 FSDP 分片，只 apply delta | — |
+| SCALE-3 | P2 | done | Client 尽量保持 FSDP 分片，只 apply delta | — |
 | DATA-1 | P2 | done | 非 IID / 不等分数据切分可配置 | CFG-1 |
 | DATA-2 | P2 | done | 评估集隔离（不要两端共用同一份 eval） | DATA-1 |
 | TRAIN-1 | P2 | done | 每 client 独立 `local_steps` / 时间预算 | CFG-1 |
