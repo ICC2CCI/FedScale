@@ -1,6 +1,6 @@
 # 双集群联调 → 真实联邦训练 TODO
 
-- **状态**：completed（切片 A–J 已落地；SEC-1/2/3 为 P3 合规项，设计就绪，默认关闭，待产品确认后接入传输格式）
+- **状态**：completed（切片 A–J 已落地；SEC-1/2/3/5 已实现并验证）
 - **创建**：2026-09-11
 - **更新**：2026-09-11
 - **当前阶段**：配置化 + 真实联邦能力已具备，等待双集群实跑验证
@@ -59,9 +59,9 @@
 | RES-1 | P1 | done | Server 从 round N 断点续训 | IO-1 |
 | RES-2 | P1 | done | Client 持久化 memory + 本地全局版本 | RES-1 |
 | SEC-0 | P1 | done | 控制面鉴权 + MinIO 凭证不进脚本 | CFG-3 |
-| SEC-1 | P3 | designed | 上传不传 `key_name`（block_id） | 安全方案 §5.1 |
-| SEC-2 | P3 | designed | block_id 加密 | SEC-1 |
-| SEC-3 | P3 | designed | 末 block 填充到统一大小 | SEC-1 |
+| SEC-1 | P3 | done | 上传不传 `key_name`（block_id） | 安全方案 §5.1 |
+| SEC-2 | P3 | done | block_id 加密 | SEC-1 |
+| SEC-3 | P3 | done | 末 block 填充到统一大小 | SEC-1 |
 | SCALE-1 | P2 | designed | Server 流式按 block 聚合，不整模常驻 | IO-1 |
 | SCALE-2 | P2 | done | 通信精度 int8（现为占位） | — |
 | SCALE-3 | P2 | designed | Client 尽量保持 FSDP 分片，只 apply delta | — |
@@ -625,7 +625,7 @@ SecAgg / DP（安全文档第四、五层）明确标为**可选，默认不做*
 | **G. 规模** | SCALE-1, SCALE-2, SCALE-3 | 中～大 | SCALE-2 done; SCALE-1/3 designed | int8 已实现；流式/FSDP 分片为 7B 前再做 |
 | **H. 真实数据** | DATA-1, DATA-2, TRAIN-1, TRAIN-2 | 中 | done | 非 IID、异构 step |
 | **I. 运维** | OPS-1, OPS-2, OPS-3 | 中 | done | 可值守 |
-| **J. 安全加固** | SEC-1~5, SEC-4 | 中～大 | SEC-4/5 done; SEC-1/2/3 designed | TLS+异常防护已实现；上传隐私待合规确认 |
+| **J. 安全加固** | SEC-1~5, SEC-4 | 中～大 | done | TLS+异常防护+上传隐私全部实现并验证 |
 
 近期若只做联调体验：**先做切片 A，再做 C**。A 让「5% 还是 20%、30 step 还是 100」变成真开关；C 让换大模型时聚合侧先活下来。
 
