@@ -350,7 +350,18 @@ def train_local_steps(
         try:
             gpu_util_pct = round(torch.cuda.utilization(), 2)
         except Exception:
-            gpu_util_pct = None
+            pass
+        if gpu_util_pct is None:
+            try:
+                import subprocess as _sp
+                _r = _sp.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                gpu_util_pct = round(float(_r.stdout.strip().splitlines()[0]), 2)
+            except Exception:
+                gpu_util_pct = None
 
     # CPU memory (RSS) via resource module
     cpu_mem_peak_mb = 0.0
