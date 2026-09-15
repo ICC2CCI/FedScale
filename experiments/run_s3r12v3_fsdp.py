@@ -263,7 +263,12 @@ def train_local_steps(
     accelerator,
     local_steps: int,
     grad_accum: int,
-) -> float:
+) -> tuple[float, dict]:
+    """Run local training and return (avg_loss, step_metrics).
+
+    step_metrics contains per-step timing and resource data that the
+    evaluation package can aggregate (category 1 + 2).
+    """
     model.train()
     step = 0
     micro = 0
@@ -271,23 +276,56 @@ def train_local_steps(
     loss_count = 0
     data_iter = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
+    step_records: list[dict] = []
+    train_start = time.monotonic()
+    gpu_mem_base = 0.0
+    if torch.cuda.is_available():
+        gpu_mem_base = torch.cuda.memory_allocated() / (1024 * 1024)
+
     while step < local_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
+        step_start = time.monotonic()
         with accelerator.accumulate(model):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            fwd_start = time.monotonic()
             outputs = model(**batch)
             loss = outputs.loss
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            fwd_ms = (time.monotonic() - fwd_start) * 1000
+
+            bwd_start = time.monotonic()
             accelerator.backward(loss)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            bwd_ms = (time.monotonic() - bwd_start) * 1000
+
             loss_sum += float(loss.detach().item())
             loss_count += 1
             if accelerator.sync_gradients:
+                opt_start = time.monotonic()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                opt_ms = (time.monotonic() - opt_start) * 1000
                 step += 1
+                total_ms = (time.monotonic() - step_start) * 1000
+                step_records.append({
+                    "step": step,
+                    "forward_ms": round(fwd_ms, 2),
+                    "backward_ms": round(bwd_ms, 2),
+                    "optimizer_ms": round(opt_ms, 2),
+                    "comm_ms": round(max(0.0, total_ms - fwd_ms - bwd_ms - opt_ms), 2),
+                    "total_ms": round(total_ms, 2),
+                    "loss": round(loss_sum / max(loss_count, 1), 6),
+                })
                 if accelerator.is_main_process and step % 10 == 0:
                     logger.info(
                         "local step %s/%s loss=%.4f",
@@ -297,7 +335,39 @@ def train_local_steps(
                     )
             else:
                 micro += 1
-    return loss_sum / max(loss_count, 1)
+
+    train_time_s = time.monotonic() - train_start
+    gpu_mem_peak_mb = 0.0
+    if torch.cuda.is_available():
+        gpu_mem_peak_mb = max(
+            gpu_mem_base,
+            torch.cuda.max_memory_allocated() / (1024 * 1024),
+        )
+
+    avg_loss = loss_sum / max(loss_count, 1)
+    n = len(step_records)
+    summary = {
+        "steps": step_records,
+        "total_train_time_s": round(train_time_s, 2),
+        "avg_step_time_ms": round(sum(s["total_ms"] for s in step_records) / n, 2) if n else 0.0,
+        "avg_forward_ms": round(sum(s["forward_ms"] for s in step_records) / n, 2) if n else 0.0,
+        "avg_backward_ms": round(sum(s["backward_ms"] for s in step_records) / n, 2) if n else 0.0,
+        "avg_comm_ms": round(sum(s["comm_ms"] for s in step_records) / n, 2) if n else 0.0,
+        "avg_optimizer_ms": round(sum(s["optimizer_ms"] for s in step_records) / n, 2) if n else 0.0,
+        "throughput_tokens_per_s": 0.0,
+        "total_tokens": 0,
+        "num_steps": n,
+    }
+    resources = {
+        "gpu_memory_peak_mb": round(gpu_mem_peak_mb, 2),
+        "gpu_utilization_avg_pct": None,
+        "cpu_utilization_avg_pct": 0.0,
+        "cpu_memory_peak_mb": 0.0,
+        "network_rx_bytes": None,
+        "network_tx_bytes": None,
+        "network_total_bytes": None,
+    }
+    return avg_loss, {"training": summary, "resources": resources}
 
 
 @torch.no_grad()
@@ -744,7 +814,7 @@ def main() -> None:
             continue
 
         t_train0 = time.monotonic()
-        train_loss = train_local_steps(
+        train_loss, train_step_metrics = train_local_steps(
             model=model,
             dataloader=loader,
             optimizer=optimizer,
@@ -920,6 +990,10 @@ def main() -> None:
                 "upload_blocks_MiB": round(total_upload_bytes / (1024 * 1024), 3),
                 "pipeline_wait_agg_s": round(t_wait, 3),
                 "pipeline_post_apply_s": round(t_post, 3),
+                # Evaluation-compatible WAN timing aliases
+                "wan_download_s": round(t_download, 3),
+                "wan_upload_s": round(t_upload, 3),
+                "model_delta_bytes": int(total_upload_bytes),
             }
             return timings
 
@@ -1010,6 +1084,10 @@ def main() -> None:
                 "encode_delta_s": round(t_encode, 3),
                 "upload_minio_s": round(t_upload, 3),
                 "upload_blocks_MiB": round(upload_bytes / (1024 * 1024), 3),
+                # Evaluation-compatible WAN timing aliases
+                "wan_download_s": round(t_download, 3),
+                "wan_upload_s": round(t_upload, 3),
+                "model_delta_bytes": int(upload_bytes),
             }
             t_notify0 = time.monotonic()
             body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings, "block_energies": energies}
@@ -1094,6 +1172,38 @@ def main() -> None:
                 "post_delta_MiB": round(float((post or {}).get("bytes", 0.0)) / (1024 * 1024), 3),
                 "round_total_s": round(time.monotonic() - t_round0, 3),
             }
+
+            # Write metrics_detailed.json for evaluation package compatibility
+            try:
+                from datetime import datetime as _dt
+                metrics_detailed = {
+                    "timestamp": _dt.now().isoformat(),
+                    "training": train_step_metrics.get("training", {}),
+                    "resources": train_step_metrics.get("resources", {}),
+                    "federated": {
+                        "t_total_round_s": full_timings.get("round_total_s"),
+                        "t_model_delta_export_s": full_timings.get("encode_delta_s"),
+                        "t_full_update_compression_s": full_timings.get("encode_delta_s"),
+                        "wan_download_s": full_timings.get("wan_download_s"),
+                        "wan_upload_s": full_timings.get("wan_upload_s"),
+                        "model_delta_bytes": full_timings.get("model_delta_bytes"),
+                        "training_only_s": full_timings.get("train_local_s"),
+                        "evaluation_s": full_timings.get("eval_local_s", 0.0),
+                    },
+                }
+                metrics_dir = Path(args.client_state_dir or ".") / "metrics"
+                metrics_dir.mkdir(parents=True, exist_ok=True)
+                md_path = metrics_dir / f"metrics_detailed_round_{round_idx}.json"
+                md_path.write_text(
+                    json.dumps(metrics_detailed, indent=2), encoding="utf-8"
+                )
+                # Also overwrite the latest version
+                (metrics_dir / "metrics_detailed.json").write_text(
+                    json.dumps(metrics_detailed, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to write metrics_detailed.json: %s", exc)
+
             logger.info(
                 "Round %s done mode=%s timing_s=%s server_timing=%s",
                 round_idx,

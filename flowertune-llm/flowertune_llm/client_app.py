@@ -738,6 +738,7 @@ def train(msg: Message, context: Context):
         save_dir = f"/app/outputs/{job_name}"
         os.makedirs(save_dir, exist_ok=True)
         initial_weights_path = f"{save_dir}/initial_weights.pt"
+        wan_download_started = time.perf_counter()
         if object_store_transport:
             global_artifact = ModelArtifact(
                 uri=str(msg.content["config"]["global-model-uri"]),
@@ -785,6 +786,8 @@ def train(msg: Message, context: Context):
                 del base_state
             torch.save(received_state, initial_weights_path)
             print(f"Saved initial weights to {initial_weights_path}")
+        wan_download_s = round(time.perf_counter() - wan_download_started, 4)
+        print(f"WAN download (global model receipt): {wan_download_s}s")
 
         # Copy FSDP-aware training files to the shared PVC so every rank starts
         # from exactly the same implementation.
@@ -1022,6 +1025,8 @@ def train(msg: Message, context: Context):
         cleanup_k8s_job(job_name)
 
         artifact = None
+        wan_upload_s = 0.0
+        object_store_uploaded_bytes = None
         if object_store_transport:
             role = os.environ.get("OBJECT_STORE_CLIENT_ROLE", "").strip()
             if role not in {"client-a", "client-b"}:
@@ -1036,10 +1041,12 @@ def train(msg: Message, context: Context):
                 role=role,
                 num_examples=int(metrics.get("num_examples", 0)),
             )
+            wan_upload_s = round(time.perf_counter() - upload_started, 4)
             encoded_bytes = artifact.size
+            object_store_uploaded_bytes = artifact.size
             print(
                 f"Uploaded full model to {artifact.uri} "
-                f"({artifact.size} bytes, {time.perf_counter() - upload_started:.2f}s)"
+                f"({artifact.size} bytes, {wan_upload_s}s)"
             )
 
         # Step 6: Measure federated timing
@@ -1055,7 +1062,11 @@ def train(msg: Message, context: Context):
             "t_full_update_compression_s": round(compression_seconds, 4),
             "t_total_round_s": round(t_total_round, 4),
             "model_delta_bytes": encoded_bytes,
+            "wan_download_s": wan_download_s,
+            "wan_upload_s": wan_upload_s,
         }
+        if object_store_uploaded_bytes is not None:
+            federated_metrics["object_store_uploaded_bytes"] = object_store_uploaded_bytes
         if detailed_metrics is not None:
             detailed_metrics.setdefault("federated", {}).update(federated_metrics)
             try:
@@ -1097,7 +1108,11 @@ def train(msg: Message, context: Context):
             "full_update_compression_seconds": round(compression_seconds, 4),
             "model_delta_bytes": encoded_bytes,
             "model_delta_export_seconds": round(t_model_delta_export, 4),
+            "wan_download_seconds": wan_download_s,
+            "wan_upload_seconds": wan_upload_s,
         })
+        if object_store_uploaded_bytes is not None:
+            metric_record["object_store_uploaded_bytes"] = object_store_uploaded_bytes
 
         content = RecordDict({"arrays": model_record, "metrics": metric_record})
         if artifact is not None:

@@ -168,6 +168,7 @@ class ObjectStoreFedAvg(FedAvg):
         initial_global: ModelArtifact,
         expected_roles: tuple[str, ...] = ("client-a", "client-b"),
         resume_round: int = 0,
+        round_client_metrics: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -177,6 +178,7 @@ class ObjectStoreFedAvg(FedAvg):
         self.current_global = initial_global
         self.expected_roles = expected_roles
         self.resume_round = int(resume_round)
+        self._round_client_metrics = round_client_metrics if round_client_metrics is not None else {}
 
     def configure_train(self, server_round, arrays, config, grid):
         config["server-round"] = int(server_round)
@@ -218,4 +220,14 @@ class ObjectStoreFedAvg(FedAvg):
         )
         metrics = self.train_metrics_aggr_fn(metric_contents, self.weighted_by_key)
         metrics["object_store_global_bytes"] = self.current_global.size
+        self._round_client_metrics[server_round] = {
+            key: metrics[key]
+            for key in (
+                "wan_download_seconds",
+                "wan_upload_seconds",
+                "model_delta_bytes",
+                "object_store_uploaded_bytes",
+            )
+            if metrics.get(key) is not None
+        }
         return ArrayRecord({CONTROL_ARRAY_KEY: torch.zeros(1, dtype=torch.uint8)}), metrics

@@ -98,9 +98,10 @@ class FinalEvaluationOnlyMixin:
 class TimedFedAvg(FinalEvaluationOnlyMixin, FedAvg):
     """FedAvg wrapper that records pure server-side train aggregation time."""
 
-    def __init__(self, *args, aggregation_timings=None, **kwargs):
+    def __init__(self, *args, aggregation_timings=None, round_client_metrics=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._aggregation_timings = aggregation_timings if aggregation_timings is not None else {}
+        self._round_client_metrics = round_client_metrics if round_client_metrics is not None else {}
 
     def aggregate_train(self, server_round: int, replies):
         started = time.perf_counter()
@@ -120,11 +121,32 @@ class TimedFedAvg(FinalEvaluationOnlyMixin, FedAvg):
                     f"{len(valid_replies)} valid results; refusing to advance "
                     "the global model from a partial aggregation"
                 )
-            return super().aggregate_train(server_round, valid_replies)
+            result = super().aggregate_train(server_round, valid_replies)
+            self._capture_client_metrics(server_round, result)
+            return result
         finally:
             self._aggregation_timings[server_round] = round(
                 time.perf_counter() - started, 4
             )
+
+    def _capture_client_metrics(self, server_round, result):
+        """Extract WAN timing from aggregated client metrics for round files."""
+        if not result or len(result) < 2 or result[1] is None:
+            return
+        try:
+            metrics = dict(result[1])
+        except (TypeError, ValueError):
+            return
+        self._round_client_metrics[server_round] = {
+            key: metrics[key]
+            for key in (
+                "wan_download_seconds",
+                "wan_upload_seconds",
+                "model_delta_bytes",
+                "object_store_uploaded_bytes",
+            )
+            if metrics.get(key) is not None
+        }
 
 
 class SparseFullDeltaFedAvg(FinalEvaluationOnlyMixin, FedAvg):
@@ -138,7 +160,7 @@ class SparseFullDeltaFedAvg(FinalEvaluationOnlyMixin, FedAvg):
     This keeps every round below the cross-cloud transport limit.
     """
 
-    def __init__(self, *args, initial_state, topk_ratio, aggregation_timings=None, **kwargs):
+    def __init__(self, *args, initial_state, topk_ratio, aggregation_timings=None, round_client_metrics=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._base_state = {
             key: value.clone() if hasattr(value, "clone") else value
@@ -147,15 +169,37 @@ class SparseFullDeltaFedAvg(FinalEvaluationOnlyMixin, FedAvg):
         self._global_state = initial_state
         self._topk_ratio = float(topk_ratio)
         self._aggregation_timings = aggregation_timings if aggregation_timings is not None else {}
+        self._round_client_metrics = round_client_metrics if round_client_metrics is not None else {}
 
     def aggregate_train(self, server_round: int, replies):
         started = time.perf_counter()
         try:
-            return self._aggregate_train_impl(server_round, replies)
+            result = self._aggregate_train_impl(server_round, replies)
+            self._capture_client_metrics(server_round, result)
+            return result
         finally:
             self._aggregation_timings[server_round] = round(
                 time.perf_counter() - started, 4
             )
+
+    def _capture_client_metrics(self, server_round, result):
+        """Extract WAN timing from aggregated client metrics for round files."""
+        if not result or len(result) < 2 or result[1] is None:
+            return
+        try:
+            metrics = dict(result[1])
+        except (TypeError, ValueError):
+            return
+        self._round_client_metrics[server_round] = {
+            key: metrics[key]
+            for key in (
+                "wan_download_seconds",
+                "wan_upload_seconds",
+                "model_delta_bytes",
+                "object_store_uploaded_bytes",
+            )
+            if metrics.get(key) is not None
+        }
 
     def _aggregate_train_impl(
         self, server_round: int, replies
@@ -237,6 +281,7 @@ class FedScaleBlockFedAvg(FinalEvaluationOnlyMixin, FedAvg):
         mask_ratio,
         encode_downlink=True,
         aggregation_timings=None,
+        round_client_metrics=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -270,6 +315,9 @@ class FedScaleBlockFedAvg(FinalEvaluationOnlyMixin, FedAvg):
         self._aggregation_timings = (
             aggregation_timings if aggregation_timings is not None else {}
         )
+        self._round_client_metrics = (
+            round_client_metrics if round_client_metrics is not None else {}
+        )
 
     def _set_round_plan(self, config, block_ids):
         config["fedscale-layout-hash"] = self._layout.layout_hash
@@ -295,11 +343,32 @@ class FedScaleBlockFedAvg(FinalEvaluationOnlyMixin, FedAvg):
     def aggregate_train(self, server_round, replies):
         started = time.perf_counter()
         try:
-            return self._aggregate_train_impl(server_round, replies)
+            result = self._aggregate_train_impl(server_round, replies)
+            self._capture_client_metrics(server_round, result)
+            return result
         finally:
             self._aggregation_timings[server_round] = round(
                 time.perf_counter() - started, 4
             )
+
+    def _capture_client_metrics(self, server_round, result):
+        """Extract WAN timing from aggregated client metrics for round files."""
+        if not result or len(result) < 2 or result[1] is None:
+            return
+        try:
+            metrics = dict(result[1])
+        except (TypeError, ValueError):
+            return
+        self._round_client_metrics[server_round] = {
+            key: metrics[key]
+            for key in (
+                "wan_download_seconds",
+                "wan_upload_seconds",
+                "model_delta_bytes",
+                "object_store_uploaded_bytes",
+            )
+            if metrics.get(key) is not None
+        }
 
     def _aggregate_train_impl(self, server_round, replies):
         valid_replies, failures = self._check_and_log_replies(
@@ -564,6 +633,7 @@ def main(grid: Grid, context: Context) -> None:
     # Track round timing across rounds
     round_timings = []
     aggregation_timings = {}
+    round_client_metrics = {}
     final_evaluation_timings = {}
     initial_state_load_s = None
     server_base_state_load_s = None
@@ -704,6 +774,7 @@ def main(grid: Grid, context: Context) -> None:
                 experiment_id=experiment_id,
                 initial_global=initial_global,
                 resume_round=resume_round,
+                round_client_metrics=round_client_metrics,
             )
         elif full_update_compression == "topk-int8":
             print(
@@ -715,6 +786,7 @@ def main(grid: Grid, context: Context) -> None:
                 initial_state=sparse_base_state,
                 topk_ratio=float(cfg.train.full_update_topk_ratio),
                 aggregation_timings=aggregation_timings,
+                round_client_metrics=round_client_metrics,
             )
         elif full_update_compression == "fedscale-int8":
             if not 0.0 < float(cfg.train.fedscale_mask_ratio) <= 1.0:
@@ -768,11 +840,13 @@ def main(grid: Grid, context: Context) -> None:
                 mask_ratio=float(cfg.train.fedscale_mask_ratio),
                 encode_downlink=not is_lora_fedscale,
                 aggregation_timings=aggregation_timings,
+                round_client_metrics=round_client_metrics,
             )
         else:
             strategy = TimedFedAvg(
                 **strategy_kwargs,
                 aggregation_timings=aggregation_timings,
+                round_client_metrics=round_client_metrics,
             )
         progress.phase(
             "waiting_for_clients",
@@ -811,6 +885,7 @@ def main(grid: Grid, context: Context) -> None:
                 experiment_id,
                 sparse_base_state=getattr(strategy, "_base_state", None),
                 aggregation_timings=aggregation_timings,
+                round_client_metrics=round_client_metrics,
                 initial_state_load_s=initial_state_load_s,
                 server_base_state_load_s=server_base_state_load_s,
                 final_evaluation_timings=final_evaluation_timings,
@@ -1022,6 +1097,7 @@ def get_evaluate_fn(
     experiment_id=None,
     sparse_base_state=None,
     aggregation_timings=None,
+    round_client_metrics=None,
     initial_state_load_s=None,
     server_base_state_load_s=None,
     final_evaluation_timings=None,
@@ -1093,6 +1169,27 @@ def get_evaluate_fn(
             federated_metrics["final_model_evaluation_s"] = (
                 final_evaluation_seconds
             )
+
+        # Include client-side WAN timing from aggregated train metrics
+        if round_client_metrics:
+            client_metrics = round_client_metrics.get(server_round)
+            if client_metrics:
+                if "wan_download_seconds" in client_metrics:
+                    federated_metrics["wan_download_s"] = client_metrics[
+                        "wan_download_seconds"
+                    ]
+                if "wan_upload_seconds" in client_metrics:
+                    federated_metrics["wan_upload_s"] = client_metrics[
+                        "wan_upload_seconds"
+                    ]
+                if "model_delta_bytes" in client_metrics:
+                    federated_metrics["model_delta_bytes"] = client_metrics[
+                        "model_delta_bytes"
+                    ]
+                if "object_store_uploaded_bytes" in client_metrics:
+                    federated_metrics["object_store_uploaded_bytes"] = (
+                        client_metrics["object_store_uploaded_bytes"]
+                    )
 
         # Save model checkpoint
         checkpoint_save_s = None

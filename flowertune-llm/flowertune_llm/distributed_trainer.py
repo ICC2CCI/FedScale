@@ -31,6 +31,7 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     FullStateDictConfig,
     MixedPrecision,
+    ShardedStateDictConfig,
     ShardingStrategy,
     StateDictType,
 )
@@ -420,8 +421,10 @@ def train_distributed():
         model = get_model(model_cfg)
 
         # Load initial weights if provided
+        checkpoint_restore_s = None
         if model_weights_path and os.path.exists(model_weights_path):
             print(f"[Rank {rank}] Loading initial weights from {model_weights_path}")
+            checkpoint_restore_started = time.perf_counter()
             initial_weights = torch.load(model_weights_path, map_location="cpu")
             if (
                 tuning == "full"
@@ -435,6 +438,13 @@ def train_distributed():
                 set_federated_state_dict(model, model_cfg, initial_weights)
             del initial_weights
             gc.collect()
+            checkpoint_restore_s = round(
+                time.perf_counter() - checkpoint_restore_started, 4
+            )
+            print(
+                f"[Rank {rank}] Checkpoint restore completed in "
+                f"{checkpoint_restore_s}s"
+            )
 
         # Export the known local base before moving or wrapping the model.  The
         # sparse full-update mode is restricted by ServerApp to a fresh first
@@ -772,6 +782,8 @@ def train_distributed():
         state_export_summary = {
             "state_export_type": "full_state_dict" if distributed_strategy == "fsdp" else "replicated_full_state_dict",
         }
+        if checkpoint_restore_s is not None:
+            state_export_summary["checkpoint_restore_s"] = checkpoint_restore_s
         if distributed_strategy == "fsdp":
             full_state_dict_config = FullStateDictConfig(
                 offload_to_cpu=True,
@@ -785,6 +797,22 @@ def train_distributed():
                 full_state_dict = model.state_dict()
             state_export_summary["full_state_export_s"] = round(
                 time.perf_counter() - state_export_started, 4
+            )
+            # Time sharded-state export for evaluation category 1.16.
+            # Unlike full-state export, sharded export does not gather all
+            # parameters to rank 0 and is useful for comparing checkpoint
+            # overhead at scale.
+            sharded_export_started = time.perf_counter()
+            sharded_config = ShardedStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.SHARDED_STATE_DICT,
+                sharded_config,
+            ):
+                _sharded_state = model.state_dict()
+            del _sharded_state
+            state_export_summary["sharded_state_export_s"] = round(
+                time.perf_counter() - sharded_export_started, 4
             )
             state_conversion_started = time.perf_counter()
             model_state_dict = (
