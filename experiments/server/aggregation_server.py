@@ -1525,11 +1525,10 @@ def build_app(server: AggregationServer) -> FastAPI:
         return server.secagg_get_peer_keys(round_idx)
 
     @app.post("/api/round/{round_idx}/client/{client_id}/secagg/masked-window/{window_id}")
-    async def secagg_submit_masked_window(
+    def secagg_submit_masked_window(
         round_idx: int, client_id: int, window_id: int,
-        request: Request, _: None = Depends(_auth),
+        body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
-        body = await request.json()
         z_hex = body.get("z_hex", "")
         vector_len = int(body.get("vector_len", 0))
         num_examples = int(body.get("num_examples", 1))
@@ -1688,7 +1687,7 @@ def parse_args() -> argparse.Namespace:
                    help="B: 随机舍入（让低精度平均无偏）")
     p.add_argument("--secagg-q-min", type=int, default=0,
                    help="B: 最小成功参与者数；0=num_clients")
-    return p
+    return p.parse_args()
 
 
 def main() -> None:

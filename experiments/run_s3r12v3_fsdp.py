@@ -854,7 +854,7 @@ def main() -> None:
                 if plan.layout_hash:
                     group_blocks_l, always_on_l = build_group_blocks(
                         global_state, block_size=args.block_size,
-                        always_on_threshold=0 if always_on_keys else 4096,
+                        always_on_threshold=4096,
                     )
                     layout_hash_l = compute_layout_hash(
                         group_blocks_l, always_on_keys=always_on_l,
@@ -1297,15 +1297,20 @@ def main() -> None:
                 total_upload_bytes += len(z_packed)
 
                 # 上传 z_k 到 server
+                # JSON 不支持 NaN/Inf，需替换
+                _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
+                _el = None
+                if eval_loss_val is not None:
+                    _el = float(eval_loss_val) if eval_loss_val == eval_loss_val and abs(eval_loss_val) != float('inf') else None
                 body = {
                     "z_hex": z_hex,
                     "vector_len": window.vector_length,
                     "num_examples": int(num_examples),
-                    "train_loss": float(train_loss),
+                    "train_loss": _tl,
                     "block_energies": [],
                 }
-                if eval_loss_val is not None:
-                    body["eval_loss"] = float(eval_loss_val)
+                if _el is not None:
+                    body["eval_loss"] = _el
                 resp = requests.post(
                     f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/masked-window/{wid}",
                     json=body, timeout=120, headers=auth_headers, verify=_REQUESTS_VERIFY,

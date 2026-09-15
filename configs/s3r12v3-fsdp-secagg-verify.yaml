@@ -1,0 +1,56 @@
+# B-10 验证配置：SecAgg 开启，5 轮快速验证
+# SEC-1/2/3 关闭（隔离测试 SecAgg），eval 每轮做
+federated:
+  num_clients: 2
+  num_rounds: 5
+  coverage_h: 10
+  slots_per_round: 1
+  seed: 20260831
+  transfer_dtype: fp16
+  memory_decay: 0.9
+  block_size: 524288
+  compressor: public_random
+  rho: 0.0
+  always_on_threshold: 4096
+
+train:
+  local_steps: 30
+  batch_size: 8
+  grad_accum: 2
+  lr: 1.0e-5
+  seq_len: 512
+
+io:
+  skip_round0_download: true
+  online_eval: true
+  write_full_global_every_n_rounds: 1
+  client_upload_timeout_s: 1800
+
+eval:
+  eval_path: data/medical_flashcards_eval.json
+  eval_max_batches: 0
+  eval_every_n_rounds: 1
+
+sync:
+  min_clients_to_aggregate: 0
+  round_deadline_s: 0
+
+security:
+  auth_token: ""
+  tls: false
+  sec_upload_privacy: false     # 关闭 SEC-1/2/3，隔离测试 SecAgg
+  secagg_enabled: true          # 开启 SecAgg
+  secagg_modulus_bits: 16
+  secagg_scale: 0.0
+  secagg_stochastic_rounding: false
+  secagg_q_min: 0
+
+scale:
+  scale1_no_resident_global: false   # 关闭 SCALE-1，让 server 有 global_state（简化验证）
+  scale3_sharded_extract: false      # 关闭 SCALE-3，简化验证
+
+resume:
+  resume_from_round: 0
+
+ops:
+  minio_retention_recent_uploads: 0
