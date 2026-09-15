@@ -78,6 +78,11 @@ class RoundPlan:
     total_elems: int
     # 流式 per-block pipeline：有序 block 列表，每项 [global_idx, key_name, start, end]
     block_list: List[List[int]] = field(default_factory=list)
+    # A-3: 审计字段（spec v1 第 9 节）
+    layout_hash: str = ""        # SHA256 of canonical-encoded layout (groups + always_on + H + block_size)
+    mask_hash: str = ""          # SHA256 of canonical-encoded selected blocks
+    mask_policy_id: str = ""     # e.g. "hierarchical-permute-rotate-v1"
+    always_on_keys: List[str] = field(default_factory=list)  # sorted key names that are always selected
 
     @property
     def upload_ratio(self) -> float:
@@ -103,6 +108,10 @@ class RoundPlan:
             selected_elems=int(data["selected_elems"]),
             total_elems=int(data["total_elems"]),
             block_list=[list(b) for b in data.get("block_list", [])],
+            layout_hash=str(data.get("layout_hash", "")),
+            mask_hash=str(data.get("mask_hash", "")),
+            mask_policy_id=str(data.get("mask_policy_id", "")),
+            always_on_keys=list(data.get("always_on_keys", [])),
         )
 
 

@@ -17,6 +17,10 @@ federated:
   transfer_dtype: fp16
   memory_decay: 0.9
   block_size: 524288
+  # BlockVote / selection (default keeps legacy public random mask)
+  compressor: public_random   # public_random | block_vote_lag | block_topk | dense
+  rho: 0.0                    # 0 => 1/coverage_h
+  always_on_threshold: 4096   # A-4: numel <= this → always_on (LayerNorm/bias/gate scalars)
 
 train:
   local_steps: 30
@@ -44,11 +48,11 @@ sync:
 security:
   auth_token: ""                # 空字符串=不鉴权（联调）；非空则要求 Authorization: Bearer <token>
   tls: false                    # true 时客户端用 https://
-  sec_upload_privacy: false     # SEC-1/2/3: true=上传隐私（gidx+加密+填充）；false=原版格式（0.5B 默认关闭，7B+ 按需开启）
+  sec_upload_privacy: true      # SEC-1/2/3: true=上传隐私（gidx+加密+填充）
 
 scale:
-  scale1_no_resident_global: false  # SCALE-1: true=server 不常驻 global_state（7B+ 开启省内存）；false=原版（0.5B 默认）
-  scale3_sharded_extract: false     # SCALE-3: true=client 逐 FSDP unit 提取 delta（7B+ 开启省内存）；false=原版 full gather
+  scale1_no_resident_global: true  # SCALE-1: true=server 不常驻 global_state（省内存）
+  scale3_sharded_extract: true     # SCALE-3: true=client 逐 FSDP unit 提取 delta（省内存）
 
 resume:
   resume_from_round: 0          # 0=不续训；>0=从该 round 恢复（需 MinIO 中已有该轮 delta/state）

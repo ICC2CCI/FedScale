@@ -130,8 +130,27 @@ def fisher_yates_shuffle(n: int, seed: bytes) -> List[int]:
     return perm
 
 
-def build_group_blocks(state: Dict[str, torch.Tensor], block_size: int = DEFAULT_BLOCK_SIZE) -> GroupBlocks:
-    """按 layer / non_layer 分组，并把每个 floating tensor 切成 block。"""
+# Threshold: tensors with <= this many elements are designated "always_on"
+# (spec section 7: small params like LayerNorm/bias/gate scalars)
+DEFAULT_ALWAYS_ON_THRESHOLD = 4096
+
+
+def build_group_blocks(
+    state: Dict[str, torch.Tensor],
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    always_on_threshold: int = DEFAULT_ALWAYS_ON_THRESHOLD,
+) -> Tuple[GroupBlocks, set]:
+    """按 layer / non_layer 分组，并把每个 floating tensor 切成 block。
+
+    返回 (group_blocks, always_on_keys)：
+    - group_blocks: 同前，每个 floating tensor 切成 block
+    - always_on_keys: numel <= always_on_threshold 的参数 key_name 集合，
+      这些参数的所有 block 在 build_selected_blocks 中每轮都会被选中，
+      不参与 permutation / slot 轮转。
+
+    always_on 的设计依据：spec 第 7 节——小参数（LayerNorm/bias/门控标量）
+    不适合独立参与 H 轮轮转（会导致某些轮次完全没有这类参数更新）。
+    """
     groups_keys: Dict[str, List[str]] = {}
     for name, tensor in sorted(state.items()):
         if not tensor.is_floating_point():
@@ -144,27 +163,71 @@ def build_group_blocks(state: Dict[str, torch.Tensor], block_size: int = DEFAULT
         groups_keys.setdefault(gid, []).append(name)
 
     group_blocks: GroupBlocks = {}
+    always_on_keys: set = set()
     for gid, keys in groups_keys.items():
         blocks: List[Tuple[str, int, int]] = []
         for key_name in keys:
             n_elem = state[key_name].numel()
+            if n_elem <= always_on_threshold:
+                always_on_keys.add(key_name)
             for start in range(0, n_elem, block_size):
                 end = min(start + block_size, n_elem)
                 blocks.append((key_name, start, end))
         group_blocks[gid] = blocks
-    return group_blocks
+    return group_blocks, always_on_keys
+
+
+def get_rotating_blocks(
+    group_blocks: GroupBlocks,
+    always_on_keys: set,
+) -> GroupBlocks:
+    """返回只包含 rotating blocks 的 group_blocks（排除 always_on）。"""
+    rotating: GroupBlocks = {}
+    for gid, blocks in group_blocks.items():
+        rotating[gid] = [
+            (kn, s, e) for kn, s, e in blocks if kn not in always_on_keys
+        ]
+    return rotating
+
+
+def get_always_on_blocks(
+    group_blocks: GroupBlocks,
+    always_on_keys: set,
+) -> List[Tuple[str, int, int]]:
+    """返回 always_on blocks 的 flat list（按 group 顺序）。"""
+    always_on: List[Tuple[str, int, int]] = []
+    for gid in sorted(group_blocks):
+        for kn, s, e in group_blocks[gid]:
+            if kn in always_on_keys:
+                always_on.append((kn, s, e))
+    return always_on
 
 
 def build_permutations(
     group_blocks: GroupBlocks,
     epoch: int,
     seed: int,
+    always_on_keys: Optional[set] = None,
 ) -> Permutations:
+    """为每个 group 构建 Fisher-Yates 排列。
+
+    always_on_keys 中的 key 的 block 不参与排列（它们每轮都选中）。
+    只有 rotating blocks 参与排列，确保 H 轮内每个 rotating block 恰好被选一次。
+    """
     epoch_seed = hashlib.sha256(f"FedScale-BlockMask-v1|{seed}|{epoch}".encode("utf-8")).digest()
+    always_on_keys = always_on_keys or set()
     permutations: Permutations = {}
     for gid, blocks in group_blocks.items():
+        # 只对 rotating blocks 做排列
+        rotating = [(i, b) for i, b in enumerate(blocks) if b[0] not in always_on_keys]
+        n_rotating = len(rotating)
+        if n_rotating == 0:
+            permutations[gid] = []
+            continue
         group_seed = hkdf_group_seed(epoch_seed, gid)
-        permutations[gid] = fisher_yates_shuffle(len(blocks), group_seed)
+        perm = fisher_yates_shuffle(n_rotating, group_seed)
+        # perm 是 rotating-only 的排列；存原始 block indices
+        permutations[gid] = [rotating[j][0] for j in perm]
     return permutations
 
 
@@ -173,19 +236,73 @@ def build_selected_blocks(
     permutations: Permutations,
     slot: int,
     coverage_h: int = DEFAULT_COVERAGE_H,
+    always_on_keys: Optional[set] = None,
 ) -> SelectedByKey:
+    """构建本轮选中的 blocks。
+
+    - rotating blocks: pos % coverage_h == slot 的 blocks（参与 H 轮轮转）
+    - always_on blocks: always_on_keys 中 key 的所有 blocks，每轮都选中
+
+    always_on_keys=None 时向后兼容（无 always_on）。
+    """
     selected_by_key: SelectedByKey = {}
+    # rotating blocks
     for gid, blocks in group_blocks.items():
-        perm = permutations[gid]
+        perm = permutations.get(gid)
+        if perm is None:
+            continue
         for pos, block_idx in enumerate(perm):
             if pos % coverage_h == slot:
                 key_name, start, end = blocks[block_idx]
+                if always_on_keys and key_name in always_on_keys:
+                    continue  # always_on 在下面统一处理
                 selected_by_key.setdefault(key_name, []).append((start, end))
+    # always_on blocks: 每轮全部加入
+    if always_on_keys:
+        for gid in sorted(group_blocks):
+            for key_name, start, end in group_blocks[gid]:
+                if key_name in always_on_keys:
+                    selected_by_key.setdefault(key_name, []).append((start, end))
     return selected_by_key
 
 
 def count_selected_elems(selected_by_key: SelectedByKey) -> int:
     return sum(e - s for slices in selected_by_key.values() for s, e in slices)
+
+
+def recompute_selected_blocks(
+    reference_state: Dict[str, torch.Tensor],
+    round_idx: int,
+    coverage_h: int,
+    seed: int,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    always_on_keys: Optional[set] = None,
+    always_on_threshold: int = 0,
+) -> SelectedByKey:
+    """客户端独立重算 selected blocks（用于验证 server 下发的 plan）。
+
+    给定与 server 相同的 reference_state / coverage_h / seed / block_size，
+    独立构建 group_blocks → permutations → selected_blocks，
+    不依赖 server 下发的 selected_by_key。
+
+    always_on_threshold > 0 时自动识别小参数为 always_on；
+    always_on_keys 非 None 时直接使用（优先于 threshold）。
+    """
+    if always_on_keys is None and always_on_threshold > 0:
+        _, always_on_keys = build_group_blocks(
+            reference_state, block_size=block_size, always_on_threshold=always_on_threshold
+        )
+    group_blocks, _ = build_group_blocks(reference_state, block_size=block_size)
+    epoch = (round_idx - 1) // coverage_h
+    slot = (round_idx - 1) % coverage_h
+    permutations = build_permutations(
+        group_blocks, epoch=epoch, seed=seed, always_on_keys=always_on_keys,
+    )
+    selected = build_selected_blocks(
+        group_blocks, permutations, slot=slot,
+        coverage_h=coverage_h, always_on_keys=always_on_keys,
+    )
+    return selected
 
 
 def encode_block_delta(

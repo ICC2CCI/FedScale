@@ -33,6 +33,7 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "block_size",
         "compressor",
         "rho",
+        "always_on_threshold",
     ],
     "train": [
         "local_steps",
@@ -67,10 +68,6 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
     ],
     "ops": [
         "minio_retention_recent_uploads",
-    ],
-    "scale": [
-        "scale1_no_resident_global",
-        "scale3_sharded_extract",
     ],
 }
 

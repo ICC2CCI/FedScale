@@ -90,7 +90,6 @@ from shared.state_dict_utils import (  # noqa: E402
     add_state,
     broadcast_object,
     get_full_state_fsdp,
-    get_sharded_block_delta,
     load_full_state_fsdp,
     sub_state,
     zero_state_like,
@@ -459,6 +458,8 @@ def parse_args() -> argparse.Namespace:
         choices=["public_random", "block_vote_lag", "block_topk", "dense"],
     )
     p.add_argument("--rho", type=float, default=0.0, help="vote/topk 比例；0 表示跟随 yaml/coverage")
+    p.add_argument("--always-on-threshold", type=int, default=4096,
+                   help="numel <= this → always_on (LayerNorm/bias/gate scalars); 0=disable")
     p.add_argument("--poll-interval", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=20260831)
     p.add_argument(
@@ -507,13 +508,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
-    )
-    # SCALE-3：逐 FSDP unit 提取 delta
-    p.add_argument(
-        "--scale3-sharded-extract",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="SCALE-3: 逐 FSDP unit 提取 delta（7B+ 开启省内存）；false=原版 full gather",
     )
     # SEC-5：TLS（自签名证书时跳过验证）
     p.add_argument(
@@ -820,6 +814,56 @@ def main() -> None:
         accelerator.wait_for_everyone()
         t_broadcast_load = time.monotonic() - t_load0
 
+        # A-5: 客户端独立验证 plan（mask_hash + layout_hash）
+        # 防止 server 在看到本轮更新后篡改 mask（spec 第 3 节 Independence from current private updates）
+        if is_main and plan.mask_hash and plan.mask_policy_id:
+            from shared.block_selection import recompute_selected_blocks, build_group_blocks, build_permutations, build_selected_blocks
+            from shared.canonical_encoding import compute_mask_hash, compute_layout_hash, MASK_POLICY_ID
+            try:
+                # 独立重算 selected blocks
+                always_on_keys = set(plan.always_on_keys) if plan.always_on_keys else None
+                recomputed = recompute_selected_blocks(
+                    reference_state=global_state,
+                    round_idx=round_idx,
+                    coverage_h=plan.coverage_h,
+                    seed=plan.seed,
+                    block_size=args.block_size,
+                    always_on_keys=always_on_keys,
+                    always_on_threshold=0 if always_on_keys else 4096,
+                )
+                recomputed_hash = compute_mask_hash(recomputed)
+                if recomputed_hash != plan.mask_hash:
+                    logger.error(
+                        "MASK VERIFICATION FAILED: recomputed mask_hash=%s != plan mask_hash=%s; "
+                        "refusing to participate in round %s",
+                        recomputed_hash[:16], plan.mask_hash[:16], round_idx,
+                    )
+                    raise RuntimeError(f"mask_hash mismatch: server plan may be tampered")
+                # 验证 layout_hash（只验证一次，因为 layout 不变）
+                if plan.layout_hash:
+                    group_blocks_l, always_on_l = build_group_blocks(
+                        global_state, block_size=args.block_size,
+                        always_on_threshold=0 if always_on_keys else 4096,
+                    )
+                    layout_hash_l = compute_layout_hash(
+                        group_blocks_l, always_on_keys=always_on_l,
+                        coverage_h=plan.coverage_h, block_size=args.block_size,
+                    )
+                    if layout_hash_l != plan.layout_hash:
+                        logger.error(
+                            "LAYOUT VERIFICATION FAILED: recomputed=%s != plan=%s",
+                            layout_hash_l[:16], plan.layout_hash[:16],
+                        )
+                        raise RuntimeError("layout_hash mismatch: model layout differs from server")
+                logger.info(
+                    "Plan verified: mask_hash=%s layout_hash=%s (round %s)",
+                    plan.mask_hash[:16], plan.layout_hash[:16], round_idx,
+                )
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.warning("Plan verification skipped due to error: %s", e)
+
         if not am_selected:
             # OPS-3：未选中——不训练/不上传，只等聚合后对齐 delta
             if is_main:
@@ -887,69 +931,32 @@ def main() -> None:
                 logger.info("Online eval_loss=%.6f in %.1fs", eval_loss_val, t_eval)
         accelerator.wait_for_everyone()
 
-        # SCALE-3：逐 FSDP unit 提取 block delta，不 gather 完整 state
-        # 这是 collective op，所有 rank 同步执行
-        # public_random compressor 不需要 energies；其他 compressor 回退到 full state
-        use_scale3 = args.scale3_sharded_extract and str(getattr(args, "compressor", "public_random") or "public_random") in ("public_random", "dense")
-        block_delta: Dict[str, Any] = {}
-        full_state: Optional[Dict[str, torch.Tensor]] = None
-
-        if use_scale3 and selected:
-            t_enc0 = time.monotonic()
-            # 所有 rank 同步：逐 FSDP unit unshard 提取 block delta
-            block_delta, memory = get_sharded_block_delta(
-                model,
-                local_global=local_global or {},
-                memory=memory or {},
-                selected_by_key=selected,
-                transfer_dtype=transfer_dtype,
-                memory_decay=args.memory_decay,
-                is_main=is_main,
-            )
-            accelerator.wait_for_everyone()
-            t_encode = time.monotonic() - t_enc0
-            if is_main:
-                logger.info("SCALE-3: extracted block_delta from %s FSDP units in %.2fs (no full gather)",
-                            len([m for m in model.modules() if 'FullyShardedDataParallel' in type(m).__name__]),
-                            t_encode)
-        else:
-            # 回退：非 SCALE-3 路径（block_topk 等需要 energies 的 compressor）
-            full_state = get_full_state_fsdp(model)
+        full_state = get_full_state_fsdp(model)
         mem_box: List[Any] = [memory]
 
         def _pipeline_upload_and_apply():
             """流式 per-block pipeline：逐 block 上传，聚合好的立即下载 apply。"""
             nonlocal local_global, local_version
-            assert minio is not None and global_state is not None and mem_box[0] is not None
-
-            if not use_scale3:
-                # 回退路径：从 full_state 计算 block_delta
-                assert full_state is not None
-                t_enc0 = time.monotonic()
-                delta = sub_state(full_state, global_state)
-                to_send = add_state(delta, mem_box[0])
-                assert transfer_dtype is not None
-                groups = build_group_blocks(to_send, block_size=args.block_size)
-                flat_blocks = flatten_group_blocks(groups)
-                energies = block_energies(to_send, flat_blocks)
-                compressor = str(getattr(args, "compressor", "public_random") or "public_random")
-                rho = float(getattr(args, "rho", 0.0) or 0.0)
-                if rho <= 0:
-                    rho = 1.0 / max(int(plan.coverage_h or 1), 1)
-                local_selected = selected
-                if compressor == "block_topk":
-                    local_selected = selected_from_flat(flat_blocks, select_topk_indices(energies, rho))
-                elif compressor == "dense":
-                    local_selected = selected_from_flat(flat_blocks, range(len(flat_blocks)))
-                block_delta_local = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
-                mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
-                t_encode = time.monotonic() - t_enc0
-                nonlocal_block_delta = block_delta_local
-            else:
-                # SCALE-3 路径：block_delta 已在主循环提取
-                nonlocal_block_delta = block_delta
-                t_encode = 0.0
-                energies = []  # SCALE-3 不计算 energies（public_random 不需要）
+            assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
+            t_enc0 = time.monotonic()
+            delta = sub_state(full_state, global_state)
+            to_send = add_state(delta, mem_box[0])
+            assert transfer_dtype is not None
+            groups, _ = build_group_blocks(to_send, block_size=args.block_size)
+            flat = flatten_group_blocks(groups)
+            energies = block_energies(to_send, flat)
+            compressor = str(getattr(args, "compressor", "public_random") or "public_random")
+            rho = float(getattr(args, "rho", 0.0) or 0.0)
+            if rho <= 0:
+                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
+            local_selected = selected
+            if compressor == "block_topk":
+                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
+            elif compressor == "dense":
+                local_selected = selected_from_flat(flat, range(len(flat)))
+            block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
+            t_encode = time.monotonic() - t_enc0
 
             # 逐 block 上传并通知 server
             logger.info("Pipeline: uploading %s blocks (ratio=%.2f%%)", plan.n_selected_blocks, plan.upload_ratio * 100)
@@ -965,26 +972,21 @@ def main() -> None:
                 gidx, key_name, start, end = binfo[0], binfo[1], binfo[2], binfo[3]
                 # 取出该 block 的 delta slice
                 single_block_delta = {}
-                if key_name in nonlocal_block_delta:
-                    for s, e, slice_data in nonlocal_block_delta[key_name]:
+                if key_name in block_delta:
+                    for s, e, slice_data in block_delta[key_name]:
                         if s == start and e == end:
                             single_block_delta[key_name] = [(s, e, slice_data)]
                             break
                 if args.sec_upload_privacy:
                     # SEC-1/2/3：gidx 化 + 加密 + 末 block 填充
-                    if key_name not in single_block_delta or not single_block_delta[key_name]:
-                        # 该 block 未在 block_delta 中（可能 key 不匹配），用全 0 delta
-                        slice_data = torch.zeros(end - start, dtype=transfer_dtype or torch.float16)
-                        is_int8_item = False
-                        scale = None
-                    else:
-                        slice_data = single_block_delta[key_name][0][2]
-                        is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
-                        scale = None
-                        if is_int8_item:
-                            for it in nonlocal_block_delta.get(key_name, []):
-                                if it[0] == start and it[1] == end and len(it) > 3:
-                                    scale = float(it[3]); break
+                    slice_data = single_block_delta.get(key_name, [(0, 0, torch.zeros(1, dtype=transfer_dtype) if transfer_dtype else torch.zeros(1))])[0][2]
+                    is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
+                    scale = None
+                    if is_int8_item:
+                        # int8 时 slice 在元组第 3 位，scale 在第 4 位
+                        for it in block_delta.get(key_name, []):
+                            if it[0] == start and it[1] == end and len(it) > 3:
+                                scale = float(it[3]); break
                     real_len = int(end - start)
                     block_payload = encode_sec_block_payload(
                         gidx, slice_data, round_key,
@@ -1084,36 +1086,26 @@ def main() -> None:
 
         def _batch_upload_and_notify():
             """批量模式（回退）：打包成一个 blocks.pt 上传。"""
-            assert minio is not None and global_state is not None and mem_box[0] is not None
-
-            if use_scale3:
-                # SCALE-3 路径：block_delta 已在主循环提取
-                block_delta_batch = block_delta
-                t_encode = 0.0
-                energies = []  # SCALE-3 不计算 energies
-            else:
-                # 回退路径：从 full_state 计算 block_delta
-                assert full_state is not None
-                t_enc0 = time.monotonic()
-                delta = sub_state(full_state, global_state)
-                to_send = add_state(delta, mem_box[0])
-                assert transfer_dtype is not None
-                groups = build_group_blocks(to_send, block_size=args.block_size)
-                flat = flatten_group_blocks(groups)
-                energies = block_energies(to_send, flat)
-                compressor = str(getattr(args, "compressor", "public_random") or "public_random")
-                rho = float(getattr(args, "rho", 0.0) or 0.0)
-                if rho <= 0:
-                    rho = 1.0 / max(int(plan.coverage_h or 1), 1)
-                local_selected = selected
-                if compressor == "block_topk":
-                    local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
-                elif compressor == "dense":
-                    local_selected = selected_from_flat(flat, range(len(flat)))
-                block_delta_batch = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
-                mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
-                t_encode = time.monotonic() - t_enc0
-
+            assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
+            t_enc0 = time.monotonic()
+            delta = sub_state(full_state, global_state)
+            to_send = add_state(delta, mem_box[0])
+            assert transfer_dtype is not None
+            groups, _ = build_group_blocks(to_send, block_size=args.block_size)
+            flat = flatten_group_blocks(groups)
+            energies = block_energies(to_send, flat)
+            compressor = str(getattr(args, "compressor", "public_random") or "public_random")
+            rho = float(getattr(args, "rho", 0.0) or 0.0)
+            if rho <= 0:
+                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
+            local_selected = selected
+            if compressor == "block_topk":
+                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
+            elif compressor == "dense":
+                local_selected = selected_from_flat(flat, range(len(flat)))
+            block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
+            t_encode = time.monotonic() - t_enc0
             if args.sec_upload_privacy:
                 # SEC-1/2/3：批量模式也用 SEC 编码（每个 block 一个 SEC payload，打包成 list）
                 round_key = derive_round_key(epoch_seed_from_plan(plan.seed, plan.epoch), round_idx)
@@ -1122,15 +1114,15 @@ def main() -> None:
                     gidx, key_name, start, end = binfo[0], binfo[1], binfo[2], binfo[3]
                     slice_data = None
                     scale = None
-                    if key_name in block_delta_batch:
-                        for s, e, sd in block_delta_batch[key_name]:
+                    if key_name in block_delta:
+                        for s, e, sd in block_delta[key_name]:
                             if s == start and e == end:
                                 slice_data = sd; break
                     if slice_data is None:
                         slice_data = torch.zeros(end - start, dtype=transfer_dtype or torch.float16)
                     is_int8_item = (slice_data.dtype == torch.int8) if hasattr(slice_data, "dtype") else False
                     if is_int8_item:
-                        for it in block_delta_batch.get(key_name, []):
+                        for it in block_delta.get(key_name, []):
                             if it[0] == start and it[1] == end and len(it) > 3:
                                 scale = float(it[3]); break
                     sec_blocks.append(encode_sec_block_payload(
@@ -1152,7 +1144,7 @@ def main() -> None:
                 }
             else:
                 payload = {
-                    "block_delta": block_delta_batch,
+                    "block_delta": block_delta,
                     "num_examples": int(num_examples),
                     "train_loss": float(train_loss),
                     "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,

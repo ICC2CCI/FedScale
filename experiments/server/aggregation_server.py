@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from server.block_scheduler import BlockScheduler
-from shared.block_selection import apply_block_delta, compute_weighted_block_delta, resolve_transfer_dtype, _slice_to_fp32
+from shared.block_selection import apply_block_delta, resolve_transfer_dtype, _slice_to_fp32
 from shared.block_crypto import (
     SEC_PAYLOAD_VERSION,
     decode_sec_block_payload,
@@ -126,7 +126,7 @@ class AggregationServer:
         compressor: str = "public_random",
         rho: float = 0.0,
         sec_upload_privacy: bool = False,
-        scale1_no_resident_global: bool = False,
+        always_on_threshold: int = 4096,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -140,7 +140,6 @@ class AggregationServer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
         self.global_state = cpu_state(init_state)
-        self._floating_elems = floating_elem_count(self.global_state)
         self.transfer_dtype = resolve_transfer_dtype(
             transfer_dtype_name, ref_state=self.global_state
         )
@@ -157,6 +156,7 @@ class AggregationServer:
             slots_per_round=self.slots_per_round,
             compressor=compressor,
             rho=rho,
+            always_on_threshold=always_on_threshold,
         )
         self.compressor = self.scheduler.compressor
         self.rho = self.scheduler.rho
@@ -190,10 +190,12 @@ class AggregationServer:
         # server 端只做"解码"：从 SEC payload 还原出 block_delta。
         # 兼容旧格式：若 payload 不是 SEC 格式，走旧路径。
         self.sec_upload_privacy = bool(sec_upload_privacy)
-        # SCALE-1：不常驻 global_state（7B+ 开启省内存）
-        self.scale1_no_resident_global = bool(scale1_no_resident_global)
 
         self.current_round = 1
+        # A-6: successful_round_index — only incremented after successful aggregation + commit
+        # (spec section 2.1: only count as successful round if all conditions met)
+        # Failed/aborted rounds do NOT increment this, so slot/mask stays the same on retry.
+        self.successful_round_index = 0
         self.lock = threading.Lock()
         self.round_uploads: Dict[int, Dict[int, UploadCompleteBody]] = {}
         self.round_results: Dict[int, Dict[str, Any]] = {}
@@ -221,18 +223,6 @@ class AggregationServer:
             self.current_round = 1
             self._ensure_plan(1)
             self._mark_round_open(1)
-        # SCALE-1：释放 global_state，不常驻内存（仅 scale1_no_resident_global=true 时）
-        # scheduler 已构建好 gidx_map，后续聚合用 compute_weighted_block_delta（不需要 global_state）
-        # 写全量 checkpoint 时用 _rebuild_global_state 从 MinIO 重建
-        if self.scale1_no_resident_global:
-            logger.info(
-                "SCALE-1: releasing global_state from memory (was %.1f MB)",
-                sum(v.numel() * v.element_size() for v in self.global_state.values()) / 1024 / 1024,
-            )
-            self.global_state = {}
-        else:
-            # 原版：常驻 global_state，用 apply_block_delta
-            pass
         self._write_run_meta()
         threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
@@ -403,7 +393,8 @@ class AggregationServer:
                 "num_clients": self.num_clients,
                 "status": "finished" if finished else "running",
                 "aggregating": self._aggregating,
-                "floating_elems": self._floating_elems,
+                "floating_elems": floating_elem_count(self.global_state),
+                "successful_round_index": self.successful_round_index,
             }
 
     def get_plan(self, round_idx: int) -> Dict[str, Any]:
@@ -592,15 +583,14 @@ class AggregationServer:
                 deltas.append(payload)
                 weights.append(float(client_meta.get(cid, {}).get("num_examples", 1)))
 
-        # SCALE-1：FedAvg 该单个 block
-        if self.scale1_no_resident_global:
-            agg_delta = compute_weighted_block_delta(
-                deltas, weights, selected_for_block, out_dtype=self.transfer_dtype,
-            )
-        else:
-            agg_delta = apply_block_delta(
-                self.global_state, deltas, weights, selected_for_block, out_dtype=self.transfer_dtype,
-            )
+        # FedAvg 该单个 block
+        agg_delta = apply_block_delta(
+            self.global_state,
+            deltas,
+            weights,
+            selected_for_block,
+            out_dtype=self.transfer_dtype,
+        )
 
         # 写出该 block 的聚合 delta
         agg_payload = {
@@ -723,33 +713,6 @@ class AggregationServer:
             # 只写 round-0 与最终一轮
             return round_idx == self.num_rounds
         return round_idx % n == 0 or round_idx == self.num_rounds
-
-    def _rebuild_global_state(self, up_to_round: int) -> Dict[str, torch.Tensor]:
-        """SCALE-1：从 MinIO 重建 global_state 到 round up_to_round。
-
-        找到最近的 checkpoint（round-0 或之前写的全量），加载后 apply 从那时到 up_to_round 的所有 delta。
-        重建后临时常驻内存，写完 checkpoint 后由调用方释放。
-        """
-        # 找到最近的 checkpoint
-        checkpoint_round = 0
-        for r in range(up_to_round, -1, -1):
-            if r == 0 or self.minio.exists(global_state_key(r)):
-                checkpoint_round = r
-                break
-        logger.info("SCALE-1: rebuilding global_state from checkpoint round %s to round %s", checkpoint_round, up_to_round)
-        global_state = self.minio.get_torch(global_state_key(checkpoint_round), map_location="cpu")
-        if isinstance(global_state, dict) and "block_delta" in global_state:
-            global_state = global_state["block_delta"]
-        # apply delta from checkpoint_round+1 to up_to_round
-        from shared.block_selection import add_block_delta
-        for r in range(checkpoint_round + 1, up_to_round + 1):
-            dkey = global_delta_key(r)
-            if self.minio.exists(dkey):
-                payload = self.minio.get_torch(dkey, map_location="cpu")
-                if isinstance(payload, dict) and "block_delta" in payload:
-                    add_block_delta(global_state, payload["block_delta"])
-                    logger.info("SCALE-1: applied delta round %s during rebuild", r)
-        return global_state
 
     def _aggregate_round(self, round_idx: int) -> None:
         try:
@@ -897,15 +860,13 @@ class AggregationServer:
                         self.compressor,
                         len(selected),
                     )
-                # SCALE-1：只计算加权平均，不修改 global_state
-                if self.scale1_no_resident_global:
-                    agg_delta = compute_weighted_block_delta(
-                        deltas, weights, selected, out_dtype=self.transfer_dtype,
-                    )
-                else:
-                    agg_delta = apply_block_delta(
-                        self.global_state, deltas, weights, selected, out_dtype=self.transfer_dtype,
-                    )
+                agg_delta = apply_block_delta(
+                    self.global_state,
+                    deltas,
+                    weights,
+                    selected,
+                    out_dtype=self.transfer_dtype,
+                )
                 t_apply = time.monotonic() - t_apply0
 
             # 公共：写出 delta + 结果（pipeline 模式 agg_delta 已组装好，batch 模式刚算完）
@@ -924,13 +885,7 @@ class AggregationServer:
             wrote_full_global = self._should_write_full_global(round_idx)
             global_bytes = 0
             if wrote_full_global:
-                # SCALE-1：不常驻 global_state 时从 MinIO 重建；否则直接写常驻的 global_state
-                if self.scale1_no_resident_global:
-                    global_state = self._rebuild_global_state(round_idx)
-                    global_bytes = self.minio.put_torch(global_state_key(round_idx), global_state)
-                    del global_state
-                else:
-                    global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
+                global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
             else:
                 logger.info("IO-1: skip writing full global_state for round %s", round_idx)
             t_upload_global = time.monotonic() - t_up0
@@ -1029,6 +984,8 @@ class AggregationServer:
                 self.round_log.append(entry)
                 self._write_round_log()
                 self._append_metrics_jsonl(entry)
+                # A-6: only increment successful_round_index after successful commit
+                self.successful_round_index += 1
                 if round_idx < self.num_rounds:
                     self.current_round = round_idx + 1
                     self._ensure_plan(self.current_round)
@@ -1216,6 +1173,8 @@ def parse_args() -> argparse.Namespace:
         help="block 选择器：随机公共 mask / 滞后能量投票 / 本地 topk / 稠密",
     )
     p.add_argument("--rho", type=float, default=0.0, help="vote/topk 选择比例；0 则用 1/coverage_h")
+    p.add_argument("--always-on-threshold", type=int, default=4096,
+                   help="numel <= this → always_on (LayerNorm/bias/gate scalars); 0=disable")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
@@ -1305,13 +1264,6 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
     )
-    # SCALE-1：server 不常驻 global_state
-    p.add_argument(
-        "--scale1-no-resident-global",
-        action="store_true",
-        default=False,
-        help="SCALE-1: server 不常驻 global_state（7B+ 开启省内存）",
-    )
     return p.parse_args()
 
 
@@ -1372,7 +1324,7 @@ def main() -> None:
         compressor=args.compressor,
         rho=args.rho,
         sec_upload_privacy=args.sec_upload_privacy,
-        scale1_no_resident_global=args.scale1_no_resident_global,
+        always_on_threshold=getattr(args, "always_on_threshold", 4096),
     )
     # CFG-1：把生效的 run.yaml 写入 results 目录，保证可复现
     try:
