@@ -62,6 +62,11 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "tls",
         "sec_upload_privacy",
         "tls_no_verify",
+        "secagg_enabled",
+        "secagg_modulus_bits",
+        "secagg_scale",
+        "secagg_stochastic_rounding",
+        "secagg_q_min",
     ],
     "resume": [
         "resume_from_round",

@@ -49,6 +49,12 @@ security:
   auth_token: ""                # 空字符串=不鉴权（联调）；非空则要求 Authorization: Bearer <token>
   tls: false                    # true 时客户端用 https://
   sec_upload_privacy: true      # SEC-1/2/3: true=上传隐私（gidx+加密+填充）
+  # B: Windowed SecAgg v2（pairwise+self mask, server 只见聚合和）
+  secagg_enabled: false         # true=启用 SecAgg（默认关闭，联调验证后再开）
+  secagg_modulus_bits: 16       # 模数位宽: 16=int16(2B,推荐) / 8=int8(需自适应scale) / 24/32
+  secagg_scale: 0.0             # 0=用默认 scale(2^-(bits-2))；>0=固定 scale
+  secagg_stochastic_rounding: false  # 随机舍入（让低精度平均无偏）
+  secagg_q_min: 0               # 0=num_clients；>0=最小成功参与者数
 
 scale:
   scale1_no_resident_global: true  # SCALE-1: true=server 不常驻 global_state（省内存）

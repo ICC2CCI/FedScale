@@ -145,3 +145,117 @@ def selected_to_jsonable(selected: SelectedByKey) -> Dict[str, List[List[int]]]:
 
 def selected_from_jsonable(data: Dict[str, List[List[int]]]) -> SelectedByKey:
     return {k: [(int(s), int(e)) for s, e in slices] for k, slices in data.items()}
+
+
+# ---------------------------------------------------------------------------
+# B-3: SecAgg 协议对象（spec section 12）
+# ---------------------------------------------------------------------------
+
+SECAGG_PROTOCOL_ID = "fedscale-window-secagg-v1"
+
+
+@dataclass
+class SecAggPlan:
+    """SecAgg 计划（嵌入 RoundPlan 或独立下发）。"""
+
+    secagg_protocol_id: str = SECAGG_PROTOCOL_ID
+    secagg_session_id: str = ""          # H(job_id, round, model_version, cohort, mask)
+    attempt_id: int = 0                  # 重试递增；mask 全部重采样
+    cohort_hash: str = ""                # H(sorted client_ids)
+    mask_hash: str = ""                  # 来自 Block Mask
+    window_plan_hash: str = ""           # H(all window descriptors)
+    q_min: int = 2                       # 最小成功参与者数
+    quantization_scale: float = 2.0 ** -14  # cohort 共享定点 scale
+    modulus_bits: int = 16               # q = 2^modulus_bits
+    modulus_q: int = 65536               # q = 2^modulus_bits
+    q_max: int = 16383                   # 量化值上界
+    reconstruction_threshold: int = 1    # Shamir 恢复阈值（2-client 无掉线=1）
+    stochastic_rounding: bool = False    # 随机舍入
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SecAggPlan":
+        return cls(
+            secagg_protocol_id=str(data.get("secagg_protocol_id", SECAGG_PROTOCOL_ID)),
+            secagg_session_id=str(data.get("secagg_session_id", "")),
+            attempt_id=int(data.get("attempt_id", 0)),
+            cohort_hash=str(data.get("cohort_hash", "")),
+            mask_hash=str(data.get("mask_hash", "")),
+            window_plan_hash=str(data.get("window_plan_hash", "")),
+            q_min=int(data.get("q_min", 2)),
+            quantization_scale=float(data.get("quantization_scale", 2.0 ** -14)),
+            modulus_bits=int(data.get("modulus_bits", 16)),
+            modulus_q=int(data.get("modulus_q", 65536)),
+            q_max=int(data.get("q_max", 16383)),
+            reconstruction_threshold=int(data.get("reconstruction_threshold", 1)),
+            stochastic_rounding=bool(data.get("stochastic_rounding", False)),
+        )
+
+
+@dataclass
+class WindowDescriptor:
+    """单个 window (= 1 block) 的描述符。"""
+
+    window_id: int               # = gidx
+    gidx: int                    # global block index
+    key_name: str
+    start: int
+    end: int
+    vector_length: int           # = end - start
+    window_layout_hash: str      # H(gidx || start || end || length)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WindowDescriptor":
+        return cls(
+            window_id=int(data["window_id"]),
+            gidx=int(data["gidx"]),
+            key_name=str(data["key_name"]),
+            start=int(data["start"]),
+            end=int(data["end"]),
+            vector_length=int(data["vector_length"]),
+            window_layout_hash=str(data["window_layout_hash"]),
+        )
+
+
+def compute_window_layout_hash(gidx: int, start: int, end: int, length: int) -> str:
+    """计算 window_layout_hash。"""
+    import hashlib
+
+    data = (
+        b"window|"
+        + str(gidx).encode("utf-8") + b"|"
+        + str(start).encode("utf-8") + b"|"
+        + str(end).encode("utf-8") + b"|"
+        + str(length).encode("utf-8")
+    )
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_window_descriptors(block_list: List[List[int]]) -> List[WindowDescriptor]:
+    """从 RoundPlan.block_list 构建 WindowDescriptor 列表。
+
+    block_list 每项: [gidx, key_name, start, end]
+    """
+    windows = []
+    for b in block_list:
+        gidx = int(b[0])
+        key_name = str(b[1])
+        start = int(b[2])
+        end = int(b[3])
+        length = end - start
+        wlh = compute_window_layout_hash(gidx, start, end, length)
+        windows.append(WindowDescriptor(
+            window_id=gidx,
+            gidx=gidx,
+            key_name=key_name,
+            start=start,
+            end=end,
+            vector_length=length,
+            window_layout_hash=wlh,
+        ))
+    return windows

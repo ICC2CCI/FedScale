@@ -516,6 +516,17 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="SEC-5: 跳过 TLS 证书验证（自签名证书时用）；生产环境应改用 CA 签名证书",
     )
+    # B: SecAgg (Windowed Secure Aggregation v2)
+    p.add_argument("--secagg-enabled", action=argparse.BooleanOptionalAction, default=False,
+                   help="B: 启用 Windowed SecAgg（pairwise+self mask）")
+    p.add_argument("--secagg-modulus-bits", type=int, default=16,
+                   help="B: 模数位宽 8/16/24/32")
+    p.add_argument("--secagg-scale", type=float, default=0.0,
+                   help="B: 定点量化 scale；0=用默认")
+    p.add_argument("--secagg-stochastic-rounding", action=argparse.BooleanOptionalAction, default=False,
+                   help="B: 随机舍入")
+    p.add_argument("--secagg-q-min", type=int, default=0,
+                   help="B: 最小成功参与者数；0=num_clients")
     # RES-2：client memory 持久化目录
     p.add_argument(
         "--client-state-dir",

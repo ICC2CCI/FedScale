@@ -58,6 +58,10 @@ ONLINE_EVAL="$(yaml_get YCFG_ ONLINE_EVAL true)"
 AUTH_TOKEN="${AUTH_TOKEN:-$(yaml_get YCFG_ AUTH_TOKEN '')}"
 TLS_ENABLED="$(yaml_get YCFG_ TLS false)"
 SEC_UPLOAD_PRIVACY="$(yaml_get YCFG_ SEC_UPLOAD_PRIVACY false)"
+SECAGG_ENABLED="$(yaml_get YCFG_ SECAGG_ENABLED false)"
+SECAGG_MODULUS_BITS="$(yaml_get YCFG_ SECAGG_MODULUS_BITS 16)"
+SECAGG_SCALE="$(yaml_get YCFG_ SECAGG_SCALE 0.0)"
+SECAGG_Q_MIN="$(yaml_get YCFG_ SECAGG_Q_MIN 0)"
 
 # 允许 env 覆盖 yaml（联调快速调参）
 NUM_CLIENTS="${NUM_CLIENTS_ENV:-$NUM_CLIENTS}"
@@ -159,6 +163,8 @@ auth_flag=""
 [[ -n "$AUTH_TOKEN" ]] && auth_flag="--auth-token ${AUTH_TOKEN}"
 sec_privacy_flag=""
 [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && sec_privacy_flag="--sec-upload-privacy"
+secagg_flag=""
+[[ "$SECAGG_ENABLED" == "true" ]] && secagg_flag="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN}"
 
 # SEC-5：TLS 证书（自签名，自动生成/复用）
 TLS_CERT="" ; TLS_KEY=""
@@ -210,6 +216,7 @@ nohup /home/pcllgr/miniconda3/envs/fedscale-server/bin/python \
   --client-upload-timeout-s "${UPLOAD_TIMEOUT_S}" \
   ${auth_flag} \
   ${sec_privacy_flag} \
+  ${secagg_flag} \
   ${tls_flag} \
   --results-dir "${RUN_DIR}" \
   > "${RUN_DIR}/logs/aggregation_server.log" 2>&1 &
@@ -285,6 +292,8 @@ for plan_json in "${CLIENT_PLANS[@]}"; do
   [[ -n "$AUTH_TOKEN" ]] && AUTH_FLAG="--auth-token ${AUTH_TOKEN}"
   SEC_PRIVACY_FLAG=""
   [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && SEC_PRIVACY_FLAG="--sec-upload-privacy"
+  SECAGG_FLAG=""
+  [[ "$SECAGG_ENABLED" == "true" ]] && SECAGG_FLAG="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN}"
   TLS_NO_VERIFY_FLAG="--no-tls-no-verify"
   [[ "$TLS_ENABLED" == "true" ]] && TLS_NO_VERIFY_FLAG="--tls-no-verify"
 
@@ -329,6 +338,7 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   ${PER_CLIENT_STEPS_FLAG} \\
   ${AUTH_FLAG} \\
   ${SEC_PRIVACY_FLAG} \\
+  ${SECAGG_FLAG} \\
   ${TLS_NO_VERIFY_FLAG} \\
   > logs/client${CID}_fsdp.log 2>&1 &
 echo \$! > logs/client${CID}_fsdp.pid

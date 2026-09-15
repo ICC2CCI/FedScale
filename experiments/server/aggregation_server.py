@@ -38,6 +38,9 @@ from shared.protocol import (
     DEFAULT_SEED,
     DEFAULT_TRANSFER_DTYPE,
     RoundPlan,
+    SecAggPlan,
+    WindowDescriptor,
+    build_window_descriptors,
     agg_block_done_key,
     agg_block_key,
     epoch_seed_from_plan,
@@ -50,6 +53,14 @@ from shared.protocol import (
 )
 from shared.run_config import apply_to_args, load_run_config, snapshot_effective_config
 from shared.state_dict_utils import cpu_state, floating_elem_count
+from shared.fixed_point import (
+    DEFAULT_MODULUS_BITS,
+    DEFAULT_Q,
+    DEFAULT_Q_MAX,
+    DEFAULT_SCALE,
+    compute_q_max,
+)
+from server.secagg_coordinator import SecAggCoordinator
 
 logger = logging.getLogger("aggregation_server")
 
@@ -127,6 +138,11 @@ class AggregationServer:
         rho: float = 0.0,
         sec_upload_privacy: bool = False,
         always_on_threshold: int = 4096,
+        secagg_enabled: bool = False,
+        secagg_modulus_bits: int = DEFAULT_MODULUS_BITS,
+        secagg_scale: float = 0.0,
+        secagg_stochastic_rounding: bool = False,
+        secagg_q_min: int = 0,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -190,6 +206,23 @@ class AggregationServer:
         # server 端只做"解码"：从 SEC payload 还原出 block_delta。
         # 兼容旧格式：若 payload 不是 SEC 格式，走旧路径。
         self.sec_upload_privacy = bool(sec_upload_privacy)
+
+        # B-6: SecAgg (Windowed Secure Aggregation v2)
+        self.secagg_enabled = bool(secagg_enabled)
+        self.secagg_modulus_bits = int(secagg_modulus_bits)
+        self.secagg_q = 1 << self.secagg_modulus_bits
+        self.secagg_q_max = compute_q_max(self.secagg_modulus_bits, n_clients=max(num_clients, 2))
+        self.secagg_scale = float(secagg_scale) if secagg_scale > 0 else DEFAULT_SCALE
+        self.secagg_stochastic_rounding = bool(secagg_stochastic_rounding)
+        self.secagg_q_min = int(secagg_q_min) if secagg_q_min > 0 else num_clients
+        # per-round SecAgg coordinator
+        self.secagg_coordinators: Dict[int, SecAggCoordinator] = {}
+        if self.secagg_enabled:
+            logger.info(
+                "SecAgg enabled: modulus_bits=%s q=%s q_max=%s scale=%s q_min=%s",
+                self.secagg_modulus_bits, self.secagg_q, self.secagg_q_max,
+                self.secagg_scale, self.secagg_q_min,
+            )
 
         self.current_round = 1
         # A-6: successful_round_index — only incremented after successful aggregation + commit
@@ -1053,6 +1086,95 @@ class AggregationServer:
         except Exception:
             logger.warning("OPS-2: cleanup for round %s failed", cutoff, exc_info=True)
 
+    # ----------------------------------------------------------------------- #
+    # B-6: SecAgg coordinator management
+    # ----------------------------------------------------------------------- #
+
+    def _get_or_create_secagg_coordinator(self, round_idx: int) -> Optional[SecAggCoordinator]:
+        """获取或创建 per-round SecAgg coordinator。"""
+        if not self.secagg_enabled:
+            return None
+        with self.lock:
+            if round_idx in self.secagg_coordinators:
+                return self.secagg_coordinators[round_idx]
+            plan = self._ensure_plan(round_idx)
+            windows = build_window_descriptors(plan.block_list)
+            secagg_plan = SecAggPlan(
+                q_min=self.secagg_q_min,
+                quantization_scale=self.secagg_scale,
+                modulus_bits=self.secagg_modulus_bits,
+                modulus_q=self.secagg_q,
+                q_max=self.secagg_q_max,
+                stochastic_rounding=self.secagg_stochastic_rounding,
+            )
+            client_ids = list(range(self.num_clients))
+            if self.selected_client_ids is not None:
+                client_ids = list(self.selected_client_ids)
+            coord = SecAggCoordinator(
+                round_idx=round_idx,
+                successful_round_index=self.successful_round_index,
+                client_ids=client_ids,
+                windows=windows,
+                layout_hash=plan.layout_hash,
+                mask_hash=plan.mask_hash,
+                secagg_plan=secagg_plan,
+            )
+            self.secagg_coordinators[round_idx] = coord
+            return coord
+
+    def secagg_key_announce(self, round_idx: int, client_id: int, pk_hex: str) -> Dict[str, Any]:
+        """B-6: client 提交 X25519 公钥。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+        pk_raw = bytes.fromhex(pk_hex)
+        return coord.submit_public_key(client_id, pk_raw)
+
+    def secagg_get_peer_keys(self, round_idx: int) -> Dict[str, Any]:
+        """B-6: client 获取所有 peer 的公钥。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+        return coord.get_peer_keys()
+
+    def secagg_submit_masked_window(
+        self, round_idx: int, client_id: int, window_id: int,
+        z_data: bytes, vector_len: int,
+    ) -> Dict[str, Any]:
+        """B-6: client 提交一个 masked window (z_k packed bytes)。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+        from shared.fixed_point import unpack_zq
+        z_kw = unpack_zq(z_data, vector_len, self.secagg_modulus_bits)
+        return coord.submit_masked_window(client_id, window_id, z_kw)
+
+    def secagg_submit_self_master(self, round_idx: int, client_id: int, sm_hex: str) -> Dict[str, Any]:
+        """B-6: client 提交 self_master。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+        sm_raw = bytes.fromhex(sm_hex)
+        coord.submit_self_master(client_id, sm_raw)
+        return {"accepted": True}
+
+    def secagg_get_status(self, round_idx: int) -> Dict[str, Any]:
+        """B-6: 查询 SecAgg 状态。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            return {"enabled": False}
+        return {"enabled": True, **coord.get_status()}
+
+    def secagg_get_aggregated_delta(self, round_idx: int) -> Dict[str, Any]:
+        """B-6: 获取 SecAgg 聚合后的 delta（用于 pipeline 模式）。"""
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+        if not coord.all_self_masters_received():
+            return {"done": False, "status": "waiting for self_masters"}
+        agg_delta = coord.aggregate_and_unmask()
+        return {"done": True, "agg_delta": agg_delta}
+
 
 def load_initial_state(args: argparse.Namespace, minio: MinIOClient) -> Dict[str, torch.Tensor]:
     key0 = global_state_key(0)
@@ -1148,6 +1270,37 @@ def build_app(server: AggregationServer) -> FastAPI:
     @app.get("/api/round/{round_idx}/block-status")
     def block_status(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
         return server.check_block_agg_done(round_idx)
+
+    # B-6: SecAgg REST API
+    @app.post("/api/round/{round_idx}/client/{client_id}/secagg/key-announce")
+    def secagg_key_announce(
+        round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
+    ) -> Dict[str, Any]:
+        return server.secagg_key_announce(round_idx, client_id, body.get("pk_hex", ""))
+
+    @app.get("/api/round/{round_idx}/secagg/peer-keys")
+    def secagg_peer_keys(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
+        return server.secagg_get_peer_keys(round_idx)
+
+    @app.post("/api/round/{round_idx}/client/{client_id}/secagg/masked-window/{window_id}")
+    async def secagg_submit_masked_window(
+        round_idx: int, client_id: int, window_id: int,
+        request: Request, _: None = Depends(_auth),
+    ) -> Dict[str, Any]:
+        body = await request.json()
+        z_data = bytes.fromhex(body.get("z_hex", ""))
+        vector_len = int(body.get("vector_len", 0))
+        return server.secagg_submit_masked_window(round_idx, client_id, window_id, z_data, vector_len)
+
+    @app.post("/api/round/{round_idx}/client/{client_id}/secagg/self-master")
+    def secagg_submit_self_master(
+        round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
+    ) -> Dict[str, Any]:
+        return server.secagg_submit_self_master(round_idx, client_id, body.get("sm_hex", ""))
+
+    @app.get("/api/round/{round_idx}/secagg/status")
+    def secagg_status(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
+        return server.secagg_get_status(round_idx)
 
     return app
 
@@ -1264,7 +1417,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="SEC-1/2/3: 启用上传隐私（payload 不含 key_name, gidx 加密, 末 block 填充）",
     )
-    return p.parse_args()
+    # B-6: SecAgg (Windowed Secure Aggregation v2)
+    p.add_argument("--secagg-enabled", action="store_true", default=False,
+                   help="B: 启用 Windowed SecAgg（pairwise + self mask, server 只见聚合和）")
+    p.add_argument("--secagg-modulus-bits", type=int, default=16,
+                   help="B: 模数位宽 8/16/24/32；16=int16(2B,推荐)；8=int8(需自适应scale)")
+    p.add_argument("--secagg-scale", type=float, default=0.0,
+                   help="B: 定点量化 scale；0=用默认(2^-(bits-2))")
+    p.add_argument("--secagg-stochastic-rounding", action="store_true", default=False,
+                   help="B: 随机舍入（让低精度平均无偏）")
+    p.add_argument("--secagg-q-min", type=int, default=0,
+                   help="B: 最小成功参与者数；0=num_clients")
+    return p
 
 
 def main() -> None:
@@ -1325,6 +1489,11 @@ def main() -> None:
         rho=args.rho,
         sec_upload_privacy=args.sec_upload_privacy,
         always_on_threshold=getattr(args, "always_on_threshold", 4096),
+        secagg_enabled=getattr(args, "secagg_enabled", False),
+        secagg_modulus_bits=getattr(args, "secagg_modulus_bits", 16),
+        secagg_scale=getattr(args, "secagg_scale", 0.0),
+        secagg_stochastic_rounding=getattr(args, "secagg_stochastic_rounding", False),
+        secagg_q_min=getattr(args, "secagg_q_min", 0),
     )
     # CFG-1：把生效的 run.yaml 写入 results 目录，保证可复现
     try:
