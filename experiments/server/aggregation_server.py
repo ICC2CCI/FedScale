@@ -212,12 +212,16 @@ class AggregationServer:
         self.secagg_modulus_bits = int(secagg_modulus_bits)
         self.secagg_q = 1 << self.secagg_modulus_bits
         self.secagg_q_max = compute_q_max(self.secagg_modulus_bits, n_clients=max(num_clients, 2))
-        self.secagg_scale = float(secagg_scale) if secagg_scale > 0 else DEFAULT_SCALE
+        self.secagg_scale = float(secagg_scale)  # 0=自适应, >0=固定
         self.secagg_stochastic_rounding = bool(secagg_stochastic_rounding)
         self.secagg_q_min = int(secagg_q_min) if secagg_q_min > 0 else num_clients
         # per-round SecAgg coordinator
         self.secagg_coordinators: Dict[int, SecAggCoordinator] = {}
         if self.secagg_enabled:
+            # round 1 的自适应 scale：用保守默认值
+            # delta max 通常 ~0.0003 (lr=1e-5, 30 steps)，用 scale=2^-20 覆盖
+            if self.secagg_scale <= 0:
+                self.secagg_scale = 2.0 ** -20  # ~9.5e-7, 可表示 ±0.0156
             logger.info(
                 "SecAgg enabled: modulus_bits=%s q=%s q_max=%s scale=%s q_min=%s",
                 self.secagg_modulus_bits, self.secagg_q, self.secagg_q_max,
@@ -810,6 +814,28 @@ class AggregationServer:
                 self.current_round = round_idx + 1
                 self._ensure_plan(self.current_round)
                 self._mark_round_open(self.current_round)
+                # B-debug: 自适应 scale — 根据本轮 delta max 更新下一轮的 scale
+                if self.secagg_enabled:
+                    # 计算本轮 delta 的 max
+                    delta_max = 0.0
+                    for kn, blocks in agg_delta.items():
+                        for s, e, sd in blocks:
+                            m = float(sd.abs().max().item())
+                            if m > delta_max:
+                                delta_max = m
+                    if delta_max > 0:
+                        # scale = delta_max / q_max * 0.9 (留 10% 余量)
+                        new_scale = delta_max / float(self.secagg_q_max) * 0.9
+                        # 更新 secagg_scale 供下一轮使用
+                        self.secagg_scale = new_scale
+                        # 更新下一轮的 plan
+                        next_plan = self.round_plans.get(self.current_round)
+                        if next_plan:
+                            next_plan.secagg_scale = new_scale
+                        logger.info(
+                            "SecAgg: adaptive scale updated to %e (delta_max=%.4f)",
+                            new_scale, delta_max,
+                        )
             else:
                 self.current_round = self.num_rounds + 1
             self._aggregating = False
@@ -1340,6 +1366,8 @@ class AggregationServer:
             if round_idx in self.secagg_coordinators:
                 return self.secagg_coordinators[round_idx]
             plan = self._ensure_plan(round_idx)
+            # 把当前 secagg_scale 写入 plan，让 client 能读到
+            plan.secagg_scale = self.secagg_scale
             windows = build_window_descriptors(plan.block_list)
             secagg_plan = SecAggPlan(
                 q_min=self.secagg_q_min,

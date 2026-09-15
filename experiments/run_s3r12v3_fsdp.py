@@ -1213,13 +1213,32 @@ def main() -> None:
             to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
 
+            # B-debug: 打印 delta 范围，诊断 NaN 问题
+            _delta_max = max(float(v.abs().max().item()) for v in delta.values() if hasattr(v, 'abs'))
+            _fs_max = max(float(v.abs().max().item()) for v in full_state.values() if hasattr(v, 'abs'))
+            _gs_max = max(float(v.abs().max().item()) for v in global_state.values() if hasattr(v, 'abs'))
+            _fs_dtype = str(next(iter(full_state.values())).dtype) if full_state else "?"
+            _gs_dtype = str(next(iter(global_state.values())).dtype) if global_state else "?"
+            logger.info(
+                "SecAgg delta range: max|delta|=%.4f max|full_state|=%.4f(%s) max|global_state|=%.4f(%s)",
+                _delta_max, _fs_max, _fs_dtype, _gs_max, _gs_dtype,
+            )
+
             # 构建 SecAggPlan（与 server 一致）
             modulus_bits = int(getattr(args, "secagg_modulus_bits", 16))
             q = 1 << modulus_bits
             q_max = compute_q_max(modulus_bits, n_clients=2)
             scale = float(getattr(args, "secagg_scale", 0.0))
             if scale <= 0:
-                scale = 2.0 ** -(modulus_bits - 2)
+                # 自适应 scale：根据 delta 的 max|值| 计算
+                # scale = max|delta| / q_max * 0.9 (留 10% 余量)
+                # 但所有 client 必须用相同 scale → 用 plan 中的 scale（server 下发）
+                # 如果 plan 中没有 scale，用保守默认值
+                if hasattr(plan, "secagg_scale") and plan.secagg_scale > 0:
+                    scale = float(plan.secagg_scale)
+                else:
+                    # 保守默认：覆盖 delta max ~0.1
+                    scale = 0.1 / q_max * 0.9
             stochastic = bool(getattr(args, "secagg_stochastic_rounding", False))
 
             windows = build_window_descriptors(plan.block_list)
@@ -1291,10 +1310,10 @@ def main() -> None:
 
                 # mask
                 z_k = secagg_client.mask_window(window, delta_slice)
-                # pack
-                z_packed = pack_zq(z_k, modulus_bits)
-                z_hex = z_packed.hex()
-                total_upload_bytes += len(z_packed)
+                # pack + 立即转 hex（不保存 z_k 和 z_packed 引用，让 GC 回收）
+                z_hex = pack_zq(z_k, modulus_bits).hex()
+                del z_k
+                total_upload_bytes += len(z_hex) // 2
 
                 # 上传 z_k 到 server
                 # JSON 不支持 NaN/Inf，需替换

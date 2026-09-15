@@ -39,10 +39,10 @@ security:
   auth_token: ""
   tls: false
   sec_upload_privacy: false     # 关闭 SEC-1/2/3，隔离测试 SecAgg
-  secagg_enabled: true          # 开启 SecAgg
-  secagg_modulus_bits: 16
-  secagg_scale: 0.0
-  secagg_stochastic_rounding: false
+  secagg_enabled: true
+  secagg_modulus_bits: 16       # int16 (2B)
+  secagg_scale: 0.0             # 自适应（round 1 用默认, 后续根据 delta max 调整）
+  secagg_stochastic_rounding: true
   secagg_q_min: 0
 
 scale:

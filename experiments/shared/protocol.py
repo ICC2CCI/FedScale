@@ -83,6 +83,8 @@ class RoundPlan:
     mask_hash: str = ""          # SHA256 of canonical-encoded selected blocks
     mask_policy_id: str = ""     # e.g. "hierarchical-permute-rotate-v1"
     always_on_keys: List[str] = field(default_factory=list)  # sorted key names that are always selected
+    # B-debug: 自适应 scale（server 下发给 client）
+    secagg_scale: float = 0.0
 
     @property
     def upload_ratio(self) -> float:
@@ -112,6 +114,7 @@ class RoundPlan:
             mask_hash=str(data.get("mask_hash", "")),
             mask_policy_id=str(data.get("mask_policy_id", "")),
             always_on_keys=list(data.get("always_on_keys", [])),
+            secagg_scale=float(data.get("secagg_scale", 0.0)),
         )
 
 

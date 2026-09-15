@@ -39,7 +39,9 @@ DEFAULT_MODULUS_BITS = 16
 DEFAULT_Q = 1 << DEFAULT_MODULUS_BITS  # 65536
 # Q_max 留一半给 overflow：Q_max = q/4 - 1，保证 2*Q_max < q/2
 DEFAULT_Q_MAX = (DEFAULT_Q // 4) - 1  # 16383
-DEFAULT_SCALE = 2.0 ** -(DEFAULT_MODULUS_BITS - 2)  # 2^-14 ≈ 6.1e-5
+# scale 选择：可表示范围 = ±(Q_max × scale)
+# delta 实际范围可达 ±2.0（embed_tokens/lm_head），用 scale=2^-12 → ±4.0 覆盖
+DEFAULT_SCALE = 2.0 ** -(DEFAULT_MODULUS_BITS - 4)  # 2^-12 ≈ 2.44e-4
 
 
 def compute_q_max(modulus_bits: int, n_clients: int = 2) -> int:
