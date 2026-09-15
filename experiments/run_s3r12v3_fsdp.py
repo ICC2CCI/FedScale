@@ -1199,8 +1199,188 @@ def main() -> None:
             timings["notify_server_s"] = round(time.monotonic() - t_notify0, 3)
             return timings
 
-        # 执行上传（pipeline 或 batch）
-        upload_fn = _pipeline_upload_and_apply if use_pipeline else _batch_upload_and_notify
+        def _secagg_upload_and_apply():
+            """B-7b: SecAgg pipeline — 量化 → DH → mask → 上传 z_k → 提交 self_master → 等聚合 → apply。"""
+            nonlocal local_global, local_version
+            assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
+            from shared.secagg_client import SecAggClient
+            from shared.secagg_crypto import build_pair_domain_info
+            from shared.fixed_point import quantize_to_zq, pack_zq, DEFAULT_Q, DEFAULT_Q_MAX, DEFAULT_SCALE, compute_q_max
+            from shared.protocol import SecAggPlan, build_window_descriptors
+
+            t_enc0 = time.monotonic()
+            delta = sub_state(full_state, global_state)
+            to_send = add_state(delta, mem_box[0])
+            assert transfer_dtype is not None
+
+            # 构建 SecAggPlan（与 server 一致）
+            modulus_bits = int(getattr(args, "secagg_modulus_bits", 16))
+            q = 1 << modulus_bits
+            q_max = compute_q_max(modulus_bits, n_clients=2)
+            scale = float(getattr(args, "secagg_scale", 0.0))
+            if scale <= 0:
+                scale = 2.0 ** -(modulus_bits - 2)
+            stochastic = bool(getattr(args, "secagg_stochastic_rounding", False))
+
+            windows = build_window_descriptors(plan.block_list)
+            secagg_plan = SecAggPlan(
+                q_min=int(getattr(args, "secagg_q_min", 0)) or 2,
+                quantization_scale=scale,
+                modulus_bits=modulus_bits,
+                modulus_q=q,
+                q_max=q_max,
+                stochastic_rounding=stochastic,
+            )
+
+            # 创建 SecAgg client
+            secagg_client = SecAggClient(args.client_id, secagg_plan, windows)
+
+            # Phase 1: 提交公钥
+            t_dh0 = time.monotonic()
+            resp = requests.post(
+                f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/key-announce",
+                json={"pk_hex": secagg_client.get_public_key_hex()},
+                timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
+            )
+            resp.raise_for_status()
+
+            # 等待所有 peer 公钥
+            peer_keys = {}
+            deadline_dh = time.time() + 300.0
+            while time.time() < deadline_dh:
+                resp = requests.get(
+                    f"{server}/api/round/{round_idx}/secagg/peer-keys",
+                    timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
+                )
+                resp.raise_for_status()
+                pk_status = resp.json()
+                if pk_status.get("status") == "ready":
+                    peer_keys = pk_status["public_keys"]
+                    break
+                time.sleep(args.poll_interval)
+            else:
+                raise RuntimeError("SecAgg: timeout waiting for peer keys")
+
+            # DH 协商
+            secagg_client.setup_dh(peer_keys)
+            t_dh = time.monotonic() - t_dh0
+            logger.info("SecAgg: DH setup complete in %.2fs", t_dh)
+
+            # 构建 delta slices（每个 window 的 delta）
+            block_delta = encode_block_delta(to_send, selected, dtype=transfer_dtype)
+            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
+            t_encode = time.monotonic() - t_enc0
+
+            # Phase 3: 逐 window 量化 → mask → 上传 z_k
+            logger.info("SecAgg: uploading %s masked windows", len(windows))
+            t_up0 = time.monotonic()
+            total_upload_bytes = 0
+
+            for window in windows:
+                wid = window.window_id
+                # 取出该 window 的 delta slice
+                delta_slice = None
+                for kn, blocks in block_delta.items():
+                    if kn == window.key_name:
+                        for s, e, sd in blocks:
+                            if s == window.start and e == window.end:
+                                delta_slice = sd.to(dtype=torch.float32)
+                                break
+                if delta_slice is None:
+                    delta_slice = torch.zeros(window.vector_length, dtype=torch.float32)
+
+                # mask
+                z_k = secagg_client.mask_window(window, delta_slice)
+                # pack
+                z_packed = pack_zq(z_k, modulus_bits)
+                z_hex = z_packed.hex()
+                total_upload_bytes += len(z_packed)
+
+                # 上传 z_k 到 server
+                body = {
+                    "z_hex": z_hex,
+                    "vector_len": window.vector_length,
+                    "num_examples": int(num_examples),
+                    "train_loss": float(train_loss),
+                    "block_energies": [],
+                }
+                if eval_loss_val is not None:
+                    body["eval_loss"] = float(eval_loss_val)
+                resp = requests.post(
+                    f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/masked-window/{wid}",
+                    json=body, timeout=120, headers=auth_headers, verify=_REQUESTS_VERIFY,
+                )
+                resp.raise_for_status()
+            t_upload = time.monotonic() - t_up0
+            logger.info("SecAgg: uploaded all z_k in %.2fs (%.1f MiB)", t_upload, total_upload_bytes / (1024*1024))
+
+            # Phase 4: 提交 self_master
+            t_sm0 = time.monotonic()
+            resp = requests.post(
+                f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/self-master",
+                json={"sm_hex": secagg_client.get_self_master_hex()},
+                timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
+            )
+            resp.raise_for_status()
+            t_sm = time.monotonic() - t_sm0
+            logger.info("SecAgg: self_master submitted in %.2fs", t_sm)
+
+            # 等待 server 聚合完成
+            t_wait0 = time.monotonic()
+            deadline = time.time() + 3600.0
+            while time.time() < deadline:
+                resp = requests.get(
+                    f"{server}/api/round/{round_idx}/block-status",
+                    timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
+                )
+                resp.raise_for_status()
+                status = resp.json()
+                if status.get("done"):
+                    break
+                time.sleep(args.poll_interval)
+            t_wait = time.monotonic() - t_wait0
+
+            # 下载聚合 delta 并 apply
+            t_post0 = time.monotonic()
+            applied_blocks = set()
+            post_bytes = 0
+            for binfo in plan.block_list:
+                gidx = int(binfo[0])
+                agg_key = agg_block_key(round_idx, gidx)
+                if minio.exists(agg_key):
+                    payload, nbytes = minio.get_torch_with_size(agg_key, map_location="cpu")
+                    add_block_delta(local_global, payload["block_delta"])
+                    applied_blocks.add(gidx)
+                    post_bytes += nbytes
+            local_version = round_idx
+            t_post = time.monotonic() - t_post0
+            logger.info("SecAgg: applied %s aggregated blocks in %.2fs", len(applied_blocks), t_post)
+
+            mode_code = {"cache": 0.0, "delta": 1.0, "full": 2.0, "local_base": 3.0}.get(download_mode, 2.0)
+            timings = {
+                "download_mode": mode_code,
+                "download_global_s": round(t_download, 3),
+                "download_global_MiB": round(download_bytes / (1024 * 1024), 3),
+                "broadcast_load_s": round(t_broadcast_load, 3),
+                "train_local_s": round(t_train, 3),
+                "eval_local_s": round(t_eval, 3),
+                "encode_delta_s": round(t_encode, 3),
+                "secagg_dh_s": round(t_dh, 3),
+                "upload_minio_s": round(t_upload, 3),
+                "upload_blocks_MiB": round(total_upload_bytes / (1024 * 1024), 3),
+                "secagg_self_master_s": round(t_sm, 3),
+                "pipeline_wait_agg_s": round(t_wait, 3),
+                "pipeline_post_apply_s": round(t_post, 3),
+            }
+            return timings
+
+        # 执行上传（SecAgg / pipeline / batch）
+        if getattr(args, "secagg_enabled", False) and is_main:
+            upload_fn = _secagg_upload_and_apply
+        elif use_pipeline:
+            upload_fn = _pipeline_upload_and_apply
+        else:
+            upload_fn = _batch_upload_and_notify
         pre_wait_timings = run_rank0_io_with_heartbeat(
             accelerator,
             upload_fn if is_main else (lambda: {}),

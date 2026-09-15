@@ -578,6 +578,248 @@ class AggregationServer:
 
         return {"aggregated": True, "agg_key": agg_block_key(round_idx, block_idx)}
 
+    # ----------------------------------------------------------------------- #
+    # B-7a: SecAgg pipeline 集成
+    # ----------------------------------------------------------------------- #
+
+    def secagg_block_uploaded(
+        self,
+        round_idx: int,
+        client_id: int,
+        block_idx: int,
+        z_hex: str,
+        vector_len: int,
+        num_examples: int,
+        train_loss: float,
+        eval_loss: Optional[float] = None,
+        block_energies: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """B-7a: SecAgg pipeline — client 上传一个 masked window (z_k)。
+
+        流程：
+        1. 解包 z_k (int16 packed bytes)
+        2. 存入 SecAggCoordinator
+        3. 检查该 window 的所有 client 是否都已上传
+        4. 是 → 等待 self_master 提交后聚合 unmask → 写 agg_block_key
+        5. 否 → 等待
+        """
+        if client_id < 0 or client_id >= self.num_clients:
+            raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
+        if round_idx < 1 or round_idx > self.num_rounds:
+            raise HTTPException(404, f"round {round_idx} out of range")
+
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+
+        # 解包 z_k
+        from shared.fixed_point import unpack_zq
+        z_data = bytes.fromhex(z_hex)
+        z_kw = unpack_zq(z_data, vector_len, self.secagg_modulus_bits)
+
+        # 记录 client metadata
+        with self.lock:
+            if round_idx < self.current_round:
+                raise HTTPException(409, f"round {round_idx} already finished")
+            block_uploads = self.round_block_uploads.setdefault(round_idx, {})
+            uploaded_clients = block_uploads.setdefault(block_idx, set())
+            uploaded_clients.add(client_id)
+            client_meta = self.round_client_meta.setdefault(round_idx, {})
+            client_meta[client_id] = {
+                "num_examples": num_examples,
+                "train_loss": train_loss,
+                "eval_loss": eval_loss,
+            }
+            self._ingest_energies(block_energies or [])
+            all_uploaded = len(uploaded_clients) >= self.effective_min_clients
+
+        # 存入 coordinator
+        coord.submit_masked_window(client_id, block_idx, z_kw)
+
+        if not all_uploaded:
+            logger.info(
+                "SecAgg block %s round %s: client %s uploaded z_k (%s/%s), waiting",
+                block_idx, round_idx, client_id,
+                len(uploaded_clients), self.effective_min_clients,
+            )
+            return {"aggregated": False, "waiting": len(uploaded_clients)}
+
+        # 所有 client 的该 block 都已上传 → 检查是否所有 self_master 也已提交
+        logger.info(
+            "SecAgg: all clients uploaded z_k for block %s round %s, checking self_masters",
+            block_idx, round_idx,
+        )
+        return {"aggregated": False, "waiting_self_masters": True}
+
+    def secagg_try_finalize_round(self, round_idx: int) -> bool:
+        """B-7a: 尝试完成 SecAgg 轮次。
+
+        条件：所有 window 的 z_k 都已上传 + 所有 self_master 都已提交。
+        如果条件满足：聚合 unmask → 写每个 block 的 agg_block_key → 写 delta → 推进 round。
+        返回 True 如果完成，False 如果还在等待。
+        """
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            return False
+
+        plan = self._ensure_plan(round_idx)
+        n_windows = plan.n_selected_blocks
+
+        with self.lock:
+            block_uploads = self.round_block_uploads.get(round_idx, {})
+            n_blocks_uploaded = len(block_uploads)
+            n_self_masters = len(coord.self_masters)
+
+        # 检查所有 window 是否都有所有 client 的 z_k
+        all_windows_done = n_blocks_uploaded >= n_windows
+        all_self_masters = n_self_masters >= self.effective_min_clients
+
+        if not (all_windows_done and all_self_masters):
+            logger.info(
+                "SecAgg finalize round %s: windows=%s/%s self_masters=%s/%s, waiting",
+                round_idx, n_blocks_uploaded, n_windows,
+                n_self_masters, self.effective_min_clients,
+            )
+            return False
+
+        # 所有条件满足 → 聚合
+        logger.info("SecAgg: finalizing round %s (all z_k + self_masters received)", round_idx)
+        try:
+            coord.freeze_survivors()
+            agg_delta = coord.aggregate_and_unmask()
+        except RuntimeError as e:
+            logger.error("SecAgg aggregation failed: %s", e)
+            with self.lock:
+                self.round_results[round_idx] = {
+                    "round": round_idx,
+                    "done": False,
+                    "message": "secagg_failed",
+                    "reason": str(e),
+                }
+                self._aggregating = False
+            return True
+
+        # 写每个 block 的 agg_block_key（让 client 可以逐 block 下载）
+        for window_id in range(n_windows):
+            # 找到该 window 的 key_name, start, end
+            block_info = None
+            for b in plan.block_list:
+                if int(b[0]) == window_id:
+                    block_info = b
+                    break
+            if block_info is None:
+                continue
+            _, key_name, start, end = block_info
+            # 从 agg_delta 中取出该 block 的 slice
+            block_slice = None
+            for kn, blocks in agg_delta.items():
+                if kn == key_name:
+                    for s, e, slice_data in blocks:
+                        if s == start and e == end:
+                            block_slice = (s, e, slice_data)
+                            break
+            if block_slice is None:
+                logger.warning("SecAgg: block %s not found in agg_delta", window_id)
+                continue
+            s, e, slice_data = block_slice
+            # 转成 fp16 用于 client 下载
+            slice_fp16 = slice_data.to(dtype=self.transfer_dtype)
+            agg_payload = {
+                "round": int(round_idx),
+                "block_idx": int(window_id),
+                "block_delta": {key_name: [(s, e, slice_fp16)]},
+            }
+            self.minio.put_torch(agg_block_key(round_idx, window_id), agg_payload)
+            with self.lock:
+                self.round_block_agg.setdefault(round_idx, {})[window_id] = {
+                    key_name: [(s, e, slice_fp16)]
+                }
+
+        # 写完整 delta + 推进 round
+        with self.lock:
+            client_meta = dict(self.round_client_meta.get(round_idx, {}))
+            participated = sorted(client_meta.keys())
+        losses = [float(client_meta[c].get("train_loss", 0)) for c in participated]
+        eval_losses = [float(client_meta[c]["eval_loss"]) for c in participated
+                       if client_meta[c].get("eval_loss") is not None]
+
+        # 把 agg_delta 转成 block_delta 格式（与现有 pipeline 一致）
+        agg_delta_fp16: Dict[str, list] = {}
+        for kn, blocks in agg_delta.items():
+            agg_delta_fp16[kn] = [
+                (s, e, sd.to(dtype=self.transfer_dtype)) for s, e, sd in blocks
+            ]
+
+        # 写 delta payload
+        delta_payload = {
+            "round": int(round_idx),
+            "from_round": int(round_idx - 1),
+            "to_round": int(round_idx),
+            "block_delta": agg_delta_fp16,
+            "n_selected_blocks": int(plan.n_selected_blocks),
+            "selected_elems": int(plan.selected_elems),
+            "secagg": True,
+        }
+        delta_bytes = self.minio.put_torch(global_delta_key(round_idx), delta_payload)
+
+        # 写全量 global_state（如果需要）
+        # SecAgg 模式下，server 不一定有 global_state（SCALE-1）
+        # 但 delta 已经写好，client 会自己 apply
+        wrote_full_global = self._should_write_full_global(round_idx)
+        global_bytes = 0
+        if wrote_full_global and self.global_state is not None:
+            # apply delta to global_state
+            from shared.block_selection import add_block_delta
+            add_block_delta(self.global_state, agg_delta_fp16)
+            global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
+
+        # 构建结果
+        avg_train = sum(losses) / max(len(losses), 1)
+        avg_eval = (sum(eval_losses) / len(eval_losses)) if eval_losses else None
+        result = {
+            "round": round_idx,
+            "done": True,
+            "eval_loss": round(float(avg_eval), 6) if avg_eval is not None else None,
+            "avg_train_loss": round(avg_train, 6),
+            "upload_ratio": round(plan.upload_ratio, 6),
+            "n_selected_blocks": plan.n_selected_blocks,
+            "selected_elems": plan.selected_elems,
+            "message": "secagg_aggregated",
+            "secagg": True,
+            "wrote_full_global": wrote_full_global,
+            "global_delta_key": global_delta_key(round_idx),
+            "global_state_key": global_state_key(round_idx) if wrote_full_global else None,
+        }
+        entry = {
+            "round": round_idx,
+            "epoch": plan.epoch,
+            "slot": plan.slot,
+            "avg_train_loss": result["avg_train_loss"],
+            "eval_loss": result["eval_loss"],
+            "pct_of_total": round(plan.upload_ratio * 100, 2),
+            "n_selected_blocks": plan.n_selected_blocks,
+            "secagg": True,
+        }
+        with self.lock:
+            self.round_results[round_idx] = result
+            self.round_log.append(entry)
+            self._write_round_log()
+            self._append_metrics_jsonl(entry)
+            self.successful_round_index += 1
+            if round_idx < self.num_rounds:
+                self.current_round = round_idx + 1
+                self._ensure_plan(self.current_round)
+                self._mark_round_open(self.current_round)
+            else:
+                self.current_round = self.num_rounds + 1
+            self._aggregating = False
+
+        logger.info(
+            "SecAgg: round %s complete, avg_train=%.4f delta_MiB=%.1f",
+            round_idx, avg_train, delta_bytes / (1024 * 1024),
+        )
+        return True
+
     def _aggregate_single_block(self, round_idx: int, block_idx: int) -> Dict[str, Any]:
         """流式：聚合单个 block（所有 client 的该 block FedAvg），写出 agg_block_key。"""
         plan = self._ensure_plan(round_idx)
@@ -1288,15 +1530,33 @@ def build_app(server: AggregationServer) -> FastAPI:
         request: Request, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
         body = await request.json()
-        z_data = bytes.fromhex(body.get("z_hex", ""))
+        z_hex = body.get("z_hex", "")
         vector_len = int(body.get("vector_len", 0))
-        return server.secagg_submit_masked_window(round_idx, client_id, window_id, z_data, vector_len)
+        num_examples = int(body.get("num_examples", 1))
+        train_loss = float(body.get("train_loss", 0.0))
+        eval_loss = body.get("eval_loss")
+        if eval_loss is not None:
+            eval_loss = float(eval_loss)
+        block_energies = body.get("block_energies", [])
+        result = server.secagg_block_uploaded(
+            round_idx, client_id, window_id, z_hex, vector_len,
+            num_examples, train_loss, eval_loss, block_energies,
+        )
+        # 如果所有 z_k 都已上传，尝试 finalize
+        if result.get("waiting_self_masters"):
+            finalized = server.secagg_try_finalize_round(round_idx)
+            if finalized:
+                result["aggregated"] = True
+        return result
 
     @app.post("/api/round/{round_idx}/client/{client_id}/secagg/self-master")
     def secagg_submit_self_master(
         round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
-        return server.secagg_submit_self_master(round_idx, client_id, body.get("sm_hex", ""))
+        result = server.secagg_submit_self_master(round_idx, client_id, body.get("sm_hex", ""))
+        # 尝试 finalize（self_master 可能是最后到达的）
+        server.secagg_try_finalize_round(round_idx)
+        return result
 
     @app.get("/api/round/{round_idx}/secagg/status")
     def secagg_status(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
