@@ -344,6 +344,30 @@ def train_local_steps(
             torch.cuda.max_memory_allocated() / (1024 * 1024),
         )
 
+    # Sample GPU utilization at the end of training (instantaneous snapshot)
+    gpu_util_pct = None
+    if torch.cuda.is_available():
+        try:
+            gpu_util_pct = round(torch.cuda.utilization(), 2)
+        except Exception:
+            gpu_util_pct = None
+
+    # CPU memory (RSS) via resource module
+    cpu_mem_peak_mb = 0.0
+    cpu_util_pct = 0.0
+    try:
+        import resource as _resource
+        rss = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # Linux: KB, macOS: bytes
+        cpu_mem_peak_mb = round(rss / 1024.0, 2) if rss > 0 else 0.0
+    except Exception:
+        pass
+    try:
+        import psutil
+        cpu_util_pct = round(psutil.cpu_percent(interval=0.1), 2)
+    except Exception:
+        pass
+
     avg_loss = loss_sum / max(loss_count, 1)
     n = len(step_records)
     summary = {
@@ -360,9 +384,9 @@ def train_local_steps(
     }
     resources = {
         "gpu_memory_peak_mb": round(gpu_mem_peak_mb, 2),
-        "gpu_utilization_avg_pct": None,
-        "cpu_utilization_avg_pct": 0.0,
-        "cpu_memory_peak_mb": 0.0,
+        "gpu_utilization_avg_pct": gpu_util_pct,
+        "cpu_utilization_avg_pct": cpu_util_pct,
+        "cpu_memory_peak_mb": cpu_mem_peak_mb,
         "network_rx_bytes": None,
         "network_tx_bytes": None,
         "network_total_bytes": None,
