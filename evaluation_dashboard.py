@@ -39,8 +39,14 @@ def _scan_runs(results_dir: Path) -> list[dict]:
     for d in sorted(results_dir.iterdir(), reverse=True):
         if not d.is_dir():
             continue
-        meta_path = d / "run_meta.json"
+        # Skip symlinks (e.g. "current" -> latest run) to avoid duplicates
+        if d.is_symlink():
+            continue
+        # Only include directories that contain a round_log.json or run_meta.json
         round_log_path = d / "round_log.json"
+        meta_path = d / "run_meta.json"
+        if not round_log_path.exists() and not meta_path.exists():
+            continue
         run_info: dict[str, Any] = {
             "run_id": d.name,
             "path": str(d),
@@ -178,7 +184,18 @@ async def api_get_run(run_id: str):
     run_dir = results_dir / run_id
     if not run_dir.exists():
         return JSONResponse({"error": "Run not found"}, status_code=404)
-    return JSONResponse(_load_run_data(run_dir))
+    data = _load_run_data(run_dir)
+    # Merge summary fields from _scan_runs
+    runs = _scan_runs(results_dir)
+    for r in runs:
+        if r["run_id"] == run_id:
+            for k in ("num_rounds", "status", "num_clients", "model",
+                       "coverage_h", "tag", "completed_rounds",
+                       "final_train_loss", "final_eval_loss"):
+                if k in r:
+                    data[k] = r[k]
+            break
+    return JSONResponse(data)
 
 
 @app.get("/view/{run_id}", response_class=HTMLResponse)
