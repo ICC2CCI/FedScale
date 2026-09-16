@@ -274,6 +274,7 @@ def train_local_steps(
     micro = 0
     loss_sum = 0.0
     loss_count = 0
+    total_tokens_processed = 0
     data_iter = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
     step_records: list[dict] = []
@@ -282,13 +283,37 @@ def train_local_steps(
     if torch.cuda.is_available():
         gpu_mem_base = torch.cuda.memory_allocated() / (1024 * 1024)
 
+    # NCCL collective tracking via torch.profiler
+    from collections import defaultdict as _dd
+    _nccl_stats: dict = _dd(lambda: {"count": 0, "total_us": 0, "bytes": 0})
+
+    def _make_profiler():
+        """Create a torch.profiler instance that tracks NCCL collectives."""
+        try:
+            from torch.profiler import profile, ProfilerActivity
+            return profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+                with_modules=False,
+            )
+        except Exception:
+            return None
+
+    _prof = _make_profiler()
+
     while step < local_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
+        # Track tokens processed (input_ids count)
+        if "input_ids" in batch:
+            total_tokens_processed += int(batch["input_ids"].numel())
         step_start = time.monotonic()
+        if _prof is not None:
+            _prof.start()
         with accelerator.accumulate(model):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -308,6 +333,23 @@ def train_local_steps(
             loss_sum += float(loss.detach().item())
             loss_count += 1
             if accelerator.sync_gradients:
+                if _prof is not None:
+                    _prof.stop()
+                    # Extract NCCL collective stats from profiler
+                    try:
+                        events = _prof.key_averages()
+                        for evt in events:
+                            key = evt.key
+                            if "nccl" in key.lower() or "all_reduce" in key.lower() or "all_gather" in key.lower() or "reduce_scatter" in key.lower():
+                                cat = "all_reduce" if "all_reduce" in key.lower() else \
+                                      "all_gather" if "all_gather" in key.lower() else \
+                                      "reduce_scatter" if "reduce_scatter" in key.lower() else "other_nccl"
+                                _nccl_stats[cat]["count"] += evt.count
+                                _nccl_stats[cat]["total_us"] += evt.self_device_time_total if hasattr(evt, 'self_device_time_total') else 0
+                                _nccl_stats[cat]["bytes"] += getattr(evt, 'flops', 0) or 0
+                        _prof = _make_profiler()  # Fresh profiler for next step
+                    except Exception:
+                        _prof = _make_profiler()
                 opt_start = time.monotonic()
                 optimizer.step()
                 scheduler.step()
@@ -317,6 +359,13 @@ def train_local_steps(
                 opt_ms = (time.monotonic() - opt_start) * 1000
                 step += 1
                 total_ms = (time.monotonic() - step_start) * 1000
+                # Aggregate NCCL stats for this step
+                ar_ms = round(_nccl_stats["all_reduce"]["total_us"] / 1000.0 / max(_nccl_stats["all_reduce"]["count"], 1), 2) if _nccl_stats["all_reduce"]["count"] > 0 else 0.0
+                ag_ms = round(_nccl_stats["all_gather"]["total_us"] / 1000.0 / max(_nccl_stats["all_gather"]["count"], 1), 2) if _nccl_stats["all_gather"]["count"] > 0 else 0.0
+                rs_ms = round(_nccl_stats["reduce_scatter"]["total_us"] / 1000.0 / max(_nccl_stats["reduce_scatter"]["count"], 1), 2) if _nccl_stats["reduce_scatter"]["count"] > 0 else 0.0
+                ar_bytes = int(_nccl_stats["all_reduce"]["bytes"])
+                ag_bytes = int(_nccl_stats["all_gather"]["bytes"])
+                rs_bytes = int(_nccl_stats["reduce_scatter"]["bytes"])
                 step_records.append({
                     "step": step,
                     "forward_ms": round(fwd_ms, 2),
@@ -325,6 +374,12 @@ def train_local_steps(
                     "comm_ms": round(max(0.0, total_ms - fwd_ms - bwd_ms - opt_ms), 2),
                     "total_ms": round(total_ms, 2),
                     "loss": round(loss_sum / max(loss_count, 1), 6),
+                    "all_reduce_ms": ar_ms,
+                    "all_gather_ms": ag_ms,
+                    "reduce_scatter_ms": rs_ms,
+                    "all_reduce_bytes": ar_bytes,
+                    "all_gather_bytes": ag_bytes,
+                    "reduce_scatter_bytes": rs_bytes,
                 })
                 if accelerator.is_main_process and step % 10 == 0:
                     logger.info(
@@ -334,6 +389,8 @@ def train_local_steps(
                         loss_sum / max(loss_count, 1),
                     )
             else:
+                if _prof is not None:
+                    _prof.stop()
                 micro += 1
 
     train_time_s = time.monotonic() - train_start
@@ -381,6 +438,27 @@ def train_local_steps(
 
     avg_loss = loss_sum / max(loss_count, 1)
     n = len(step_records)
+    # Aggregate NCCL stats across all steps
+    total_ar_ms = sum(s.get("all_reduce_ms", 0) for s in step_records)
+    total_ag_ms = sum(s.get("all_gather_ms", 0) for s in step_records)
+    total_rs_ms = sum(s.get("reduce_scatter_ms", 0) for s in step_records)
+    total_ar_bytes = sum(s.get("all_reduce_bytes", 0) for s in step_records)
+    total_ag_bytes = sum(s.get("all_gather_bytes", 0) for s in step_records)
+    total_rs_bytes = sum(s.get("reduce_scatter_bytes", 0) for s in step_records)
+    # Throughput: tokens per second (only count on main process to avoid overcounting)
+    throughput_tokens_per_s = round(total_tokens_processed / train_time_s, 2) if train_time_s > 0 else 0.0
+    # Network traffic via psutil (per-process NIC counters)
+    net_rx = None
+    net_tx = None
+    net_total = None
+    try:
+        import psutil as _ps
+        _net = _ps.net_io_counters()
+        net_rx = _net.bytes_recv
+        net_tx = _net.bytes_sent
+        net_total = net_rx + net_tx
+    except Exception:
+        pass
     summary = {
         "steps": step_records,
         "total_train_time_s": round(train_time_s, 2),
@@ -389,8 +467,14 @@ def train_local_steps(
         "avg_backward_ms": round(sum(s["backward_ms"] for s in step_records) / n, 2) if n else 0.0,
         "avg_comm_ms": round(sum(s["comm_ms"] for s in step_records) / n, 2) if n else 0.0,
         "avg_optimizer_ms": round(sum(s["optimizer_ms"] for s in step_records) / n, 2) if n else 0.0,
-        "throughput_tokens_per_s": 0.0,
-        "total_tokens": 0,
+        "avg_all_reduce_ms": round(total_ar_ms / n, 2) if n else 0.0,
+        "avg_all_gather_ms": round(total_ag_ms / n, 2) if n else 0.0,
+        "avg_reduce_scatter_ms": round(total_rs_ms / n, 2) if n else 0.0,
+        "total_all_reduce_bytes": total_ar_bytes,
+        "total_all_gather_bytes": total_ag_bytes,
+        "total_reduce_scatter_bytes": total_rs_bytes,
+        "throughput_tokens_per_s": throughput_tokens_per_s,
+        "total_tokens": total_tokens_processed,
         "num_steps": n,
     }
     resources = {
@@ -398,9 +482,12 @@ def train_local_steps(
         "gpu_utilization_avg_pct": gpu_util_pct,
         "cpu_utilization_avg_pct": cpu_util_pct,
         "cpu_memory_peak_mb": cpu_mem_peak_mb,
-        "network_rx_bytes": None,
-        "network_tx_bytes": None,
-        "network_total_bytes": None,
+        "network_rx_bytes": net_rx,
+        "network_tx_bytes": net_tx,
+        "network_total_bytes": net_total,
+        "total_nccl_bytes": total_ar_bytes + total_ag_bytes + total_rs_bytes,
+        "nccl_collective_calls": sum(1 for s in step_records if s.get("all_reduce_ms", 0) > 0 or s.get("all_gather_ms", 0) > 0 or s.get("reduce_scatter_ms", 0) > 0),
+        "avg_nccl_comm_ms": round((total_ar_ms + total_ag_ms + total_rs_ms) / n, 2) if n else 0.0,
     }
     return avg_loss, {"training": summary, "resources": resources}
 
@@ -942,7 +1029,12 @@ def main() -> None:
                 logger.info("Online eval_loss=%.6f in %.1fs", eval_loss_val, t_eval)
         accelerator.wait_for_everyone()
 
+        # FSDP state export timing
+        t_state_export0 = time.monotonic()
         full_state = get_full_state_fsdp(model)
+        t_state_export = time.monotonic() - t_state_export0
+        if is_main:
+            logger.info("FSDP state export: %.3fs", t_state_export)
         mem_box: List[Any] = [memory]
 
         def _pipeline_upload_and_apply():
@@ -1486,6 +1578,8 @@ def main() -> None:
                         "t_total_round_s": full_timings.get("round_total_s"),
                         "t_model_delta_export_s": full_timings.get("encode_delta_s"),
                         "t_full_update_compression_s": full_timings.get("encode_delta_s"),
+                        "t_state_export_s": round(t_state_export, 3) if 't_state_export' in dir() else None,
+                        "full_state_export_s": round(t_state_export, 3) if 't_state_export' in dir() else None,
                         "wan_download_s": full_timings.get("wan_download_s"),
                         "wan_upload_s": full_timings.get("wan_upload_s"),
                         "model_delta_bytes": full_timings.get("model_delta_bytes"),

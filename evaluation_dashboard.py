@@ -452,6 +452,22 @@ function renderReport() {{
     html += box('优化器时间', t.avg_optimizer_ms, 'ms');
     html += box('通信时间', t.avg_comm_ms, 'ms');
     html += box('总训练时间', t.total_train_time_s, 's');
+    html += box('吞吐量', t.throughput_tokens_per_s > 0 ? t.throughput_tokens_per_s : '—', 'tokens/s');
+    html += box('总 Tokens', t.total_tokens > 0 ? t.total_tokens : '—', '');
+    html += `</div>`;
+
+    // NCCL collective breakdown
+    if (t.avg_all_reduce_ms > 0 || t.avg_all_gather_ms > 0 || t.avg_reduce_scatter_ms > 0) {{
+      html += `<div class="param-section-label">NCCL 集合通信分解</div>`;
+      html += `<div class="metric-grid">`;
+      html += box('All-Reduce', t.avg_all_reduce_ms, 'ms');
+      html += box('All-Gather', t.avg_all_gather_ms, 'ms');
+      html += box('Reduce-Scatter', t.avg_reduce_scatter_ms, 'ms');
+      html += box('AR 总字节', t.total_all_reduce_bytes > 0 ? (t.total_all_reduce_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('AG 总字节', t.total_all_gather_bytes > 0 ? (t.total_all_gather_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('RS 总字节', t.total_reduce_scatter_bytes > 0 ? (t.total_reduce_scatter_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += `</div>`;
+    }}
     html += `</div>`;
 
     // Per-step loss chart
@@ -478,11 +494,23 @@ function renderReport() {{
     const r = md.resources;
     html += `<h2>🖥️ 资源使用</h2><div class="card"><div class="metric-grid">`;
     html += box('GPU 峰值显存', r.gpu_memory_peak_mb ? (r.gpu_memory_peak_mb/1024).toFixed(2) : '—', 'GB');
-    html += box('GPU 利用率', r.gpu_utilization_avg_pct !== null ? r.gpu_utilization_avg_pct : '—', '%');
+    html += box('GPU 利用率', r.gpu_utilization_avg_pct !== null && r.gpu_utilization_avg_pct !== undefined ? r.gpu_utilization_avg_pct : '—', '%');
     html += box('CPU 利用率', r.cpu_utilization_avg_pct, '%');
     html += box('CPU 峰值内存', r.cpu_memory_peak_mb ? (r.cpu_memory_peak_mb/1024).toFixed(2) : '—', 'GB');
     html += `</div>`;
-    if (r.gpu_utilization_avg_pct === null) {{
+    // Network traffic & NCCL overhead
+    if (r.network_total_bytes !== null && r.network_total_bytes !== undefined) {{
+      html += `<div class="param-section-label">网络 & NCCL 开销</div>`;
+      html += `<div class="metric-grid">`;
+      html += box('网络接收', r.network_rx_bytes !== null ? (r.network_rx_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('网络发送', r.network_tx_bytes !== null ? (r.network_tx_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('网络总流量', (r.network_total_bytes/1024/1024).toFixed(2), 'MB');
+      html += box('NCCL 总字节', r.total_nccl_bytes > 0 ? (r.total_nccl_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('NCCL 调用数', r.nccl_collective_calls || '—', '');
+      html += box('NCCL 平均耗时', r.avg_nccl_comm_ms || '—', 'ms');
+      html += `</div>`;
+    }}
+    if (r.gpu_utilization_avg_pct === null || r.gpu_utilization_avg_pct === undefined) {{
       html += `<div class="warn"><strong>⚠ GPU 利用率未采集</strong>：旧版本训练未记录此指标，新版本已修复</div>`;
     }}
     html += `</div>`;
@@ -491,6 +519,18 @@ function renderReport() {{
   // --- Federated Timing ---
   if (rl.length) {{
     html += `<h2>🌐 联邦时序</h2><div class="card">`;
+    // Federated round breakdown metrics
+    const fed = (md && md.federated) || {{}};
+    if (fed.t_state_export_s !== null && fed.t_state_export_s !== undefined) {{
+      html += `<div class="param-section-label">FSDP 状态导出 & 模型 Delta</div>`;
+      html += `<div class="metric-grid">`;
+      html += box('FSDP State Export', fed.t_state_export_s, 's');
+      html += box('Model Delta 导出', fed.t_model_delta_export_s || '—', 's');
+      html += box('Delta 压缩', fed.t_full_update_compression_s || '—', 's');
+      html += box('Delta 大小', fed.model_delta_bytes ? (fed.model_delta_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += `</div>`;
+    }}
+    html += `<div class="param-section-label">联邦轮次时序</div>`;
     html += `<div class="chart-container"><canvas id="timingChart"></canvas></div>`;
     html += `<table><thead><tr><th>轮次</th><th>周期(s)</th><th>训练(s)</th><th>WAN上传(s)</th><th>聚合(s)</th><th>传输量(MB)</th></tr></thead><tbody>`;
     rl.forEach(r => {{
