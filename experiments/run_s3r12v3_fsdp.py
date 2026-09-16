@@ -283,6 +283,48 @@ def train_local_steps(
     if torch.cuda.is_available():
         gpu_mem_base = torch.cuda.memory_allocated() / (1024 * 1024)
 
+    # Per-step resource sampling helpers
+    _gpu_util_samples: list[float] = []
+    _cpu_util_samples: list[float] = []
+    _gpu_mem_samples: list[float] = []
+
+    def _sample_gpu_util() -> float | None:
+        """Sample current GPU utilization (non-blocking, works across ranks)."""
+        try:
+            import subprocess as _sp
+            _r = _sp.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+            )
+            lines = _r.stdout.strip().splitlines()
+            if lines:
+                vals = lines[0].split(",")
+                return round(float(vals[0].strip()), 2)
+        except Exception:
+            pass
+        return None
+
+    def _sample_gpu_mem() -> float | None:
+        """Sample current GPU memory usage in MB."""
+        if torch.cuda.is_available():
+            try:
+                return round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
+            except Exception:
+                pass
+        return None
+
+    def _sample_cpu_util() -> float | None:
+        """Sample current CPU utilization."""
+        try:
+            import psutil as _ps
+            return round(_ps.cpu_percent(interval=None), 2)
+        except Exception:
+            return None
+
+    # Initialize psutil cpu_percent baseline
+    _sample_cpu_util()
+
     # NCCL collective tracking via torch.profiler
     from collections import defaultdict as _dd
     _nccl_stats: dict = _dd(lambda: {"count": 0, "total_us": 0, "bytes": 0})
@@ -366,6 +408,17 @@ def train_local_steps(
                 ar_bytes = int(_nccl_stats["all_reduce"]["bytes"])
                 ag_bytes = int(_nccl_stats["all_gather"]["bytes"])
                 rs_bytes = int(_nccl_stats["reduce_scatter"]["bytes"])
+                # Sample resource utilization during active training
+                _gpu_u = _sample_gpu_util()
+                _cpu_u = _sample_cpu_util()
+                _gpu_m = _sample_gpu_mem()
+                if _gpu_u is not None:
+                    _gpu_util_samples.append(_gpu_u)
+                if _cpu_u is not None:
+                    _cpu_util_samples.append(_cpu_u)
+                if _gpu_m is not None:
+                    _gpu_mem_samples.append(_gpu_m)
+
                 step_records.append({
                     "step": step,
                     "forward_ms": round(fwd_ms, 2),
@@ -380,6 +433,9 @@ def train_local_steps(
                     "all_reduce_bytes": ar_bytes,
                     "all_gather_bytes": ag_bytes,
                     "reduce_scatter_bytes": rs_bytes,
+                    "gpu_util_pct": _gpu_u,
+                    "gpu_mem_mb": _gpu_m,
+                    "cpu_util_pct": _cpu_u,
                 })
                 if accelerator.is_main_process and step % 10 == 0:
                     logger.info(
@@ -401,9 +457,12 @@ def train_local_steps(
             torch.cuda.max_memory_allocated() / (1024 * 1024),
         )
 
-    # Sample GPU utilization at the end of training (instantaneous snapshot)
+    # Compute GPU/CPU utilization from per-step samples (not end-of-training snapshot)
     gpu_util_pct = None
-    if torch.cuda.is_available():
+    if _gpu_util_samples:
+        gpu_util_pct = round(sum(_gpu_util_samples) / len(_gpu_util_samples), 2)
+    elif torch.cuda.is_available():
+        # Fallback: single snapshot if no per-step samples were collected
         try:
             gpu_util_pct = round(torch.cuda.utilization(), 2)
         except Exception:
@@ -426,15 +485,22 @@ def train_local_steps(
     try:
         import resource as _resource
         rss = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
-        # Linux: KB, macOS: bytes
         cpu_mem_peak_mb = round(rss / 1024.0, 2) if rss > 0 else 0.0
     except Exception:
         pass
-    try:
-        import psutil
-        cpu_util_pct = round(psutil.cpu_percent(interval=0.1), 2)
-    except Exception:
-        pass
+    if _cpu_util_samples:
+        cpu_util_pct = round(sum(_cpu_util_samples) / len(_cpu_util_samples), 2)
+    else:
+        try:
+            import psutil
+            cpu_util_pct = round(psutil.cpu_percent(interval=0.1), 2)
+        except Exception:
+            pass
+
+    # GPU memory stats from per-step samples
+    gpu_mem_avg_mb = None
+    if _gpu_mem_samples:
+        gpu_mem_avg_mb = round(sum(_gpu_mem_samples) / len(_gpu_mem_samples), 2)
 
     avg_loss = loss_sum / max(loss_count, 1)
     n = len(step_records)
@@ -482,6 +548,10 @@ def train_local_steps(
         "gpu_utilization_avg_pct": gpu_util_pct,
         "cpu_utilization_avg_pct": cpu_util_pct,
         "cpu_memory_peak_mb": cpu_mem_peak_mb,
+        "gpu_memory_avg_mb": gpu_mem_avg_mb,
+        "gpu_util_samples": _gpu_util_samples,
+        "cpu_util_samples": _cpu_util_samples,
+        "gpu_mem_samples": _gpu_mem_samples,
         "network_rx_bytes": net_rx,
         "network_tx_bytes": net_tx,
         "network_total_bytes": net_total,

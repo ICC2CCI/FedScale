@@ -602,10 +602,19 @@ function renderReport() {{
     const r = md.resources;
     html += `<h2>🖥️ 资源使用</h2><div class="card"><div class="metric-grid">`;
     html += box('GPU 峰值显存', r.gpu_memory_peak_mb ? (r.gpu_memory_peak_mb/1024).toFixed(2) : '—', 'GB');
+    html += box('GPU 平均显存', r.gpu_memory_avg_mb ? (r.gpu_memory_avg_mb/1024).toFixed(2) : '—', 'GB');
     html += box('GPU 利用率', r.gpu_utilization_avg_pct !== null && r.gpu_utilization_avg_pct !== undefined ? r.gpu_utilization_avg_pct : '—', '%');
     html += box('CPU 利用率', r.cpu_utilization_avg_pct, '%');
     html += box('CPU 峰值内存', r.cpu_memory_peak_mb ? (r.cpu_memory_peak_mb/1024).toFixed(2) : '—', 'GB');
     html += `</div>`;
+    // Resource utilization trend charts (from per-step samples)
+    const gpuSamples = r.gpu_util_samples || [];
+    const cpuSamples = r.cpu_util_samples || [];
+    const memSamples = r.gpu_mem_samples || [];
+    if (gpuSamples.length > 1 || cpuSamples.length > 1 || memSamples.length > 1) {{
+      html += `<div class="param-section-label">训练全程资源利用率趋势</div>`;
+      html += `<div class="chart-container" style="height:280px;"><canvas id="resourceTrendChart"></canvas></div>`;
+    }}
     // Network traffic & NCCL overhead
     if (r.network_total_bytes !== null && r.network_total_bytes !== undefined) {{
       html += `<div class="param-section-label">网络 & NCCL 开销</div>`;
@@ -805,6 +814,36 @@ function renderReport() {{
         // We'll load them from the predictions endpoint
       }}).catch(() => {{}});
       predContainer.innerHTML = '<p style="color:#8b949e;">预测样本请在服务器上查看 predictions.jsonl</p>';
+    }}
+  }}
+
+  // Render resource utilization trend chart
+  const resChartCanvas = document.getElementById('resourceTrendChart');
+  if (resChartCanvas && md && md.resources) {{
+    const r = md.resources;
+    const gpuS = r.gpu_util_samples || [];
+    const cpuS = r.cpu_util_samples || [];
+    const memS = r.gpu_mem_samples || [];
+    if (gpuS.length > 1 || cpuS.length > 1 || memS.length > 1) {{
+      const maxLen = Math.max(gpuS.length, cpuS.length, memS.length);
+      const labels = Array.from({{length: maxLen}}, (_, i) => 'Step ' + (i + 1));
+      const datasets = [];
+      if (gpuS.length > 1) datasets.push({{ label: 'GPU 利用率 (%)', data: gpuS, borderColor: '#3fb950', backgroundColor: '#3fb95020', fill: false, tension: 0.3, pointRadius: 2, yAxisID: 'y' }});
+      if (cpuS.length > 1) datasets.push({{ label: 'CPU 利用率 (%)', data: cpuS, borderColor: '#58a6ff', backgroundColor: '#58a6ff20', fill: false, tension: 0.3, pointRadius: 2, yAxisID: 'y' }});
+      if (memS.length > 1) datasets.push({{ label: 'GPU 显存 (MB)', data: memS, borderColor: '#d29922', backgroundColor: '#d2992220', fill: false, tension: 0.3, pointRadius: 2, yAxisID: 'y1' }});
+      new Chart(resChartCanvas, {{
+        type: 'line',
+        data: {{ labels, datasets }},
+        options: {{
+          responsive: true, maintainAspectRatio: false,
+          plugins: {{ legend: {{ labels: {{ color: '#c9d1d9', font: {{ size: 10 }} }} }} }},
+          scales: {{
+            x: {{ ticks: {{ color: '#8b949e', maxTicksLimit: 15 }}, grid: {{ color: '#21262d' }} }},
+            y: {{ position: 'left', ticks: {{ color: '#8b949e' }}, grid: {{ color: '#21262d' }}, title: {{ display: true, text: '利用率 (%)', color: '#8b949e' }}, min: 0, max: 100 }},
+            y1: {{ position: 'right', ticks: {{ color: '#d29922' }}, grid: {{ drawOnChartArea: false }}, title: {{ display: true, text: '显存 (MB)', color: '#d29922' }} }},
+          }},
+        }},
+      }});
     }}
   }}
 }}
