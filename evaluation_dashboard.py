@@ -31,6 +31,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 app = FastAPI(title="FedScale Evaluation Dashboard")
 
 
+_MODE_LABELS = {
+    "dense": "基线·全量上传",
+    "public_random": "分片·随机轮转",
+    "block_vote_lag": "分片·能量投票",
+    "block_topk": "分片·TopK",
+}
+
+
+def _mode_label(compressor: str) -> str:
+    return _MODE_LABELS.get(compressor or "", compressor or "未知")
+
+
 def _scan_runs(results_dir: Path) -> list[dict]:
     """Scan the results directory for all training runs."""
     runs = []
@@ -65,6 +77,8 @@ def _scan_runs(results_dir: Path) -> list[dict]:
                     "model": meta.get("compressor", ""),
                     "coverage_h": meta.get("coverage_h", ""),
                     "tag": meta.get("tag", ""),
+                    "compressor": meta.get("compressor", ""),
+                    "mode_label": _mode_label(meta.get("compressor", "")),
                 })
             except Exception:
                 pass
@@ -210,6 +224,33 @@ async def view_run(run_id: str):
     return _render_html(runs, selected_run=run_id, run_data=run_data)
 
 
+@app.get("/compare", response_class=HTMLResponse)
+async def compare_runs(run_ids: str = Query(..., description="Comma-separated run IDs")):
+    """Compare multiple runs side by side."""
+    results_dir = _get_results_dir()
+    runs = _scan_runs(results_dir)
+    ids = [r.strip() for r in run_ids.split(",") if r.strip()]
+    compare_data = []
+    for rid in ids:
+        run_dir = results_dir / rid
+        if run_dir.exists():
+            compare_data.append(_load_run_data(run_dir))
+    return _render_compare_html(runs, compare_data)
+
+
+@app.get("/api/compare/{run_ids}")
+async def api_compare_runs(run_ids: str):
+    """API: Compare multiple runs."""
+    results_dir = _get_results_dir()
+    ids = [r.strip() for r in run_ids.split(",") if r.strip()]
+    compare_data = []
+    for rid in ids:
+        run_dir = results_dir / rid
+        if run_dir.exists():
+            compare_data.append(_load_run_data(run_dir))
+    return JSONResponse(compare_data)
+
+
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
@@ -298,19 +339,86 @@ function renderRunList() {{
     container.innerHTML = '<p style="color:#8b949e;font-size:0.85em;">暂无训练记录</p>';
     return;
   }}
-  container.innerHTML = RUNS.map(r => {{
-    const active = r.run_id === SELECTED ? 'active' : '';
-    const statusTag = r.status === 'completed'
-      ? '<span class="tag tag-green">完成</span>'
-      : r.status === 'partial'
-      ? '<span class="tag tag-yellow">部分</span>'
-      : '<span class="tag tag-blue">未知</span>';
-    const evalTag = r.has_offline_eval ? ' <span class="tag tag-blue">离线评估</span>' : '';
-    return `<div class="run-item ${{active}}" onclick="window.location.href='/view/${{r.run_id}}'">
-      <div class="run-id">${{r.run_id}}</div>
-      <div class="run-meta">${{statusTag}} ${{evalTag}} ${{r.completed_rounds || 0}}/${{r.num_rounds || 0}} 轮</div>
-    </div>`;
-  }}).join('');
+  // Group runs by mode_label
+  const groups = {{}};
+  RUNS.forEach(r => {{
+    const mode = r.mode_label || '未知';
+    if (!groups[mode]) groups[mode] = [];
+    groups[mode].push(r);
+  }});
+
+  let html = '';
+  // Compare bar
+  html += '<div id="compare-bar" style="margin-bottom:12px;padding:8px;border:1px solid #30363d;border-radius:6px;background:#161b22;display:none;">';
+  html += '<div style="font-size:0.75em;color:#8b949e;margin-bottom:4px;">已选择对比:</div>';
+  html += '<div id="compare-list" style="font-size:0.8em;"></div>';
+  html += '<button onclick="doCompare()" style="margin-top:6px;padding:4px 12px;font-size:0.8em;background:#1f6feb;color:#fff;border:none;border-radius:4px;cursor:pointer;">开始对比</button>';
+  html += ' <button onclick="clearCompare()" style="margin-top:6px;padding:4px 12px;font-size:0.8em;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;cursor:pointer;">清除</button>';
+  html += '</div>';
+  html += '<button onclick="toggleCompareMode()" id="compare-toggle" style="width:100%;margin-bottom:10px;padding:6px;font-size:0.8em;background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:6px;cursor:pointer;">☑ 多选对比模式</button>';
+
+  Object.entries(groups).forEach(([mode, runs]) => {{
+    html += `<div style="margin-bottom:10px;"><div style="font-size:0.7em;color:#d2a8ff;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;padding:0 4px;">${{mode}}</div>`;
+    runs.forEach(r => {{
+      const active = r.run_id === SELECTED ? 'active' : '';
+      const statusTag = r.status === 'completed'
+        ? '<span class="tag tag-green">完成</span>'
+        : r.status === 'partial'
+        ? '<span class="tag tag-yellow">部分</span>'
+        : '<span class="tag tag-blue">未知</span>';
+      const evalTag = r.has_offline_eval ? ' <span class="tag tag-blue">离线评估</span>' : '';
+      const checkboxClass = 'compare-cb';
+      html += `<div class="run-item ${{active}}" onclick="runClick(event,'${{r.run_id}}')" data-run-id="${{r.run_id}}">
+        <div class="run-id">${{r.run_id}}</div>
+        <div class="run-meta">${{statusTag}} ${{evalTag}} ${{r.completed_rounds || 0}}/${{r.num_rounds || 0}} 轮</div>
+      </div>`;
+    }});
+    html += '</div>';
+  }});
+  container.innerHTML = html;
+}}
+
+let compareMode = false;
+let selectedRuns = new Set();
+function toggleCompareMode() {{
+  compareMode = !compareMode;
+  selectedRuns.clear();
+  document.getElementById('compare-bar').style.display = compareMode ? 'block' : 'none';
+  const btn = document.getElementById('compare-toggle');
+  btn.textContent = compareMode ? '☑ 取消对比模式' : '☑ 多选对比模式';
+  btn.style.background = compareMode ? '#1f6feb' : '#21262d';
+  btn.style.color = compareMode ? '#fff' : '#58a6ff';
+  document.querySelectorAll('.run-item').forEach(el => {{
+    const cb = el.querySelector('.compare-cb');
+    if (cb) cb.style.display = compareMode ? 'inline' : 'none';
+  }});
+  updateCompareList();
+}}
+function runClick(ev, runId) {{
+  if (compareMode) {{
+    ev.preventDefault();
+    if (selectedRuns.has(runId)) selectedRuns.delete(runId);
+    else selectedRuns.add(runId);
+    const el = ev.currentTarget;
+    el.style.borderColor = selectedRuns.has(runId) ? '#f0883e' : '';
+    updateCompareList();
+  }} else {{
+    window.location.href = '/view/' + runId;
+  }}
+}}
+function updateCompareList() {{
+  const el = document.getElementById('compare-list');
+  if (!el) return;
+  el.innerHTML = Array.from(selectedRuns).map(r => `<span class="tag tag-yellow" style="margin-right:4px;">${{r}}</span>`).join('');
+}}
+function doCompare() {{
+  if (selectedRuns.size < 2) {{ alert('请至少选择 2 个训练版本进行对比'); return; }}
+  window.location.href = '/compare?run_ids=' + Array.from(selectedRuns).join(',');
+}}
+function clearCompare() {{
+  selectedRuns.clear();
+  document.querySelectorAll('.run-item').forEach(el => el.style.borderColor = '');
+  updateCompareList();
 }}
 
 // --- Render report ---
@@ -719,6 +827,204 @@ function toggleParams() {{
 
 renderRunList();
 renderReport();
+</script>
+</body>
+</html>"""
+
+
+def _render_compare_html(runs: list[dict], compare_data: list[dict]) -> str:
+    """Render a side-by-side comparison page for multiple runs."""
+    runs_json = json.dumps(runs, ensure_ascii=False)
+    compare_json = json.dumps(compare_data, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FedScale 评估对比</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; }}
+.layout {{ display: flex; min-height: 100vh; }}
+.sidebar {{ width: 280px; background: #161b22; border-right: 1px solid #30363d; padding: 20px; overflow-y: auto; }}
+.main {{ flex: 1; padding: 24px; overflow-y: auto; }}
+h1 {{ color: #58a6ff; font-size: 1.3em; margin-bottom: 16px; }}
+h2 {{ color: #79c0ff; font-size: 1.1em; margin: 24px 0 10px 0; border-bottom: 1px solid #30363d; padding-bottom: 6px; }}
+.run-item {{ padding: 10px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 6px; border: 1px solid transparent; transition: all 0.15s; }}
+.run-item:hover {{ background: #21262d; border-color: #30363d; }}
+.run-id {{ font-weight: 600; color: #e6edf3; font-size: 0.85em; }}
+.run-meta {{ font-size: 0.75em; color: #8b949e; margin-top: 2px; }}
+.tag {{ display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 0.7em; font-weight: 600; }}
+.tag-green {{ background: #1a4731; color: #3fb950; }}
+.tag-yellow {{ background: #3d2e00; color: #d29922; }}
+.tag-blue {{ background: #0c2d6b; color: #58a6ff; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 14px; overflow-x: auto; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.82em; }}
+th {{ background: #21262d; color: #8b949e; text-align: left; padding: 8px 10px; border-bottom: 1px solid #30363d; font-weight: 600; text-transform: uppercase; font-size: 0.7em; letter-spacing: 0.5px; }}
+td {{ padding: 6px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }}
+td:first-child {{ color: #8b949e; }}
+.chart-container {{ position: relative; height: 300px; margin: 12px 0; }}
+.section-label {{ color: #d2a8ff; font-size: 0.8em; margin: 10px 0 6px 0; font-weight: 600; }}
+.col-run {{ color: #e6edf3; font-family: monospace; }}
+.col-best {{ color: #3fb950; font-weight: 600; }}
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <h1>📊 评估对比</h1>
+    <div id="run-list"></div>
+  </div>
+  <div class="main" id="compare-area">
+  </div>
+</div>
+
+<script>
+const RUNS = {runs_json};
+const COMPARE = {compare_json};
+
+function renderRunList() {{
+  const container = document.getElementById('run-list');
+  container.innerHTML = '<p style="color:#8b949e;font-size:0.85em;">对比模式：选择左侧导航查看单版本报告</p>' +
+    RUNS.map(r => '<div class="run-item" onclick="window.location.href=\'/view/' + r.run_id + '\'">' +
+      '<div class="run-id">' + r.run_id + '</div>' +
+      '<div class="run-meta"><span class="tag tag-blue">' + (r.mode_label||'') + '</span> ' + (r.completed_rounds||0) + '/' + (r.num_rounds||0) + '</div>' +
+    '</div>').join('');
+}}
+
+function renderCompare() {{
+  const area = document.getElementById('compare-area');
+  if (!COMPARE.length) {{ area.innerHTML = '<h2>无对比数据</h2>'; return; }}
+
+  const cols = COMPARE.map(d => d.run_id);
+  let html = '<h1>📊 多版本评估对比</h1>';
+  html += '<p style="color:#8b949e;font-size:0.85em;margin-bottom:16px;">' + cols.length + ' 个训练版本：' + cols.join(' vs ') + '</p>';
+
+  function row(label, getValue, formatVal) {{
+    const vals = COMPARE.map(d => getValue(d));
+    let bestIdx = -1;
+    const numeric = vals.map(v => typeof v === 'number' ? v : null);
+    const isMinMetric = label.includes('时间') || label.includes('耗时') || label.includes('(ms)') || label.includes('(s)') || label.includes('(s)') || label.includes('Loss') || label.includes('PPL') || label.includes('Perplexity') || label.includes('Delta') || label.includes('WAN');
+    if (isMinMetric) {{
+      let best = Infinity;
+      numeric.forEach((v, i) => {{ if (v !== null && v < best) {{ best = v; bestIdx = i; }} }});
+    }} else {{
+      let best = -Infinity;
+      numeric.forEach((v, i) => {{ if (v !== null && v > best) {{ best = v; bestIdx = i; }} }});
+    }}
+    let tds = '<td>' + label + '</td>';
+    vals.forEach((v, i) => {{
+      const formatted = formatVal ? formatVal(v) : (v !== null && v !== undefined ? v : '—');
+      const cls = i === bestIdx ? 'col-best' : 'col-run';
+      tds += '<td class="' + cls + '">' + formatted + '</td>';
+    }});
+    return '<tr>' + tds + '</tr>';
+  }}
+
+  // Category 1: Training Performance
+  html += '<h2>⚡ 类别 1: 集群内训练性能</h2><div class="card">';
+  html += '<table><thead><tr><th>指标</th>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+  html += row('平均步时间 (ms)', d => d.metrics_detailed?.training?.avg_step_time_ms);
+  html += row('前向传播 (ms)', d => d.metrics_detailed?.training?.avg_forward_ms);
+  html += row('反向传播 (ms)', d => d.metrics_detailed?.training?.avg_backward_ms);
+  html += row('优化器更新 (ms)', d => d.metrics_detailed?.training?.avg_optimizer_ms);
+  html += row('通信时间 (ms)', d => d.metrics_detailed?.training?.avg_comm_ms);
+  html += row('All-Reduce (ms)', d => d.metrics_detailed?.training?.avg_all_reduce_ms);
+  html += row('All-Gather (ms)', d => d.metrics_detailed?.training?.avg_all_gather_ms);
+  html += row('Reduce-Scatter (ms)', d => d.metrics_detailed?.training?.avg_reduce_scatter_ms);
+  html += row('总训练时间 (s)', d => d.metrics_detailed?.training?.total_train_time_s);
+  html += row('吞吐量 (tokens/s)', d => d.metrics_detailed?.training?.throughput_tokens_per_s);
+  html += row('训练步数', d => d.metrics_detailed?.training?.num_steps);
+  html += '</tbody></table>';
+  html += '<div class="section-label">Loss 趋势对比</div><div class="chart-container"><canvas id="lossCompareChart"></canvas></div>';
+  html += '</div>';
+
+  // Category 2: Resource Usage
+  html += '<h2>🖥️ 类别 2: 集群内资源使用</h2><div class="card">';
+  html += '<table><thead><tr><th>指标</th>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+  html += row('GPU 峰值显存 (GB)', d => d.metrics_detailed?.resources?.gpu_memory_peak_mb ? (d.metrics_detailed.resources.gpu_memory_peak_mb/1024).toFixed(2) : null, v => v !== null ? v + ' GB' : '—');
+  html += row('GPU 利用率 (%)', d => d.metrics_detailed?.resources?.gpu_utilization_avg_pct);
+  html += row('CPU 利用率 (%)', d => d.metrics_detailed?.resources?.cpu_utilization_avg_pct);
+  html += row('CPU 峰值内存 (GB)', d => d.metrics_detailed?.resources?.cpu_memory_peak_mb ? (d.metrics_detailed.resources.cpu_memory_peak_mb/1024).toFixed(2) : null, v => v !== null ? v + ' GB' : '—');
+  html += row('网络总流量 (MB)', d => d.metrics_detailed?.resources?.network_total_bytes ? (d.metrics_detailed.resources.network_total_bytes/1024/1024).toFixed(2) : null, v => v !== null ? v + ' MB' : '—');
+  html += row('NCCL 总字节 (MB)', d => d.metrics_detailed?.resources?.total_nccl_bytes ? (d.metrics_detailed.resources.total_nccl_bytes/1024/1024).toFixed(2) : null, v => v !== null ? v + ' MB' : '—');
+  html += row('NCCL 调用数', d => d.metrics_detailed?.resources?.nccl_collective_calls);
+  html += row('NCCL 平均耗时 (ms)', d => d.metrics_detailed?.resources?.avg_nccl_comm_ms);
+  html += '</tbody></table></div>';
+
+  // Category 3: Federated Timing
+  html += '<h2>🌐 类别 3: 跨中心联邦更新</h2><div class="card">';
+  html += '<table><thead><tr><th>指标</th>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+  html += row('FSDP State Export (s)', d => d.metrics_detailed?.federated?.t_state_export_s);
+  html += row('Model Delta 导出 (s)', d => d.metrics_detailed?.federated?.t_model_delta_export_s);
+  html += row('WAN 下载 (s)', d => d.metrics_detailed?.federated?.wan_download_s);
+  html += row('WAN 上传 (s)', d => d.metrics_detailed?.federated?.wan_upload_s);
+  html += row('Model Delta (MB)', d => d.metrics_detailed?.federated?.model_delta_bytes ? (d.metrics_detailed.federated.model_delta_bytes/1024/1024).toFixed(2) : null, v => v !== null ? v + ' MB' : '—');
+  html += row('训练耗时 (s)', d => d.metrics_detailed?.federated?.training_only_s);
+  html += row('FedAvg 聚合 (s)', d => d.round_log?.[0]?.timing_s?.agg_apply_s);
+  html += row('Server 聚合总时间 (s)', d => d.round_log?.[0]?.timing_s?.agg_total_s);
+  html += row('单轮总时间 (s)', d => d.round_log?.[0]?.timing_s?.round_wall_s);
+  html += '</tbody></table>';
+  html += '<div class="section-label">联邦轮次时间对比</div><div class="chart-container"><canvas id="timingCompareChart"></canvas></div>';
+  html += '</div>';
+
+  // Category 4: Model Accuracy
+  html += '<h2>🏆 类别 4: 模型微调准确度</h2><div class="card">';
+  html += '<table><thead><tr><th>指标</th>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+  html += row('Validation Loss', d => d.offline_eval?.validation?.val_loss);
+  html += row('Perplexity', d => d.offline_eval?.validation?.perplexity);
+  html += row('ROUGE-L F1', d => d.offline_eval?.generation?.rouge_l?.f1);
+  html += row('BERTScore F1', d => d.offline_eval?.generation?.bertscore?.f1);
+  html += row('Token Overlap Acc', d => d.offline_eval?.generation?.token_overlap_accuracy);
+  html += row('Macro F1', d => d.offline_eval?.generation?.macro_f1);
+  html += row('Exact Match', d => d.offline_eval?.generation?.exact_match);
+  const hasOnlineEval = COMPARE.some(d => d.round_log?.some(r => r.eval_loss !== null));
+  if (hasOnlineEval) {{
+    html += row('在线 Eval Loss (首轮)', d => d.round_log?.find(r => r.eval_loss !== null)?.eval_loss);
+    html += row('在线 Eval Loss (末轮)', d => {{ const evals = (d.round_log||[]).filter(r => r.eval_loss !== null); return evals.length ? evals[evals.length-1].eval_loss : null; }});
+    html += row('在线 Train Loss (首轮)', d => d.round_log?.[0]?.avg_train_loss);
+    html += row('在线 Train Loss (末轮)', d => d.round_log?.[d.round_log.length-1]?.avg_train_loss);
+  }}
+  html += '</tbody></table></div>';
+
+  area.innerHTML = html;
+
+  // Loss comparison chart
+  const lossCtx = document.getElementById('lossCompareChart');
+  if (lossCtx) {{
+    const maxRounds = Math.max(...COMPARE.map(d => (d.round_log||[]).length));
+    const labels = Array.from({{length: maxRounds}}, (_, i) => 'Round ' + (i+1));
+    const datasets = [];
+    const colors = ['#f85149', '#3fb950', '#58a6ff', '#d29922', '#bc8cff', '#f0883e'];
+    COMPARE.forEach((d, i) => {{
+      const color = colors[i % colors.length];
+      datasets.push({{ label: d.run_id + ' (train)', data: (d.round_log||[]).map(r => r.avg_train_loss), borderColor: color, backgroundColor: color + '20', fill: false, tension: 0.3, pointRadius: 3 }});
+      const evalData = (d.round_log||[]).map(r => r.eval_loss);
+      if (evalData.some(v => v !== null)) {{
+        datasets.push({{ label: d.run_id + ' (eval)', data: evalData, borderColor: color, backgroundColor: color + '20', fill: false, tension: 0.3, pointRadius: 4, borderDash: [5, 5], spanGaps: true }});
+      }}
+    }});
+    new Chart(lossCtx, {{ type: 'line', data: {{ labels, datasets }}, options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#c9d1d9', font: {{ size: 10 }} }} }} }}, scales: {{ x: {{ ticks: {{ color: '#8b949e' }}, grid: {{ color: '#21262d' }} }}, y: {{ ticks: {{ color: '#8b949e' }}, grid: {{ color: '#21262d' }}, title: {{ display: true, text: 'Loss', color: '#8b949e' }} }} }} }} }});
+  }}
+
+  // Timing comparison chart
+  const timingCtx = document.getElementById('timingCompareChart');
+  if (timingCtx) {{
+    const maxRounds = Math.max(...COMPARE.map(d => (d.round_log||[]).length));
+    const labels = Array.from({{length: maxRounds}}, (_, i) => 'Round ' + (i+1));
+    const datasets = [];
+    const colors = ['#58a6ff', '#3fb950', '#f85149', '#d29922', '#bc8cff', '#f0883e'];
+    COMPARE.forEach((d, i) => {{
+      datasets.push({{ label: d.run_id, data: (d.round_log||[]).map(r => r.timing_s?.round_wall_s || 0), borderColor: colors[i % colors.length], backgroundColor: colors[i % colors.length] + '20', fill: false, tension: 0.3, pointRadius: 3 }});
+    }});
+    new Chart(timingCtx, {{ type: 'line', data: {{ labels, datasets }}, options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#c9d1d9', font: {{ size: 10 }} }} }} }}, scales: {{ x: {{ ticks: {{ color: '#8b949e' }}, grid: {{ color: '#21262d' }} }}, y: {{ ticks: {{ color: '#8b949e' }}, grid: {{ color: '#21262d' }}, title: {{ display: true, text: '秒', color: '#8b949e' }} }} }} }} }});
+  }}
+}}
+
+renderRunList();
+renderCompare();
 </script>
 </body>
 </html>"""
