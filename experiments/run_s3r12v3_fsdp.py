@@ -329,6 +329,23 @@ def train_local_steps(
     from collections import defaultdict as _dd
     _nccl_stats: dict = _dd(lambda: {"count": 0, "total_us": 0, "bytes": 0})
 
+    # Estimate NCCL communication bytes from model parameter count and FSDP pattern.
+    # FSDP FULL_SHARD per optimizer step:
+    #   - All-Gather: collect full params from all ranks  → bytes = total_params * dtype_size
+    #   - Reduce-Scatter: scatter grad shards             → bytes = total_params / world_size * dtype_size
+    #   - All-Reduce (if used): equivalent to RS + AG      → bytes = total_params * 2 / world_size * dtype_size
+    _fsdp_param_count = 0
+    try:
+        _fsdp_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    except Exception:
+        pass
+    _world_size = getattr(accelerator, 'num_processes', 1) or 1
+    _dtype_bytes = 2  # fp16
+    # Per-step estimates: FSDP does 1 All-Gather (unshard before fwd) + 1 Reduce-Scatter (grad sync)
+    _est_ar_bytes = 0  # All-Reduce not typically used in FSDP
+    _est_ag_bytes = _fsdp_param_count * _dtype_bytes      # full param gather per step
+    _est_rs_bytes = _fsdp_param_count * _dtype_bytes // _world_size  # grad shard per step
+
     def _make_profiler():
         """Create a torch.profiler instance that tracks NCCL collectives."""
         try:
@@ -388,7 +405,6 @@ def train_local_steps(
                                       "reduce_scatter" if "reduce_scatter" in key.lower() else "other_nccl"
                                 _nccl_stats[cat]["count"] += evt.count
                                 _nccl_stats[cat]["total_us"] += evt.self_device_time_total if hasattr(evt, 'self_device_time_total') else 0
-                                _nccl_stats[cat]["bytes"] += getattr(evt, 'flops', 0) or 0
                         _prof = _make_profiler()  # Fresh profiler for next step
                     except Exception:
                         _prof = _make_profiler()
@@ -405,9 +421,9 @@ def train_local_steps(
                 ar_ms = round(_nccl_stats["all_reduce"]["total_us"] / 1000.0 / max(_nccl_stats["all_reduce"]["count"], 1), 2) if _nccl_stats["all_reduce"]["count"] > 0 else 0.0
                 ag_ms = round(_nccl_stats["all_gather"]["total_us"] / 1000.0 / max(_nccl_stats["all_gather"]["count"], 1), 2) if _nccl_stats["all_gather"]["count"] > 0 else 0.0
                 rs_ms = round(_nccl_stats["reduce_scatter"]["total_us"] / 1000.0 / max(_nccl_stats["reduce_scatter"]["count"], 1), 2) if _nccl_stats["reduce_scatter"]["count"] > 0 else 0.0
-                ar_bytes = int(_nccl_stats["all_reduce"]["bytes"])
-                ag_bytes = int(_nccl_stats["all_gather"]["bytes"])
-                rs_bytes = int(_nccl_stats["reduce_scatter"]["bytes"])
+                ar_bytes = _est_ar_bytes
+                ag_bytes = _est_ag_bytes
+                rs_bytes = _est_rs_bytes
                 # Sample resource utilization during active training
                 _gpu_u = _sample_gpu_util()
                 _cpu_u = _sample_cpu_util()

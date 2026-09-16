@@ -619,10 +619,10 @@ function renderReport() {{
     if (r.network_total_bytes !== null && r.network_total_bytes !== undefined) {{
       html += `<div class="param-section-label">网络 & NCCL 开销</div>`;
       html += `<div class="metric-grid">`;
-      html += box('网络接收', r.network_rx_bytes !== null ? (r.network_rx_bytes/1024/1024).toFixed(2) : '—', 'MB');
-      html += box('网络发送', r.network_tx_bytes !== null ? (r.network_tx_bytes/1024/1024).toFixed(2) : '—', 'MB');
-      html += box('网络总流量', (r.network_total_bytes/1024/1024).toFixed(2), 'MB');
-      html += box('NCCL 总字节', r.total_nccl_bytes > 0 ? (r.total_nccl_bytes/1024/1024).toFixed(2) : '—', 'MB');
+      html += box('网络接收', fmtBytes(r.network_rx_bytes), '');
+      html += box('网络发送', fmtBytes(r.network_tx_bytes), '');
+      html += box('网络总流量', fmtBytes(r.network_total_bytes), '');
+      html += box('NCCL 总字节', r.total_nccl_bytes > 0 ? fmtBytes(r.total_nccl_bytes) : '—', '');
       html += box('NCCL 调用数', r.nccl_collective_calls || '—', '');
       html += box('NCCL 平均耗时', r.avg_nccl_comm_ms || '—', 'ms');
       html += `</div>`;
@@ -848,6 +848,15 @@ function renderReport() {{
   }}
 }}
 
+function fmtBytes(bytes) {{
+  if (bytes === null || bytes === undefined) return '—';
+  const gb = bytes / 1024 / 1024 / 1024;
+  const mb = bytes / 1024 / 1024;
+  if (gb >= 1) return gb.toFixed(2) + ' GB';
+  if (mb >= 1) return mb.toFixed(2) + ' MB';
+  return (bytes / 1024).toFixed(2) + ' KB';
+}}
+
 function box(label, value, unit) {{
   return `<div class="metric-box"><div class="metric-label">${{label}}</div><div class="metric-value">${{value ?? '—'}} <span class="metric-unit">${{unit || ''}}</span></div></div>`;
 }}
@@ -924,6 +933,15 @@ td:first-child {{ color: #8b949e; }}
 const RUNS = {runs_json};
 const COMPARE = {compare_json};
 
+function fmtBytes(bytes) {{
+  if (bytes === null || bytes === undefined || bytes === 0) return '—';
+  const gb = bytes / 1024 / 1024 / 1024;
+  const mb = bytes / 1024 / 1024;
+  if (gb >= 1) return gb.toFixed(2) + ' GB';
+  if (mb >= 1) return mb.toFixed(2) + ' MB';
+  return (bytes / 1024).toFixed(2) + ' KB';
+}}
+
 function renderRunList() {{
   const container = document.getElementById('run-list');
   container.innerHTML = '<p style="color:#8b949e;font-size:0.85em;">对比模式：选择左侧导航查看单版本报告</p>' +
@@ -990,8 +1008,8 @@ function renderCompare() {{
   html += row('GPU 利用率 (%)', d => d.metrics_detailed?.resources?.gpu_utilization_avg_pct);
   html += row('CPU 利用率 (%)', d => d.metrics_detailed?.resources?.cpu_utilization_avg_pct);
   html += row('CPU 峰值内存 (GB)', d => d.metrics_detailed?.resources?.cpu_memory_peak_mb ? (d.metrics_detailed.resources.cpu_memory_peak_mb/1024).toFixed(2) : null, v => v !== null ? v + ' GB' : '—');
-  html += row('网络总流量 (MB)', d => d.metrics_detailed?.resources?.network_total_bytes ? (d.metrics_detailed.resources.network_total_bytes/1024/1024).toFixed(2) : null, v => v !== null ? v + ' MB' : '—');
-  html += row('NCCL 总字节 (MB)', d => d.metrics_detailed?.resources?.total_nccl_bytes ? (d.metrics_detailed.resources.total_nccl_bytes/1024/1024).toFixed(2) : null, v => v !== null ? v + ' MB' : '—');
+  html += row('网络总流量', d => d.metrics_detailed?.resources?.network_total_bytes, v => fmtBytes(v));
+  html += row('NCCL 总字节', d => d.metrics_detailed?.resources?.total_nccl_bytes > 0 ? d.metrics_detailed.resources.total_nccl_bytes : null, v => fmtBytes(v));
   html += row('NCCL 调用数', d => d.metrics_detailed?.resources?.nccl_collective_calls);
   html += row('NCCL 平均耗时 (ms)', d => d.metrics_detailed?.resources?.avg_nccl_comm_ms);
   html += '</tbody></table></div>';
