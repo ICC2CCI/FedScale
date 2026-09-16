@@ -259,6 +259,18 @@ td {{ padding: 6px 10px; border-bottom: 1px solid #21262d; }}
 .placeholder {{ text-align: center; padding: 60px 20px; color: #8b949e; }}
 .placeholder h2 {{ border: none; color: #484f58; }}
 .compare-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+.param-core {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }}
+.param-full {{ margin-top: 12px; border-top: 1px solid #30363d; padding-top: 12px; }}
+.param-toggle {{ display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: #58a6ff; font-size: 0.8em; background: none; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; margin-top: 10px; transition: all 0.15s; }}
+.param-toggle:hover {{ background: #21262d; }}
+.param-toggle .arrow {{ transition: transform 0.2s; display: inline-block; }}
+.param-toggle.open .arrow {{ transform: rotate(90deg); }}
+.param-full {{ display: none; }}
+.param-full.open {{ display: block; }}
+.param-table {{ width: 100%; font-size: 0.78em; }}
+.param-table td:first-child {{ color: #8b949e; width: 45%; }}
+.param-table td:last-child {{ color: #e6edf3; font-family: monospace; }}
+.param-section-label {{ color: #d2a8ff; font-size: 0.8em; margin: 10px 0 6px 0; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -316,6 +328,113 @@ function renderReport() {{
   html += `<p style="color:#8b949e;font-size:0.85em;margin-bottom:16px;">`;
   if (meta.num_rounds) html += `${{meta.num_rounds}} 轮 | ${{meta.num_clients}} 客户端 | ${{meta.transfer_dtype || 'fp16'}} | coverage_h=${{meta.coverage_h}}`;
   html += `</p>`;
+
+  // --- Training Parameters ---
+  const ec = meta.effective_config || {{}};
+  // GPU count: infer from metrics_detailed device or accelerate config
+  let gpuPerClient = '—';
+  if (md && md.training && md.training.num_steps !== undefined) {{
+    // FSDP runs 8 GPUs per node; we can't always infer, use known config
+    gpuPerClient = 8;
+  }}
+  const totalGPUs = (meta.num_clients || 0) * (gpuPerClient === '—' ? 0 : gpuPerClient);
+
+  // Core params (always visible)
+  html += `<h2>⚙️ 训练参数</h2><div class="card">`;
+  html += `<div class="param-core">`;
+  html += box('模型', 'Qwen2.5-0.5B', '');
+  html += box('GPU 总数', totalGPUs > 0 ? totalGPUs : '—', gpuPerClient !== '—' ? `${{meta.num_clients}}×${{gpuPerClient}}` : '');
+  html += box('客户端数', meta.num_clients || '—', '');
+  html += box('联邦轮数', meta.num_rounds || '—', '');
+  html += box('学习率', (ec.lr || 1e-5).toExponential(1), '');
+  html += box('Batch Size', ec.batch_size || 8, '');
+  html += box('Local Steps', ec.local_steps || 10, '');
+  html += box('梯度累积', ec.grad_accum || 2, '');
+  html += box('序列长度', ec.seq_len || 512, '');
+  html += `</div>`;
+
+  html += `<div class="param-section-label">分片 / 联邦参数</div>`;
+  html += `<div class="param-core">`;
+  html += box('分片模式', meta.compressor || 'public_random', '');
+  html += box('Coverage H', meta.coverage_h || '—', '');
+  html += box('每轮上传比例', meta.coverage_h ? (100/meta.coverage_h).toFixed(1) : '—', '%');
+  html += box('Block Size', meta.block_size || '—', '元素');
+  html += box('通信精度', meta.transfer_dtype || 'fp16', '');
+  html += box('Memory Decay', meta.memory_decay || '—', '');
+  html += box('Slots/Round', meta.slots_per_round || 1, '');
+  html += box('Rho', meta.rho !== undefined ? meta.rho : '—', '');
+  html += `</div>`;
+
+  // Toggle for full params
+  html += `<button class="param-toggle" onclick="toggleParams()"><span class="arrow">▶</span> 展开完整参数</button>`;
+
+  // Full params (hidden by default)
+  html += `<div class="param-full" id="paramFull">`;
+  html += `<div class="compare-grid">`;
+  // Left: federated / sharding params
+  html += `<div>`;
+  html += `<div class="param-section-label">联邦 & 分片</div>`;
+  html += `<table class="param-table">`;
+  const fedParams = [
+    ['num_clients', meta.num_clients],
+    ['num_rounds', meta.num_rounds],
+    ['coverage_h', meta.coverage_h],
+    ['slots_per_round', meta.slots_per_round],
+    ['seed', meta.seed],
+    ['compressor', meta.compressor],
+    ['block_size', meta.block_size],
+    ['transfer_dtype', meta.transfer_dtype],
+    ['memory_decay', meta.memory_decay],
+    ['rho', meta.rho],
+    ['write_full_global_every_n_rounds', meta.write_full_global_every_n_rounds],
+    ['min_clients_to_aggregate', ec.min_clients_to_aggregate],
+    ['client_upload_timeout_s', ec.client_upload_timeout_s],
+    ['round_deadline_s', ec.round_deadline_s],
+    ['resume_from_round', ec.resume_from_round || meta.resume_from_round],
+  ];
+  fedParams.forEach(([k, v]) => html += `<tr><td>${{k}}</td><td>${{v ?? '—'}}</td></tr>`);
+  html += `</table>`;
+  html += `</div>`;
+  // Right: training / security / eval params
+  html += `<div>`;
+  html += `<div class="param-section-label">训练 & 评估</div>`;
+  html += `<table class="param-table">`;
+  const trainParams = [
+    ['local_steps', ec.local_steps || 10],
+    ['batch_size', ec.batch_size || 8],
+    ['grad_accum', ec.grad_accum || 2],
+    ['lr', (ec.lr || 1e-5).toExponential(2)],
+    ['seq_len', ec.seq_len || 512],
+    ['eval_every_n_rounds', ec.eval_every_n_rounds || '—'],
+    ['eval_path', ec.eval_path || 'data/medical_flashcards_eval.json'],
+    ['skip_round0_download', ec.skip_round0_download],
+    ['online_eval', ec.online_eval],
+    ['sec_upload_privacy', ec.sec_upload_privacy],
+    ['auth_token', ec.auth_token !== undefined ? (ec.auth_token ? '已设置' : '无') : '—'],
+    ['tls', ec.tls],
+    ['minio_retention_recent_uploads', ec.minio_retention_recent_uploads],
+    ['gpu_per_client', gpuPerClient],
+    ['total_gpus', totalGPUs > 0 ? totalGPUs : '—'],
+  ];
+  trainParams.forEach(([k, v]) => html += `<tr><td>${{k}}</td><td>${{v ?? '—'}}</td></tr>`);
+  html += `</table>`;
+  html += `</div>`;
+  html += `</div>`;
+
+  // Round-level sharding detail
+  if (rl.length) {{
+    const r0 = rl[0];
+    html += `<div class="param-section-label">首轮分片详情</div>`;
+    html += `<table class="param-table">`;
+    html += `<tr><td>选中 block 数</td><td>${{r0.n_selected_blocks}}</td></tr>`;
+    html += `<tr><td>选中元素</td><td>${{r0.selected_elems_M}}M (${{r0.pct_of_total}}%)</td></tr>`;
+    html += `<tr><td>Epoch / Slot</td><td>${{r0.epoch}} / ${{r0.slot}}</td></tr>`;
+    html += `<tr><td>写入全量模型</td><td>${{r0.wrote_full_global ? '是' : '否'}}</td></tr>`;
+    html += `<tr><td>参与客户端</td><td>${{(r0.participated_clients || []).join(', ')}}</td></tr>`;
+    html += `</table>`;
+  }}
+  html += `</div>`; // end param-full
+  html += `</div>`; // end card
 
   // --- Loss trend chart ---
   if (rl.length) {{
@@ -544,6 +663,18 @@ function renderReport() {{
 
 function box(label, value, unit) {{
   return `<div class="metric-box"><div class="metric-label">${{label}}</div><div class="metric-value">${{value ?? '—'}} <span class="metric-unit">${{unit || ''}}</span></div></div>`;
+}}
+
+function toggleParams() {{
+  const full = document.getElementById('paramFull');
+  const btn = full.previousElementSibling;
+  full.classList.toggle('open');
+  btn.classList.toggle('open');
+  if (full.classList.contains('open')) {{
+    btn.innerHTML = '<span class="arrow">▶</span> 收起完整参数';
+  }} else {{
+    btn.innerHTML = '<span class="arrow">▶</span> 展开完整参数';
+  }}
 }}
 
 renderRunList();
