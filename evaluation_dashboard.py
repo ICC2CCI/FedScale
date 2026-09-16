@@ -888,10 +888,13 @@ const COMPARE = {compare_json};
 function renderRunList() {{
   const container = document.getElementById('run-list');
   container.innerHTML = '<p style="color:#8b949e;font-size:0.85em;">对比模式：选择左侧导航查看单版本报告</p>' +
-    RUNS.map(r => '<div class="run-item" onclick="window.location.href=\'/view/' + r.run_id + '\'">' +
+    RUNS.map(r => '<div class="run-item" data-run-id="' + r.run_id + '">' +
       '<div class="run-id">' + r.run_id + '</div>' +
       '<div class="run-meta"><span class="tag tag-blue">' + (r.mode_label||'') + '</span> ' + (r.completed_rounds||0) + '/' + (r.num_rounds||0) + '</div>' +
     '</div>').join('');
+  document.querySelectorAll('#run-list .run-item').forEach(function(el) {{
+    el.addEventListener('click', function() {{ window.location.href = '/view/' + el.dataset.runId; }});
+  }});
 }}
 
 function renderCompare() {{
