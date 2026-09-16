@@ -1,7 +1,7 @@
 # S3R12v3 FSDP evaluation run config (20 rounds)
 federated:
   num_clients: 2
-  num_rounds: 20
+  num_rounds: 10
   coverage_h: 10
   slots_per_round: 1
   seed: 20260831
