@@ -1,0 +1,43 @@
+# S3R12v3 FSDP evaluation run config (20 rounds)
+federated:
+  num_clients: 2
+  num_rounds: 20
+  coverage_h: 10
+  slots_per_round: 1
+  seed: 20260831
+  transfer_dtype: fp16
+  memory_decay: 0.9
+  block_size: 524288
+
+train:
+  local_steps: 30
+  batch_size: 8
+  grad_accum: 2
+  lr: 1.0e-5
+  seq_len: 512
+
+io:
+  skip_round0_download: true
+  online_eval: true
+  write_full_global_every_n_rounds: 0
+  client_upload_timeout_s: 1800
+
+eval:
+  eval_path: data/medical_flashcards_eval.json
+  eval_max_batches: 0
+  eval_every_n_rounds: 5
+
+sync:
+  min_clients_to_aggregate: 0
+  round_deadline_s: 0
+
+security:
+  auth_token: ""
+  tls: false
+  sec_upload_privacy: true
+
+resume:
+  resume_from_round: 0
+
+ops:
+  minio_retention_recent_uploads: 0
