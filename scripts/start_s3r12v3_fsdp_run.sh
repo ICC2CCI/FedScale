@@ -9,6 +9,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source "${ROOT}/deployment/central-server.env"
+# 允许启动前覆盖端口（SecAgg 验证用 8081；env 文件默认 8080）
+if [[ -n "${AGGREGATION_PORT_OVERRIDE:-}" ]]; then
+  AGGREGATION_PORT="$AGGREGATION_PORT_OVERRIDE"
+  SERVER_URL="http://${CENTRAL_SERVER_IP}:${AGGREGATION_PORT}"
+fi
+if [[ -n "${SERVER_URL_OVERRIDE:-}" ]]; then
+  SERVER_URL="$SERVER_URL_OVERRIDE"
+fi
 # shellcheck disable=SC1091
 source "${ROOT}/scripts/_yaml_env.sh"
 
@@ -62,6 +70,9 @@ SECAGG_ENABLED="$(yaml_get YCFG_ SECAGG_ENABLED false)"
 SECAGG_MODULUS_BITS="$(yaml_get YCFG_ SECAGG_MODULUS_BITS 16)"
 SECAGG_SCALE="$(yaml_get YCFG_ SECAGG_SCALE 0.0)"
 SECAGG_Q_MIN="$(yaml_get YCFG_ SECAGG_Q_MIN 0)"
+SECAGG_HADAMARD="$(yaml_get YCFG_ SECAGG_HADAMARD false)"
+SECAGG_STOCHASTIC="$(yaml_get YCFG_ SECAGG_STOCHASTIC_ROUNDING false)"
+QUANT_RESIDUAL_DECAY="$(yaml_get YCFG_ QUANT_RESIDUAL_DECAY 1.0)"
 
 # 允许 env 覆盖 yaml（联调快速调参）
 NUM_CLIENTS="${NUM_CLIENTS_ENV:-$NUM_CLIENTS}"
@@ -164,7 +175,11 @@ auth_flag=""
 sec_privacy_flag=""
 [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && sec_privacy_flag="--sec-upload-privacy"
 secagg_flag=""
-[[ "$SECAGG_ENABLED" == "true" ]] && secagg_flag="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN}"
+if [[ "$SECAGG_ENABLED" == "true" ]]; then
+  secagg_flag="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN}"
+  [[ "$SECAGG_HADAMARD" == "true" ]] && secagg_flag+=" --secagg-hadamard"
+  [[ "$SECAGG_STOCHASTIC" == "true" ]] && secagg_flag+=" --secagg-stochastic-rounding"
+fi
 
 # SEC-5：TLS 证书（自签名，自动生成/复用）
 TLS_CERT="" ; TLS_KEY=""
@@ -293,7 +308,11 @@ for plan_json in "${CLIENT_PLANS[@]}"; do
   SEC_PRIVACY_FLAG=""
   [[ "$SEC_UPLOAD_PRIVACY" == "true" ]] && SEC_PRIVACY_FLAG="--sec-upload-privacy"
   SECAGG_FLAG=""
-  [[ "$SECAGG_ENABLED" == "true" ]] && SECAGG_FLAG="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN}"
+  if [[ "$SECAGG_ENABLED" == "true" ]]; then
+    SECAGG_FLAG="--secagg-enabled --secagg-modulus-bits ${SECAGG_MODULUS_BITS} --secagg-scale ${SECAGG_SCALE} --secagg-q-min ${SECAGG_Q_MIN} --quant-residual-decay ${QUANT_RESIDUAL_DECAY}"
+    [[ "$SECAGG_HADAMARD" == "true" ]] && SECAGG_FLAG+=" --secagg-hadamard"
+    [[ "$SECAGG_STOCHASTIC" == "true" ]] && SECAGG_FLAG+=" --secagg-stochastic-rounding"
+  fi
   TLS_NO_VERIFY_FLAG="--no-tls-no-verify"
   [[ "$TLS_ENABLED" == "true" ]] && TLS_NO_VERIFY_FLAG="--tls-no-verify"
 

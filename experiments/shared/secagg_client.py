@@ -14,7 +14,15 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from shared.block_selection import BlockDelta, _lookup_quant_residual_slice
 from shared.fixed_point import quantize_to_zq, quantize_to_zq_with_feedback
+from shared.fixed_point import (
+    generate_rademacher_signs,
+    hadamard_transform,
+    inverse_hadamard_transform,
+    hadamard_work_length,
+    pad_to_length,
+)
 from shared.protocol import SecAggPlan, WindowDescriptor
 from shared.secagg_crypto import (
     apply_mask,
@@ -99,25 +107,47 @@ class SecAggClient:
         z_k = q_k + Σ_{l>k} R_kl - Σ_{l<k} R_lk + B_k  (mod q)
 
         return_feedback=True 时返回 (z_k, residual, stats)，residual 用于 memory error-feedback。
+
+        如果 plan.hadamard_enabled=True，先 pad 到 2 的幂再旋转 y = FWHT(D*x)。
+        residual 逆变换后裁回原始长度。
         """
+        if not self.plan.secagg_session_id:
+            raise RuntimeError(
+                "SecAgg: secagg_session_id is empty; apply peer-keys session before mask_window"
+            )
+
         q = self.plan.modulus_q
         q_max = self.plan.q_max
         scale = self.plan.get_window_scale(window.window_id)
         stochastic = self.plan.stochastic_rounding
 
-        # 1. 定点量化（per-window scale）
+        orig = delta_slice.to(dtype=torch.float32).reshape(-1)
+        orig_len = int(orig.numel())
+        work_len = hadamard_work_length(orig_len, self.plan.hadamard_enabled)
+        quant_input = pad_to_length(orig, work_len) if work_len != orig_len else orig.contiguous()
+        signs = None
+        if self.plan.hadamard_enabled and work_len > 0:
+            seed = self.plan.hadamard_seed + window.window_id
+            signs = generate_rademacher_signs(work_len, seed)
+            quant_input = hadamard_transform(quant_input, signs)
+
+        # 1. 定点量化（per-window / global scale）
         if return_feedback:
-            q_k, residual, stats = quantize_to_zq_with_feedback(
-                delta_slice, scale, q_max, q, stochastic=stochastic,
+            q_k, residual_y, stats = quantize_to_zq_with_feedback(
+                quant_input, scale, q_max, q, stochastic=stochastic,
             )
+            if signs is not None:
+                residual = inverse_hadamard_transform(residual_y, signs)
+            else:
+                residual = residual_y
+            residual = residual.reshape(-1)[:orig_len].contiguous()
         else:
-            q_k = quantize_to_zq(delta_slice, scale, q_max, q, stochastic=stochastic)
+            q_k = quantize_to_zq(quant_input, scale, q_max, q, stochastic=stochastic)
             residual, stats = None, None
 
-        # 2. 生成 pairwise masks
+        # 2. 生成 pairwise masks（长度 = work_len，与量化向量一致）
         pairwise_masks: List[Tuple[int, torch.Tensor]] = []
         for peer_id, shared_secret in self.peer_secrets.items():
-            # 派生 pair_seed
             domain = build_pair_domain_info(
                 session_id=self.plan.secagg_session_id,
                 attempt_id=self.plan.attempt_id,
@@ -137,7 +167,7 @@ class SecAggClient:
                 window_layout_hash=window.window_layout_hash,
                 client_a_id=self.client_id,
                 client_b_id=peer_id,
-                vector_len=window.vector_length,
+                vector_len=work_len,
                 q=q,
             )
             pairwise_masks.append((peer_id, R))
@@ -150,7 +180,7 @@ class SecAggClient:
             client_id=self.client_id,
             window_id=window.window_id,
             window_layout_hash=window.window_layout_hash,
-            vector_len=window.vector_length,
+            vector_len=work_len,
             q=q,
         )
 
@@ -176,6 +206,26 @@ class SecAggClient:
         return results
 
 
+def _flat_fp32_slice(
+    tensor: Optional[torch.Tensor],
+    start: int,
+    end: int,
+    length: int,
+) -> torch.Tensor:
+    if tensor is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return torch.zeros(length, dtype=torch.float32)
+    flat = tensor.detach().contiguous().view(-1).to(dtype=torch.float32)
+    s = min(max(int(start), 0), int(flat.numel()))
+    e = min(max(int(end), s), int(flat.numel()))
+    sl = flat[s:e]
+    if sl.numel() == length:
+        return sl.contiguous()
+    padded = torch.zeros(length, dtype=torch.float32)
+    if sl.numel() > 0:
+        padded[: sl.numel()] = sl
+    return padded
+
+
 def extract_window_slices(
     to_send: Dict[str, torch.Tensor],
     windows: List[WindowDescriptor],
@@ -183,29 +233,114 @@ def extract_window_slices(
     """从 fp32/fp16 state 抽出每个 window 的 fp32 slice（量化必须用 fp32，不要先转 fp16）。"""
     slices: Dict[int, torch.Tensor] = {}
     for window in windows:
-        tensor = to_send.get(window.key_name)
-        if tensor is None or not tensor.is_floating_point():
-            slices[window.window_id] = torch.zeros(window.vector_length, dtype=torch.float32)
-            continue
-        flat = tensor.contiguous().view(-1)
-        end = min(int(window.end), int(flat.numel()))
-        start = min(int(window.start), end)
-        sl = flat[start:end].detach().to(dtype=torch.float32)
-        if sl.numel() < window.vector_length:
-            padded = torch.zeros(window.vector_length, dtype=torch.float32)
-            if sl.numel() > 0:
-                padded[: sl.numel()] = sl
-            sl = padded
-        slices[window.window_id] = sl.contiguous()
+        slices[window.window_id] = _flat_fp32_slice(
+            to_send.get(window.key_name),
+            window.start,
+            window.end,
+            window.vector_length,
+        )
     return slices
 
 
-def window_amax_payload(slices: Dict[int, torch.Tensor]) -> Dict[str, float]:
-    """构造 key-announce 用的 per-window max|delta|（JSON 键必须是 str）。"""
+def extract_window_to_send_fp32(
+    local_state: Dict[str, torch.Tensor],
+    global_state: Dict[str, torch.Tensor],
+    block_memory: Dict[str, torch.Tensor],
+    quant_residual: BlockDelta,
+    windows: List[WindowDescriptor],
+) -> Dict[int, torch.Tensor]:
+    """按 window 在 FP32 中计算 x = delta + block_memory + quant_residual。
+
+    不物化完整 FP32 state，也不在量化前 round 回 FP16。
+    """
+    slices: Dict[int, torch.Tensor] = {}
+    for window in windows:
+        length = int(window.vector_length)
+        local_sl = _flat_fp32_slice(local_state.get(window.key_name), window.start, window.end, length)
+        global_sl = _flat_fp32_slice(
+            global_state.get(window.key_name) if global_state is not None else None,
+            window.start,
+            window.end,
+            length,
+        )
+        mem_sl = _flat_fp32_slice(
+            block_memory.get(window.key_name) if block_memory is not None else None,
+            window.start,
+            window.end,
+            length,
+        )
+        x = local_sl - global_sl + mem_sl
+        res = _lookup_quant_residual_slice(
+            quant_residual or {}, window.key_name, window.start, window.end,
+        )
+        if res is not None:
+            res_f = res.detach().to(dtype=torch.float32).reshape(-1)
+            n = min(int(res_f.numel()), length)
+            if n > 0:
+                x[:n] = x[:n] + res_f[:n]
+        slices[window.window_id] = x.contiguous()
+    return slices
+
+
+def window_quant_input_and_amax(
+    delta_slice: torch.Tensor,
+    window: WindowDescriptor,
+    plan: SecAggPlan,
+) -> Tuple[torch.Tensor, float, Optional[torch.Tensor]]:
+    """返回量化域输入、amax，以及 Hadamard signs（未旋转时 signs=None）。"""
+    quant_input = delta_slice.to(dtype=torch.float32).reshape(-1)
+    signs = None
+    if plan.hadamard_enabled:
+        work_len = hadamard_work_length(int(quant_input.numel()), True)
+        quant_input = pad_to_length(quant_input, work_len)
+        if work_len > 0:
+            seed = plan.hadamard_seed + window.window_id
+            signs = generate_rademacher_signs(work_len, seed)
+            quant_input = hadamard_transform(quant_input, signs)
+    amax = float(quant_input.abs().max().item()) if quant_input.numel() else 0.0
+    return quant_input, amax, signs
+
+
+def window_amax_payload(
+    slices: Dict[int, torch.Tensor],
+    windows: Optional[List[WindowDescriptor]] = None,
+    plan: Optional[SecAggPlan] = None,
+) -> Dict[str, float]:
+    """构造 key-announce 用的 per-window max|delta|（JSON 键必须是 str）。
+
+    仅非 Hadamard 路径使用。Hadamard 路径请用 global_amax_from_slices，
+    避免把 269 个 per-window L∞ 泄露给 server。
+    """
+    window_by_id = {w.window_id: w for w in (windows or [])}
     out: Dict[str, float] = {}
     for wid, tensor in slices.items():
+        window = window_by_id.get(int(wid))
+        if plan is not None and window is not None and plan.hadamard_enabled:
+            _quant_input, amax, _signs = window_quant_input_and_amax(tensor, window, plan)
+            out[str(wid)] = amax
+            continue
         if tensor is None or tensor.numel() == 0:
             out[str(wid)] = 0.0
         else:
             out[str(wid)] = float(tensor.abs().max().item())
     return out
+
+
+def global_amax_from_slices(
+    slices: Dict[int, torch.Tensor],
+    windows: List[WindowDescriptor],
+    plan: SecAggPlan,
+) -> float:
+    """量化域全局 amax：Hadamard 开启时为旋转后 max|y|，否则为原始 max|x|。
+
+    只上报这一个标量，不暴露哪个 window 更大。
+    """
+    amax = 0.0
+    for window in windows:
+        tensor = slices.get(window.window_id)
+        if tensor is None:
+            continue
+        _quant_input, window_amax, _signs = window_quant_input_and_amax(tensor, window, plan)
+        if window_amax > amax:
+            amax = window_amax
+    return float(amax)

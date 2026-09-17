@@ -1,8 +1,8 @@
 # SecAgg 量化精度问题分析与优化方案
 
-> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（20 轮验证通过）
-> 状态：**eval loss 上升问题已解决**（不再发散）。per-window 当轮 amax 对齐 scale + error-feedback + stochastic rounding，20 轮 eval 1.498→1.328，收敛。
-> 遗留：与 fp16 基线（R20 eval=0.987）仍有 35% 差距，根因是 int16 定点量化固有精度损失 + hex 编码导致 encode/upload 慢 7-8x。详见 §4x。
+> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（旧 20 轮验证通过）
+> 状态：**eval loss 上升问题已解决**（不再发散）。per-window 当轮 amax + error-feedback + stochastic rounding，旧 20 轮 eval 1.498→1.328。
+> 后续：实现层 FP16 rounding 与 quant residual×0.9 已按 [Issue #1](https://github.com/ICC2CCI/FedScale/issues/1) 去掉；Hadamard 全局 scale + raw bytes 已落地。5 轮验证（`results/202609171717`）R5 eval=**1.364**（旧 SecAgg R5=1.432，fp16 R5≈1.377）。详见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。20 轮 Hadamard 对照进行中，完成前不把剩余差距直接归因于 INT16 位宽。
 
 ## 1. 问题概述
 
@@ -226,7 +226,7 @@ Server 看不到:
   - q_k（需 R_kl + B_k 同时泄露）
 ```
 
-**结论**：当前方案在 SecAgg 安全模型基础上，额外泄露了 per-window L∞（269 个标量/轮）。这在 2-client 实验场景可接受，但不是零泄露。如需更强隐私，可切换到「公开聚合 max」回退路径（精度降低）或未来引入安全 amax 协议（如多方安全计算求 max，但通信开销增大）。
+**结论（旧方案）**：per-window 当轮 amax 会额外泄露 269 个 L∞ 标量/轮。Hadamard 路径已改为只上报 1 个 `global_amax`，所有 window 共用同一 scale，见调研文档 §3.2。
 
 ## 4. 验证结果
 
@@ -386,13 +386,11 @@ PYTHONPATH=experiments python experiments/tests/test_secagg.py
 
 覆盖：量化精度、当轮 amax 对齐 scale（`max_k` + `SCALE_COVERAGE`）、per-window 混合量级、error-feedback 恒等性、mask 抵消、端到端 2-client SecAgg。
 
-## 6. 备选方案（当前不需要）
+## 6. 后续方案（已部分落地）
 
-如果未来 per-window scale 仍不够（更多 client、更大模型、更长训练）：
-
-1. **Hadamard 变换**：window 内先随机 ±1 再 Walsh-Hadamard，压低 block 内动态范围。Hadamard 线性，`sum(H x_k) = H sum(x_k)`，和 SecAgg 兼容。传输量不变。
-2. **int24 + MinIO raw bytes**：3B/元素，4M 级量化，精度远超 fp16。流量 +50%。需避免 hex 编码 OOM。
-3. **公开聚合 max 回退路径**：`update_public_block_scales`（headroom=3.0），不泄露单 client L∞，但精度不如当轮 amax。
+1. **Hadamard 变换 + 全局 scale + raw bytes**：**已落地**。5 轮 R5 eval=1.364。见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。
+2. **int24**：仍为后备。raw bytes 上传已不再是瓶颈。
+3. **EF21 / Kashin / SCAFFOLD**：调研明确为后备，Hadamard 5 轮已接近 fp16 R5，20 轮对照后再决定。
 
 ## 7. 环境注意事项
 

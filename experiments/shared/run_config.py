@@ -30,6 +30,7 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "seed",
         "transfer_dtype",
         "memory_decay",
+        "quant_residual_decay",
         "block_size",
         "compressor",
         "rho",
@@ -67,6 +68,7 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "secagg_scale",
         "secagg_stochastic_rounding",
         "secagg_q_min",
+        "secagg_hadamard",
     ],
     "resume": [
         "resume_from_round",

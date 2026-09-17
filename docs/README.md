@@ -21,3 +21,5 @@
 | [S3R12v3 ratio 消融](experiment-records/2026-09-04-s3r12v3-ratio-ablation.md) | 5%~50% 带宽消融实验 |
 | [复现参数](reference/federated-training-reproduction-params.md) | 完整复现参数表 |
 | [上传安全方案](algorithm/2026-09-08-upload-security-plan.md) | 分片上传的隐私保护设计 |
+| [SecAgg 量化精度问题](algorithm/2026-09-15-secagg-quantization-precision-issue.md) | per-window scale / error-feedback，eval 发散已修（旧 20 轮 R20=1.328） |
+| [SecAgg 量化优化调研](algorithm/2026-09-17-secagg-quantization-optimization-survey.md) | Issue #1 + Hadamard 全局 scale + raw bytes；5 轮 R5 eval=1.364 |

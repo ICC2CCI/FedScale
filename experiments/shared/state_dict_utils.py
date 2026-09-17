@@ -13,27 +13,48 @@ def cpu_state(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v.detach().to(device="cpu") for k, v in state.items()}
 
 
-def sub_state(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def sub_state(
+    a: Dict[str, torch.Tensor],
+    b: Dict[str, torch.Tensor],
+    *,
+    keep_fp32: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """a - b。浮点运算在 FP32 中完成。
+
+    keep_fp32=True 时不把结果再 round 回 av.dtype（SecAgg 量化前必须保持 FP32）。
+    默认 False：保持历史行为，结果 dtype 跟随 a。
+    """
     out: Dict[str, torch.Tensor] = {}
     for k, av in a.items():
         bv = b.get(k)
         if bv is None:
             out[k] = av.clone() if hasattr(av, "clone") else av
         elif av.is_floating_point():
-            out[k] = (av.to(dtype=torch.float32) - bv.to(dtype=torch.float32)).to(dtype=av.dtype)
+            diff = av.to(dtype=torch.float32) - bv.to(dtype=torch.float32)
+            out[k] = diff if keep_fp32 else diff.to(dtype=av.dtype)
         else:
             out[k] = av.clone()
     return out
 
 
-def add_state(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def add_state(
+    a: Dict[str, torch.Tensor],
+    b: Dict[str, torch.Tensor],
+    *,
+    keep_fp32: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """a + b。浮点运算在 FP32 中完成。
+
+    keep_fp32=True 时不把结果再 round 回 av.dtype。
+    """
     out: Dict[str, torch.Tensor] = {}
     for k, av in a.items():
         bv = b.get(k)
         if bv is None:
             out[k] = av.clone() if hasattr(av, "clone") else av
         elif av.is_floating_point():
-            out[k] = (av.to(dtype=torch.float32) + bv.to(dtype=torch.float32)).to(dtype=av.dtype)
+            summed = av.to(dtype=torch.float32) + bv.to(dtype=torch.float32)
+            out[k] = summed if keep_fp32 else summed.to(dtype=av.dtype)
         else:
             out[k] = av.clone()
     return out
@@ -223,7 +244,7 @@ def get_sharded_block_delta(
                     flat = param.data.contiguous().view(-1).to(dtype=torch.float32)
                     lg = local_global.get(clean_name)
                     mem = memory.get(clean_name)
-                    # delta = full - local_global（与 pipe2 原版一致：先 fp32 相减，再转回 fp16）
+                    # delta / to_send 保持 FP32，避免量化或 encode 前再 round 一次 FP16。
                     if lg is not None:
                         lg_flat = lg.contiguous().view(-1).to(dtype=torch.float32)
                         if flat.numel() != lg_flat.numel():
@@ -232,14 +253,13 @@ def get_sharded_block_delta(
                                 clean_name, flat.numel(), lg_flat.numel(),
                             )
                             continue
-                        delta_flat = (flat - lg_flat).to(dtype=param.dtype).to(dtype=torch.float32)
+                        delta_flat = flat - lg_flat
                     else:
                         delta_flat = flat.clone()
-                    # to_send = delta + memory（与 pipe2 原版一致：fp16 相加后转 fp32）
                     if mem is not None:
                         mem_flat = mem.contiguous().view(-1).to(dtype=torch.float32)
                         if delta_flat.numel() == mem_flat.numel():
-                            to_send_flat = (delta_flat.to(dtype=param.dtype) + mem_flat.to(dtype=param.dtype)).to(dtype=torch.float32)
+                            to_send_flat = delta_flat + mem_flat
                         else:
                             to_send_flat = delta_flat
                     else:

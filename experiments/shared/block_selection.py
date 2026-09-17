@@ -463,11 +463,19 @@ def update_block_memory_with_quant_residual(
     selected_by_key: SelectedByKey,
     quant_residual: BlockDelta,
     decay: float,
+    *,
+    quant_decay: float = 1.0,
+    out_dtype: Optional[torch.dtype] = torch.float32,
 ) -> Dict[str, torch.Tensor]:
-    """未选中 block 保留 to_send；选中 block 保留量化 residual；再整体 * decay。
+    """未选中 block 保留 to_send * decay；选中 block 保留量化 residual * quant_decay。
+
+    两类 residual 语义不同：
+    - block-mask residual（未选中）：允许 decay（默认 0.9），避免过期更新长期累积
+    - quantization residual（已选中但 INT16 没表达完）：应完整保留，quant_decay=1.0
 
     residual = true_delta - dequant(quant(true_delta))。
     没有 residual 的选中 block 仍置 0（与 update_block_memory 一致）。
+    默认把 memory 存成 FP32，避免 residual 再被 round 回 FP16。
     """
     new_memory: Dict[str, torch.Tensor] = {}
     for key_name, tensor in to_send.items():
@@ -478,8 +486,93 @@ def update_block_memory_with_quant_residual(
         if key_name in selected_by_key:
             for s, e in selected_by_key[key_name]:
                 flat[s:e] = 0.0
+        flat.mul_(float(decay))
         for item in quant_residual.get(key_name, []):
             s, e, res = int(item[0]), int(item[1]), item[2]
-            flat[s:e] = res.to(dtype=torch.float32)
-        new_memory[key_name] = (flat * decay).to(dtype=tensor.dtype).view(tensor.shape)
+            flat[s:e] = res.to(dtype=torch.float32) * float(quant_decay)
+        store_dtype = out_dtype if out_dtype is not None else tensor.dtype
+        new_memory[key_name] = flat.to(dtype=store_dtype).view(tensor.shape)
+    return new_memory
+
+
+def _lookup_quant_residual_slice(
+    quant_residual: BlockDelta,
+    key_name: str,
+    start: int,
+    end: int,
+) -> Optional[torch.Tensor]:
+    for item in quant_residual.get(key_name, []):
+        if int(item[0]) == int(start) and int(item[1]) == int(end):
+            return item[2]
+    return None
+
+
+def merge_quant_residual_memory(
+    old_residual: BlockDelta,
+    selected_by_key: SelectedByKey,
+    new_residual: BlockDelta,
+    quant_decay: float = 1.0,
+) -> BlockDelta:
+    """量化残差独立于 block memory：选中块替换为本轮 residual，未选中块原样保留。"""
+    selected_ranges = {
+        key: {(int(s), int(e)) for s, e in ranges}
+        for key, ranges in selected_by_key.items()
+    }
+    out: BlockDelta = {}
+    for key_name, items in (old_residual or {}).items():
+        kept = []
+        sel = selected_ranges.get(key_name, set())
+        for item in items:
+            s, e = int(item[0]), int(item[1])
+            if (s, e) in sel:
+                continue
+            kept.append((s, e, item[2].detach().to(dtype=torch.float32).contiguous()))
+        if kept:
+            out[key_name] = kept
+    for key_name, items in (new_residual or {}).items():
+        lst = out.setdefault(key_name, [])
+        for item in items:
+            s, e, res = int(item[0]), int(item[1]), item[2]
+            lst.append(
+                (
+                    s,
+                    e,
+                    (res.detach().to(dtype=torch.float32) * float(quant_decay)).contiguous(),
+                )
+            )
+    return out
+
+
+def update_block_memory_from_states(
+    local_state: Dict[str, torch.Tensor],
+    global_state: Dict[str, torch.Tensor],
+    block_memory: Dict[str, torch.Tensor],
+    selected_by_key: SelectedByKey,
+    decay: float,
+) -> Dict[str, torch.Tensor]:
+    """按 FP32 计算 delta+block_memory，未选中块 * decay，选中块置 0。
+
+    不把量化残差混进 block memory，也不在中间 round 回模型 dtype。
+    """
+    new_memory: Dict[str, torch.Tensor] = {}
+    for key_name, tensor in local_state.items():
+        if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            src = (block_memory or {}).get(key_name, tensor)
+            new_memory[key_name] = src.clone() if hasattr(src, "clone") else src
+            continue
+        local_flat = tensor.detach().contiguous().view(-1).to(dtype=torch.float32)
+        gv = global_state.get(key_name) if global_state is not None else None
+        if gv is not None and gv.numel() == local_flat.numel():
+            delta_flat = local_flat - gv.detach().contiguous().view(-1).to(dtype=torch.float32)
+        else:
+            delta_flat = local_flat
+        mem = block_memory.get(key_name) if block_memory is not None else None
+        if mem is not None and mem.numel() == delta_flat.numel():
+            combined = delta_flat + mem.detach().contiguous().view(-1).to(dtype=torch.float32)
+        else:
+            combined = delta_flat
+        if key_name in selected_by_key:
+            for s, e in selected_by_key[key_name]:
+                combined[int(s):int(e)] = 0.0
+        new_memory[key_name] = (combined * float(decay)).view(tensor.shape)
     return new_memory

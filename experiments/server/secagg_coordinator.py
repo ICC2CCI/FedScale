@@ -34,6 +34,9 @@ from shared.fixed_point import (
     aggregate_zq,
     compute_window_scale,
     dequantize_from_zq,
+    generate_rademacher_signs,
+    hadamard_work_length,
+    inverse_hadamard_transform,
     unmask_aggregate,
 )
 from shared.protocol import (
@@ -97,8 +100,11 @@ class SecAggCoordinator:
         self.masked_windows: Dict[int, Dict[int, torch.Tensor]] = {}  # window_id → {client_id → z_kw}
         self.self_masters: Dict[int, bytes] = {}      # client_id → self_master (32 bytes)
         self.survivors: Optional[List[int]] = None    # 冻结后的幸存者集合
-        # window_id → {client_id → amax}，收齐后取 max_k 算当轮 scale
+        # window_id → {client_id → amax}，非 Hadamard 路径：收齐后取 max_k 算 per-window scale
         self.window_amax: Dict[int, Dict[int, float]] = {}
+        # client_id → 全局 amax（Hadamard 路径只收这一个标量，不泄露 per-window L∞）
+        self.client_global_amax: Dict[int, float] = {}
+        self.global_scale: Optional[float] = None
         # per-window scale：收齐所有 client amax 后才就绪
         self.window_scales: Dict[int, float] = {}
         self.scales_ready: bool = False
@@ -109,6 +115,14 @@ class SecAggCoordinator:
             round_idx, self.session_id[:16], self.cohort_hash[:16],
             len(windows), self.client_ids,
         )
+
+    def session_payload(self) -> Dict[str, Any]:
+        """下发给 client 的 session 字段；self-mask 必须用同一套值。"""
+        return {
+            "secagg_session_id": self.session_id,
+            "cohort_hash": self.cohort_hash,
+            "attempt_id": int(self.secagg_plan.attempt_id),
+        }
 
     def _init_window_scales(self) -> None:
         """初始化为 fallback（公开常数）；收齐 client amax 后由 _finalize_window_scales 覆盖。
@@ -131,8 +145,37 @@ class SecAggCoordinator:
                 len(vals), min(vals), max(vals),
             )
 
+    def _apply_uniform_scale(self, scale: float) -> None:
+        scale = float(scale)
+        self.global_scale = scale
+        for window in self.windows:
+            self.window_scales[window.window_id] = scale
+        self.secagg_plan.quantization_scale = scale
+        self.secagg_plan.window_scales = {
+            str(k): float(v) for k, v in self.window_scales.items()
+        }
+        self.scales_ready = True
+
+    def _finalize_global_scale(self) -> None:
+        """Hadamard 路径：所有 window 共用一个 scale，只依赖全局 amax。
+
+        scale = max_k(global_amax_k) / Q_max * SCALE_COVERAGE
+        不读、不下发 per-window L∞。
+        """
+        values = [float(v) for v in self.client_global_amax.values() if v is not None]
+        if not values:
+            self.scales_ready = True
+            return
+        amax = max(values)
+        scale = compute_window_scale(amax, self.secagg_plan.q_max, coverage=SCALE_COVERAGE)
+        self._apply_uniform_scale(scale)
+        logger.info(
+            "SecAgg: global scale finalized (hadamard, no per-window amax) amax=%e scale=%e n_windows=%s",
+            amax, scale, len(self.windows),
+        )
+
     def _finalize_window_scales(self) -> None:
-        """收齐所有 client 的 per-window amax 后，取 max_k 算当轮 scale。
+        """非 Hadamard：收齐所有 client 的 per-window amax 后，取 max_k 算当轮 scale。
 
         scale_b = max_k(|delta_{k,b}|) / Q_max * SCALE_COVERAGE
         SCALE_COVERAGE=1.05 → amax 映射到 0.95*Q_max，不 clip。
@@ -165,48 +208,67 @@ class SecAggCoordinator:
         client_id: int,
         pk_raw: bytes,
         window_amax: Optional[Dict[Any, float]] = None,
+        global_amax: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """client 提交 X25519 公钥 + per-window amax（当轮对齐 scale 用）。
+        """client 提交 X25519 公钥，并可选上报 scale 统计。
 
-        window_amax: {str(window_id): max|delta|}，泄露每 window 的 L∞（非更新本身）。
-        收齐所有 client 后取 max_k → scale_b = max_k / Q_max * 1.05，本轮使用。
+        - 非 Hadamard：window_amax = {str(window_id): max|delta|}，泄露每 window 的 L∞。
+        - Hadamard：只收 global_amax 一个标量，所有 window 共用 scale，不泄露 per-window L∞。
         """
         with self.lock:
             self.public_keys[client_id] = pk_raw
             n_keys = len(self.public_keys)
-            # 收集 per-window amax
-            if window_amax:
+            if global_amax is not None:
+                self.client_global_amax[client_id] = float(global_amax)
+            # 非 Hadamard 才保留 per-window amax。Hadamard 即使误传也不入库，避免 L∞ 画像。
+            if window_amax and not self.secagg_plan.hadamard_enabled:
                 for wid_str, amax_val in window_amax.items():
                     try:
                         wid = int(wid_str)
                     except (TypeError, ValueError):
                         continue
                     self.window_amax.setdefault(wid, {})[client_id] = float(amax_val)
+            elif window_amax and self.secagg_plan.hadamard_enabled and client_id not in self.client_global_amax:
+                # 旧 client 在 Hadamard 下仍报了 per-window amax：只取 max 当全局值，丢弃分窗口明细
+                try:
+                    collapsed = max(float(v) for v in window_amax.values())
+                    self.client_global_amax[client_id] = collapsed
+                except ValueError:
+                    pass
             all_received = n_keys >= len(self.client_ids)
-            # 收齐公钥（且至少有一个 client 报了 amax）→ 用当轮 amax 定 scale
             if all_received and not self.scales_ready:
-                if any(self.window_amax.get(w.window_id) for w in self.windows):
+                if self.secagg_plan.hadamard_enabled:
+                    if self.client_global_amax:
+                        self._finalize_global_scale()
+                    else:
+                        self.scales_ready = True
+                elif any(self.window_amax.get(w.window_id) for w in self.windows):
                     self._finalize_window_scales()
                 else:
-                    # 没有任何 client 报 amax（兼容旧 client）：保持 fallback，标记就绪
                     self.scales_ready = True
             scales_ready = self.scales_ready
             window_scales = dict(self.window_scales)
+            global_scale = self.global_scale
             logger.info(
-                "SecAgg: received public key from client %s (%s/%s) scales_ready=%s",
+                "SecAgg: received public key from client %s (%s/%s) scales_ready=%s hadamard=%s global_scale=%s",
                 client_id, n_keys, len(self.client_ids), scales_ready,
+                self.secagg_plan.hadamard_enabled,
+                f"{global_scale:e}" if global_scale is not None else "n/a",
             )
 
         result: Dict[str, Any] = {
             "received": n_keys,
             "scales_ready": scales_ready,
         }
+        result.update(self.session_payload())
         if all_received:
             result["status"] = "ready"
             result["public_keys"] = self._get_peer_keys()
         else:
             result["status"] = "waiting"
         result["window_scales"] = {str(k): float(v) for k, v in window_scales.items()}
+        if global_scale is not None:
+            result["global_scale"] = float(global_scale)
         return result
 
     def _get_peer_keys(self) -> Dict[str, str]:
@@ -227,14 +289,19 @@ class SecAggCoordinator:
                     "scales_ready": self.scales_ready,
                     "received": len(self.public_keys),
                 }
+                result.update(self.session_payload())
                 if self.scales_ready:
                     result["window_scales"] = scales_payload
+                    if self.global_scale is not None:
+                        result["global_scale"] = float(self.global_scale)
                 return result
-            return {
+            waiting = {
                 "status": "waiting",
                 "received": len(self.public_keys),
                 "scales_ready": self.scales_ready,
             }
+            waiting.update(self.session_payload())
+            return waiting
 
     # ----------------------------------------------------------------------- #
     # Phase 3: 收集 masked windows
@@ -324,11 +391,16 @@ class SecAggCoordinator:
 
         q = self.secagg_plan.modulus_q
         n_survivors = len(self.survivors)
+        hadamard = bool(self.secagg_plan.hadamard_enabled)
+        orig_amaxs: List[float] = []
+        work_amaxs: List[float] = []
 
         # 按 window 聚合
         agg_delta: Dict[str, List[Tuple[int, int, torch.Tensor]]] = {}
         for window in self.windows:
             wid = window.window_id
+            orig_len = int(window.vector_length)
+            work_len = hadamard_work_length(orig_len, hadamard)
 
             # 1. 收集所有 survivor 的 z_kw
             z_list = []
@@ -342,12 +414,17 @@ class SecAggCoordinator:
                 raise RuntimeError(
                     f"SecAgg: window {wid} has only {len(z_list)} masked values"
                 )
+            for z in z_list:
+                if int(z.numel()) != work_len:
+                    raise RuntimeError(
+                        f"SecAgg: window {wid} z_len={int(z.numel())} != work_len={work_len}"
+                    )
 
             # 2. 在 Z_q 中求和
             sum_z = aggregate_zq(z_list, q)
 
-            # 3. 生成并求和 self_mask
-            sum_B = torch.zeros(window.vector_length, dtype=torch.int64)
+            # 3. 生成并求和 self_mask（必须与 client 相同 session / 相同 work_len）
+            sum_B = torch.zeros(work_len, dtype=torch.int64)
             with self.lock:
                 for cid in self.survivors:
                     sm = self.self_masters.get(cid)
@@ -360,7 +437,7 @@ class SecAggCoordinator:
                         client_id=cid,
                         window_id=wid,
                         window_layout_hash=window.window_layout_hash,
-                        vector_len=window.vector_length,
+                        vector_len=work_len,
                         q=q,
                     )
                     sum_B = (sum_B + B_k) % q
@@ -368,21 +445,41 @@ class SecAggCoordinator:
             # 4. 移除 self_mask
             sum_q = unmask_aggregate(sum_z, sum_B, q)
 
-            # 5. dequant → delta（per-window scale）
+            # 5. dequant → delta（Hadamard 下为全局 scale；否则 per-window）
             scale = self.secagg_plan.get_window_scale(wid)
             delta_slice = dequantize_from_zq(sum_q, scale, q)
+            work_amaxs.append(float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0)
+
+            # 5b. 逆 Hadamard（工作长度已 pad 到 2 的幂），再裁回原始 window
+            if hadamard and work_len > 0:
+                seed = self.secagg_plan.hadamard_seed + wid
+                signs = generate_rademacher_signs(work_len, seed)
+                delta_slice = inverse_hadamard_transform(delta_slice, signs)
+            delta_slice = delta_slice.reshape(-1)[:orig_len].contiguous()
 
             # 6. 加权平均（等权：delta / N）
             delta_slice = delta_slice / float(n_survivors)
+            orig_amaxs.append(float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0)
 
             agg_delta.setdefault(window.key_name, []).append(
                 (window.start, window.end, delta_slice)
             )
 
+        orig_max = max(orig_amaxs) if orig_amaxs else 0.0
+        work_max = max(work_amaxs) if work_amaxs else 0.0
+        scale_ref = float(self.secagg_plan.quantization_scale or 0.0)
+        clip_bound = float(self.secagg_plan.q_max) * scale_ref if scale_ref > 0 else 0.0
         logger.info(
-            "SecAgg: aggregation complete, %s windows, %s survivors",
-            len(self.windows), n_survivors,
+            "SecAgg: aggregation complete windows=%s survivors=%s hadamard=%s "
+            "work_amax=%e orig_amax=%e clip_bound=%e session=%s",
+            len(self.windows), n_survivors, hadamard,
+            work_max, orig_max, clip_bound, self.session_id[:16],
         )
+        if clip_bound > 0 and orig_max > 0.05 and orig_max > 0.25 * clip_bound:
+            logger.warning(
+                "SecAgg: orig_amax=%e close to Q_max*scale=%e — self-mask 可能未抵消",
+                orig_max, clip_bound,
+            )
         return agg_delta
 
     # ----------------------------------------------------------------------- #

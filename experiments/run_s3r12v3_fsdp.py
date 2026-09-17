@@ -52,7 +52,8 @@ from shared.block_selection import (  # noqa: E402
     encode_block_delta,
     resolve_transfer_dtype,
     update_block_memory,
-    update_block_memory_with_quant_residual,
+    update_block_memory_from_states,
+    merge_quant_residual_memory,
 )
 from shared.block_crypto import (  # noqa: E402
     derive_round_key,
@@ -74,6 +75,7 @@ from shared.protocol import (  # noqa: E402
     DEFAULT_LOCAL_STEPS,
     DEFAULT_LR,
     DEFAULT_MEMORY_DECAY,
+    DEFAULT_QUANT_RESIDUAL_DECAY,
     DEFAULT_SEQ_LEN,
     DEFAULT_TRANSFER_DTYPE,
     RoundPlan,
@@ -85,6 +87,7 @@ from shared.protocol import (  # noqa: E402
     selected_from_jsonable,
     upload_block_key,
     upload_blocks_key,
+    upload_secagg_window_key,
 )
 from shared.run_config import apply_to_args, load_run_config  # noqa: E402
 from shared.state_dict_utils import (  # noqa: E402
@@ -625,6 +628,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=DEFAULT_LR)
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
+    p.add_argument(
+        "--quant-residual-decay",
+        type=float,
+        default=DEFAULT_QUANT_RESIDUAL_DECAY,
+        help="INT16 量化残差衰减；1.0=完整保留（不要和 block memory_decay 混用）",
+    )
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     p.add_argument(
         "--compressor",
@@ -701,6 +710,8 @@ def parse_args() -> argparse.Namespace:
                    help="B: 随机舍入")
     p.add_argument("--secagg-q-min", type=int, default=0,
                    help="B: 最小成功参与者数；0=num_clients")
+    p.add_argument("--secagg-hadamard", action=argparse.BooleanOptionalAction, default=False,
+                   help="B: 量化前 Hadamard 旋转（压低动态范围）")
     # RES-2：client memory 持久化目录
     p.add_argument(
         "--client-state-dir",
@@ -813,6 +824,7 @@ def main() -> None:
 
     minio = None
     memory = None
+    quant_residual_mem: Dict[str, Any] = {}
     # 本地缓存的全局 state：version=k 表示等于 MinIO global_state/round-k
     local_global: Optional[Dict[str, Any]] = None
     local_version: Optional[int] = None
@@ -843,6 +855,14 @@ def main() -> None:
                 logger.info("RES-2: restored client memory from %s", client_state_dir / "memory.pt")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("RES-2: failed to restore memory: %s", exc)
+        if args.resume and client_state_dir is not None and (client_state_dir / "quant_residual.pt").exists():
+            try:
+                quant_residual_mem = torch.load(
+                    client_state_dir / "quant_residual.pt", map_location="cpu", weights_only=False,
+                ) or {}
+                logger.info("RES-2: restored quant residual from %s", client_state_dir / "quant_residual.pt")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RES-2: failed to restore quant residual: %s", exc)
 
     # 首轮：用本地基地模型作 round-0，避免再下 942MiB
     # 注意：FSDP FULL_STATE_DICT 是集合通信，必须所有 rank 同步调用，不能丢进 rank0 线程
@@ -1123,6 +1143,7 @@ def main() -> None:
         if is_main:
             logger.info("FSDP state export: %.3fs", t_state_export)
         mem_box: List[Any] = [memory]
+        quant_mem_box: List[Any] = [quant_residual_mem]
 
         def _pipeline_upload_and_apply():
             """流式 per-block pipeline：逐 block 上传，聚合好的立即下载 apply。"""
@@ -1382,24 +1403,31 @@ def main() -> None:
             """B-7b: SecAgg pipeline — 公开聚合 scale → 量化 → DH → mask → 上传 z_k → 提交 self_master → apply。"""
             nonlocal local_global, local_version
             assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
-            from shared.secagg_client import SecAggClient, extract_window_slices, window_amax_payload
+            from shared.secagg_client import (
+                SecAggClient,
+                extract_window_to_send_fp32,
+                global_amax_from_slices,
+                window_amax_payload,
+            )
             from shared.fixed_point import pack_zq, compute_q_max
             from shared.protocol import SecAggPlan, build_window_descriptors
 
             t_enc0 = time.monotonic()
-            delta = sub_state(full_state, global_state)
-            to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
+            windows = build_window_descriptors(plan.block_list)
+            # 量化前全程 FP32：x = delta + block_memory + quant_residual
+            delta_slices = extract_window_to_send_fp32(
+                full_state, global_state, mem_box[0], quant_mem_box[0] or {}, windows,
+            )
 
-            # B-debug: 打印 delta 范围，诊断 NaN 问题
-            _delta_max = max(float(v.abs().max().item()) for v in delta.values() if hasattr(v, 'abs'))
-            _fs_max = max(float(v.abs().max().item()) for v in full_state.values() if hasattr(v, 'abs'))
-            _gs_max = max(float(v.abs().max().item()) for v in global_state.values() if hasattr(v, 'abs'))
+            _slice_max = max((float(v.abs().max().item()) for v in delta_slices.values()), default=0.0)
+            _fs_max = max(float(v.abs().max().item()) for v in full_state.values() if hasattr(v, "abs"))
+            _gs_max = max(float(v.abs().max().item()) for v in global_state.values() if hasattr(v, "abs"))
             _fs_dtype = str(next(iter(full_state.values())).dtype) if full_state else "?"
             _gs_dtype = str(next(iter(global_state.values())).dtype) if global_state else "?"
             logger.info(
-                "SecAgg delta range: max|delta|=%.4f max|full_state|=%.4f(%s) max|global_state|=%.4f(%s)",
-                _delta_max, _fs_max, _fs_dtype, _gs_max, _gs_dtype,
+                "SecAgg to_send range: max|x|=%.4f (fp32) max|full_state|=%.4f(%s) max|global_state|=%.4f(%s)",
+                _slice_max, _fs_max, _fs_dtype, _gs_max, _gs_dtype,
             )
 
             modulus_bits = int(getattr(args, "secagg_modulus_bits", 16))
@@ -1409,10 +1437,8 @@ def main() -> None:
             use_per_window = fixed_scale <= 0.0
             fallback_scale = fixed_scale if fixed_scale > 0.0 else (2.0 ** -20)
             stochastic = bool(getattr(args, "secagg_stochastic_rounding", False))
-
-            windows = build_window_descriptors(plan.block_list)
-            # 量化用 fp32 slice，不要先经过 fp16 encode
-            delta_slices = extract_window_slices(to_send, windows)
+            hadamard = bool(getattr(args, "secagg_hadamard", False))
+            quant_decay = float(getattr(args, "quant_residual_decay", DEFAULT_QUANT_RESIDUAL_DECAY))
 
             secagg_plan = SecAggPlan(
                 q_min=int(getattr(args, "secagg_q_min", 0)) or 2,
@@ -1421,20 +1447,26 @@ def main() -> None:
                 modulus_q=q,
                 q_max=q_max,
                 stochastic_rounding=stochastic,
+                hadamard_enabled=hadamard,
+                hadamard_seed=round_idx,
             )
 
             secagg_client = SecAggClient(args.client_id, secagg_plan, windows)
 
-            # Phase 1: 提交公钥 + per-window amax（当轮对齐 scale 用）。
-            # amax = max|delta|，每 window 一个 float（~1KB），泄露 L∞ 不泄露更新本身。
+            # Phase 1: 提交公钥。Hadamard 只报一个 global_amax，避免 per-window L∞ 泄露。
             t_dh0 = time.monotonic()
-            amax_payload = window_amax_payload(delta_slices)
+            announce_body = {"pk_hex": secagg_client.get_public_key_hex()}
+            if hadamard:
+                g_amax = global_amax_from_slices(delta_slices, windows, secagg_plan)
+                announce_body["global_amax"] = g_amax
+                logger.info("SecAgg: Hadamard global_amax=%e (no per-window L∞)", g_amax)
+            else:
+                announce_body["window_amax"] = window_amax_payload(
+                    delta_slices, windows=windows, plan=secagg_plan,
+                )
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/key-announce",
-                json={
-                    "pk_hex": secagg_client.get_public_key_hex(),
-                    "window_amax": amax_payload,
-                },
+                json=announce_body,
                 timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
             )
             resp.raise_for_status()
@@ -1451,11 +1483,18 @@ def main() -> None:
                 pk_status = resp.json()
                 if pk_status.get("status") == "ready":
                     peer_keys = pk_status["public_keys"]
+                    try:
+                        secagg_client.plan.apply_session_from_server(pk_status)
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
                     window_scales = pk_status.get("window_scales") or {}
                     if window_scales:
                         secagg_client.plan.window_scales = {
                             str(k): float(v) for k, v in window_scales.items()
                         }
+                    global_scale = pk_status.get("global_scale")
+                    if global_scale is not None:
+                        secagg_client.plan.quantization_scale = float(global_scale)
                     break
                 time.sleep(args.poll_interval)
             else:
@@ -1463,7 +1502,13 @@ def main() -> None:
 
             secagg_client.setup_dh(peer_keys)
             t_dh = time.monotonic() - t_dh0
-            logger.info("SecAgg: DH setup complete in %.2fs (per_window_scale=%s)", t_dh, use_per_window)
+            logger.info(
+                "SecAgg: DH setup complete in %.2fs (hadamard=%s global_scale=%s per_window_scale=%s session=%s)",
+                t_dh, hadamard,
+                f"{secagg_client.plan.quantization_scale:e}" if hadamard else "n/a",
+                use_per_window and not hadamard,
+                (secagg_client.plan.secagg_session_id or "")[:16],
+            )
 
             # Phase 3: 逐 window 量化 → mask → 上传 z_k；同时收集量化 residual
             logger.info("SecAgg: uploading %s masked windows", len(windows))
@@ -1473,6 +1518,9 @@ def main() -> None:
             clip_fracs = []
             zero_fracs = []
             scale_vals = []
+            rel_l2_vals = []
+            cosine_vals = []
+            sqnr_vals = []
 
             for window in windows:
                 wid = window.window_id
@@ -1483,24 +1531,33 @@ def main() -> None:
                 z_k, residual, stats = secagg_client.mask_window(
                     window, delta_slice, return_feedback=True,
                 )
+                z_len = int(z_k.numel())
                 quant_residual.setdefault(window.key_name, []).append(
-                    (window.start, window.end, residual.cpu())
+                    (window.start, window.end, residual.detach().to(dtype=torch.float32).cpu())
                 )
                 clip_fracs.append(float(stats["clip_frac"]))
                 zero_fracs.append(float(stats["zero_frac"]))
                 scale_vals.append(float(stats["scale"]))
+                rel_l2_vals.append(float(stats.get("rel_l2", 0.0)))
+                cosine_vals.append(float(stats.get("cosine", 1.0)))
+                sqnr = float(stats.get("sqnr_db", 0.0))
+                if sqnr == sqnr and abs(sqnr) != float("inf"):
+                    sqnr_vals.append(sqnr)
 
-                z_hex = pack_zq(z_k, modulus_bits).hex()
+                z_bytes = pack_zq(z_k, modulus_bits)
                 del z_k
-                total_upload_bytes += len(z_hex) // 2
+                z_key = upload_secagg_window_key(round_idx, args.client_id, wid)
+                minio.put_bytes(z_key, z_bytes)
+                total_upload_bytes += len(z_bytes)
+                del z_bytes
 
                 _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
                 _el = None
                 if eval_loss_val is not None:
                     _el = float(eval_loss_val) if eval_loss_val == eval_loss_val and abs(eval_loss_val) != float('inf') else None
                 body = {
-                    "z_hex": z_hex,
-                    "vector_len": window.vector_length,
+                    "z_key": z_key,
+                    "vector_len": z_len,
                     "num_examples": int(num_examples),
                     "train_loss": _tl,
                     "block_energies": [],
@@ -1513,8 +1570,11 @@ def main() -> None:
                 )
                 resp.raise_for_status()
 
-            mem_box[0] = update_block_memory_with_quant_residual(
-                to_send, selected, quant_residual, args.memory_decay,
+            mem_box[0] = update_block_memory_from_states(
+                full_state, global_state, mem_box[0], selected, args.memory_decay,
+            )
+            quant_mem_box[0] = merge_quant_residual_memory(
+                quant_mem_box[0] or {}, selected, quant_residual, quant_decay,
             )
             t_encode = time.monotonic() - t_enc0
             t_upload = time.monotonic() - t_up0
@@ -1522,12 +1582,18 @@ def main() -> None:
             mean_clip = (sum(clip_fracs) / len(clip_fracs)) if clip_fracs else 0.0
             max_clip = max(clip_fracs) if clip_fracs else 0.0
             mean_zero = (sum(zero_fracs) / len(zero_fracs)) if zero_fracs else 0.0
+            mean_rel_l2 = (sum(rel_l2_vals) / len(rel_l2_vals)) if rel_l2_vals else 0.0
+            mean_cos = (sum(cosine_vals) / len(cosine_vals)) if cosine_vals else 1.0
+            mean_sqnr = (sum(sqnr_vals) / len(sqnr_vals)) if sqnr_vals else 0.0
             logger.info(
-                "SecAgg: uploaded all z_k in %.2fs (%.1f MiB) clip_windows=%s/%s mean_clip=%.4g max_clip=%.4g mean_zero=%.4g scale_min=%e scale_max=%e",
+                "SecAgg: uploaded all z_k in %.2fs (%.1f MiB raw) clip_windows=%s/%s mean_clip=%.4g max_clip=%.4g mean_zero=%.4g "
+                "rel_l2=%.4g cosine=%.6f sqnr=%.2fdB scale_min=%e scale_max=%e hadamard=%s quant_decay=%.3f",
                 t_upload, total_upload_bytes / (1024 * 1024),
                 n_clip_windows, len(windows), mean_clip, max_clip, mean_zero,
+                mean_rel_l2, mean_cos, mean_sqnr,
                 min(scale_vals) if scale_vals else 0.0,
                 max(scale_vals) if scale_vals else 0.0,
+                hadamard, quant_decay,
             )
             if max_clip > 0.0:
                 logger.warning(
@@ -1540,7 +1606,7 @@ def main() -> None:
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/self-master",
                 json={"sm_hex": secagg_client.get_self_master_hex()},
-                timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
+                timeout=180, headers=auth_headers, verify=_REQUESTS_VERIFY,
             )
             resp.raise_for_status()
             t_sm = time.monotonic() - t_sm0
@@ -1610,11 +1676,13 @@ def main() -> None:
             label=f"upload-{round_idx}",
         )
         memory = mem_box[0]
+        quant_residual_mem = quant_mem_box[0]
 
         # RES-2：每轮把 memory + local_version 持久化到本地
         if is_main and client_state_dir is not None and memory is not None:
             try:
                 torch.save(memory, client_state_dir / "memory.pt")
+                torch.save(quant_residual_mem or {}, client_state_dir / "quant_residual.pt")
                 (client_state_dir / "local_version.txt").write_text(
                     str(local_version if local_version is not None else -1)
                 )

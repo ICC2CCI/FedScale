@@ -20,8 +20,13 @@ from shared.fixed_point import (
     compute_q_max,
     compute_adaptive_scale,
     compute_window_scale,
+    fwht,
+    hadamard_transform,
+    inverse_hadamard_transform,
+    generate_rademacher_signs,
     quantize_to_zq,
     quantize_to_zq_with_feedback,
+    quantization_error_metrics,
     dequantize_from_zq,
     aggregate_zq,
     unmask_aggregate,
@@ -52,9 +57,19 @@ from shared.protocol import (
     build_window_descriptors,
     compute_window_layout_hash,
 )
-from shared.secagg_client import SecAggClient
+from shared.secagg_client import (
+    SecAggClient,
+    extract_window_to_send_fp32,
+    global_amax_from_slices,
+    window_amax_payload,
+)
 from server.secagg_coordinator import SecAggCoordinator
-from shared.block_selection import update_block_memory_with_quant_residual
+from shared.block_selection import (
+    merge_quant_residual_memory,
+    update_block_memory_from_states,
+    update_block_memory_with_quant_residual,
+)
+from shared.state_dict_utils import add_state, sub_state
 
 
 # --------------------------------------------------------------------------- #
@@ -384,7 +399,7 @@ def test_e2e_per_window_mixed_magnitude():
 
 
 def test_update_block_memory_keeps_quant_residual():
-    """选中 block 保留量化 residual，未选中 block 保留原 delta。"""
+    """选中 block 保留量化 residual（不乘 memory_decay）；未选中 block 保留原 delta * decay。"""
     to_send = {
         "w": torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32),
     }
@@ -392,55 +407,93 @@ def test_update_block_memory_keeps_quant_residual():
     residual = {"w": [(0, 2, torch.tensor([0.01, -0.02], dtype=torch.float32))]}
     mem = update_block_memory_with_quant_residual(to_send, selected, residual, decay=0.9)
     got = mem["w"]
-    assert abs(got[0].item() - 0.01 * 0.9) < 1e-6
-    assert abs(got[1].item() + 0.02 * 0.9) < 1e-6
+    assert abs(got[0].item() - 0.01) < 1e-6
+    assert abs(got[1].item() + 0.02) < 1e-6
     assert abs(got[2].item() - 3.0 * 0.9) < 1e-6
     assert abs(got[3].item() - 4.0 * 0.9) < 1e-6
+    assert got.dtype == torch.float32
 
 
 # --------------------------------------------------------------------------- #
 # B-4/B-5: End-to-end 2-client SecAgg
 # --------------------------------------------------------------------------- #
 
-def _run_e2e_secagg(n_windows=3, vector_len=512, delta_scale=0.01, seed_public_scales=False):
-    """运行完整的 2-client SecAgg 模拟，返回 per-window error。"""
-    client_ids = [0, 1]
-    block_list = [[i, f"layer.{i}.weight", 0, vector_len] for i in range(n_windows)]
-    windows = build_window_descriptors(block_list)
-    plan = SecAggPlan(
-        secagg_session_id="test-session",
+def _fresh_client_plan(*, hadamard: bool = False) -> SecAggPlan:
+    """生产路径：client 本地 plan 没有 session，必须从 peer-keys 写入。"""
+    return SecAggPlan(
         modulus_q=DEFAULT_Q,
         q_max=DEFAULT_Q_MAX,
         quantization_scale=DEFAULT_SCALE,
+        hadamard_enabled=hadamard,
+        hadamard_seed=1,
+    )
+
+
+def _apply_peer_to_clients(clients, payload: dict) -> None:
+    for client in clients:
+        client.plan.apply_session_from_server(payload)
+        window_scales = payload.get("window_scales") or {}
+        if window_scales:
+            client.plan.window_scales = {str(k): float(v) for k, v in window_scales.items()}
+        if payload.get("global_scale") is not None:
+            client.plan.quantization_scale = float(payload["global_scale"])
+
+
+def _run_e2e_secagg(n_windows=3, vector_len=512, delta_scale=0.01, seed_public_scales=False, hadamard=False):
+    """运行完整的 2-client SecAgg 模拟，返回 per-window error。
+
+    client 与 coordinator 使用独立 plan；session 只通过 peer-keys 同步。
+    """
+    client_ids = [0, 1]
+    block_list = [[i, f"layer.{i}.weight", 0, vector_len] for i in range(n_windows)]
+    windows = build_window_descriptors(block_list)
+    server_plan = SecAggPlan(
+        modulus_q=DEFAULT_Q,
+        q_max=DEFAULT_Q_MAX,
+        quantization_scale=DEFAULT_SCALE,
+        hadamard_enabled=hadamard,
+        hadamard_seed=1,
     )
 
     delta_a = {w.window_id: torch.randn(vector_len) * delta_scale for w in windows}
     delta_b = {w.window_id: torch.randn(vector_len) * delta_scale for w in windows}
-    # per-window amax payload（当轮对齐 scale）
-    amax_a = {str(w.window_id): float(delta_a[w.window_id].abs().max()) for w in windows}
-    amax_b = {str(w.window_id): float(delta_b[w.window_id].abs().max()) for w in windows}
 
     coord = SecAggCoordinator(
         round_idx=1, successful_round_index=0,
         client_ids=client_ids, windows=windows,
         layout_hash="test-layout", mask_hash="test-mask",
-        secagg_plan=plan,
+        secagg_plan=server_plan,
     )
 
-    client_a = SecAggClient(0, plan, windows)
-    client_b = SecAggClient(1, plan, windows)
+    client_a = SecAggClient(0, _fresh_client_plan(hadamard=hadamard), windows)
+    client_b = SecAggClient(1, _fresh_client_plan(hadamard=hadamard), windows)
 
     if seed_public_scales:
-        # 不报 amax，走 fallback（测试 fallback 路径）
         coord.submit_public_key(0, client_a.public_key)
         coord.submit_public_key(1, client_b.public_key)
+    elif hadamard:
+        coord.submit_public_key(
+            0, client_a.public_key,
+            global_amax=global_amax_from_slices(delta_a, windows, client_a.plan),
+        )
+        result = coord.submit_public_key(
+            1, client_b.public_key,
+            global_amax=global_amax_from_slices(delta_b, windows, client_b.plan),
+        )
+        assert result.get("global_scale") is not None
+        assert result.get("secagg_session_id")
+        assert len(set(result["window_scales"].values())) == 1
+        assert coord.window_amax == {}
     else:
+        amax_a = window_amax_payload(delta_a, windows=windows, plan=client_a.plan)
+        amax_b = window_amax_payload(delta_b, windows=windows, plan=client_b.plan)
         coord.submit_public_key(0, client_a.public_key, amax_a)
-        result = coord.submit_public_key(1, client_b.public_key, amax_b)
-        # 把 server 用当轮 amax 算出的 scale 同步到 client plan
-        for k, v in result["window_scales"].items():
-            plan.window_scales[str(k)] = float(v)
-    peer_keys = coord.get_peer_keys()["public_keys"]
+        coord.submit_public_key(1, client_b.public_key, amax_b)
+
+    payload = coord.get_peer_keys()
+    assert payload.get("status") == "ready"
+    _apply_peer_to_clients([client_a, client_b], payload)
+    peer_keys = payload["public_keys"]
     client_a.setup_dh(peer_keys)
     client_b.setup_dh(peer_keys)
 
@@ -467,6 +520,7 @@ def _run_e2e_secagg(n_windows=3, vector_len=512, delta_scale=0.01, seed_public_s
                 actual = slice_data
                 break
         assert actual is not None, f"window {wid} not found in agg_delta"
+        assert int(actual.numel()) == vector_len
         error = (actual - expected).abs().max().item()
         errors.append(error)
     return errors
@@ -550,6 +604,207 @@ def test_hkdf_domain_separation():
     assert k1 != k2
 
 
+def test_sub_state_keep_fp32_avoids_fp16_roundtrip():
+    """keep_fp32=True 时 delta 不再被 round 回 FP16。"""
+    a = {"w": torch.tensor([1.0 + 1e-5], dtype=torch.float16)}
+    b = {"w": torch.tensor([1.0], dtype=torch.float16)}
+    rounded = sub_state(a, b, keep_fp32=False)
+    kept = sub_state(a, b, keep_fp32=True)
+    assert rounded["w"].dtype == torch.float16
+    assert kept["w"].dtype == torch.float32
+    # FP16 减法后再还原会丢掉一部分尾数；FP32 差值应更接近真值
+    true_diff = a["w"].to(torch.float32) - b["w"].to(torch.float32)
+    assert torch.allclose(kept["w"], true_diff, atol=0.0, rtol=0.0)
+    added = add_state(kept, {"w": torch.tensor([3e-6], dtype=torch.float32)}, keep_fp32=True)
+    assert added["w"].dtype == torch.float32
+
+
+def test_extract_window_to_send_fp32_uses_split_residual():
+    local = {"w": torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=torch.float16)}
+    glob = {"w": torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16)}
+    block_mem = {"w": torch.tensor([0.01, 0.02, 0.03, 0.04], dtype=torch.float32)}
+    quant_res = {"w": [(0, 2, torch.tensor([0.001, -0.002], dtype=torch.float32))]}
+    windows = build_window_descriptors([[0, "w", 0, 2], [1, "w", 2, 4]])
+    slices = extract_window_to_send_fp32(local, glob, block_mem, quant_res, windows)
+    # window 0: (1.5-1.0)+0.01+0.001 , (2.5-2.0)+0.02-0.002
+    assert abs(slices[0][0].item() - (0.5 + 0.01 + 0.001)) < 1e-5
+    assert abs(slices[0][1].item() - (0.5 + 0.02 - 0.002)) < 1e-5
+    # window 1 无 quant residual
+    assert abs(slices[1][0].item() - (0.5 + 0.03)) < 1e-5
+    assert slices[0].dtype == torch.float32
+
+
+def test_split_error_feedback_independent_decay():
+    local = {"w": torch.tensor([2.0, 3.0, 4.0, 5.0], dtype=torch.float32)}
+    glob = {"w": torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)}
+    block_mem = {"w": torch.zeros(4, dtype=torch.float32)}
+    old_res = {"w": [(2, 4, torch.tensor([0.7, 0.8], dtype=torch.float32))]}
+    selected = {"w": [(0, 2)]}
+    new_res = {"w": [(0, 2, torch.tensor([0.01, -0.02], dtype=torch.float32))]}
+    new_block = update_block_memory_from_states(local, glob, block_mem, selected, decay=0.9)
+    merged = merge_quant_residual_memory(old_res, selected, new_res, quant_decay=1.0)
+    # 选中 [0:2] 的 block memory 置 0；未选中 [2:4] = 0.9 * delta
+    assert abs(new_block["w"][0].item()) < 1e-8
+    assert abs(new_block["w"][2].item() - 0.9) < 1e-6
+    # 新 residual 不衰减；未选中旧 residual 原样保留
+    sel = [it for it in merged["w"] if it[0] == 0]
+    kept = [it for it in merged["w"] if it[0] == 2]
+    assert abs(sel[0][2][0].item() - 0.01) < 1e-6
+    assert abs(kept[0][2][0].item() - 0.7) < 1e-6
+
+
+def test_fwht_roundtrip():
+    x = torch.randn(1024, dtype=torch.float32)
+    y = fwht(x)
+    recon = fwht(y) / float(x.numel())
+    assert torch.allclose(recon, x, atol=1e-5, rtol=1e-5)
+
+
+def test_hadamard_roundtrip():
+    x = torch.randn(256, dtype=torch.float32)
+    signs = generate_rademacher_signs(256, seed=7)
+    y = hadamard_transform(x, signs)
+    recon = inverse_hadamard_transform(y, signs)
+    assert torch.allclose(recon, x, atol=1e-5, rtol=1e-5)
+    # 旋转后动态范围应被摊平：amax(y) 通常小于 amax(x) * sqrt(n) / few
+    assert float(y.abs().max()) > 0.0
+
+
+def test_quant_error_metrics_identity():
+    x = torch.tensor([0.1, -0.2, 0.3], dtype=torch.float32)
+    metrics = quantization_error_metrics(x, x.clone())
+    assert metrics["rel_l2"] < 1e-7
+    assert metrics["cosine"] > 0.999
+    assert metrics["sqnr_db"] == float("inf") or metrics["sqnr_db"] > 80.0
+
+
+def test_e2e_hadamard_mask_cancellation():
+    """Hadamard 旋转后 2-client SecAgg 仍能还原平均 delta。"""
+    errors = _run_e2e_secagg(n_windows=2, vector_len=512, delta_scale=0.01, hadamard=True)
+    for i, err in enumerate(errors):
+        assert err < 1e-3, f"hadamard window {i} error {err} too large"
+
+
+def test_hadamard_global_scale_hides_per_window_amax():
+    """Hadamard 只收 global_amax，所有 window scale 相同，不保存 per-window L∞。"""
+    windows = build_window_descriptors([[0, "tiny.weight", 0, 64], [1, "big.weight", 0, 64]])
+    plan = SecAggPlan(
+        modulus_q=DEFAULT_Q, q_max=DEFAULT_Q_MAX,
+        quantization_scale=DEFAULT_SCALE,
+        hadamard_enabled=True, hadamard_seed=1,
+    )
+    coord = SecAggCoordinator(
+        round_idx=1, successful_round_index=0,
+        client_ids=[0, 1], windows=windows,
+        layout_hash="lh", mask_hash="mh", secagg_plan=plan,
+    )
+    client_a = SecAggClient(0, plan, windows)
+    client_b = SecAggClient(1, plan, windows)
+    # 即使误传 per-window amax，Hadamard 路径也只应折叠成全局 max
+    coord.submit_public_key(0, client_a.public_key, window_amax={"0": 1e-6, "1": 1e-2}, global_amax=1e-2)
+    result = coord.submit_public_key(1, client_b.public_key, global_amax=5e-3)
+    assert result["status"] == "ready"
+    assert coord.window_amax == {}
+    scales = [float(v) for v in result["window_scales"].values()]
+    assert len(set(scales)) == 1
+    expected = compute_window_scale(1e-2, DEFAULT_Q_MAX, SCALE_COVERAGE)
+    assert abs(scales[0] - expected) / expected < 1e-9
+    assert abs(float(result["global_scale"]) - expected) / expected < 1e-9
+    assert result.get("secagg_session_id") == coord.session_id
+
+
+def test_next_power_of_two_and_work_length():
+    from shared.fixed_point import hadamard_work_length, next_power_of_two, pad_to_length
+    assert next_power_of_two(896) == 1024
+    assert next_power_of_two(1024) == 1024
+    assert hadamard_work_length(896, True) == 1024
+    assert hadamard_work_length(896, False) == 896
+    x = torch.arange(3, dtype=torch.float32)
+    padded = pad_to_length(x, 8)
+    assert padded[:3].tolist() == [0.0, 1.0, 2.0]
+    assert float(padded[3:].abs().sum()) == 0.0
+
+
+def test_mask_refuses_empty_session():
+    windows = build_window_descriptors([[0, "w", 0, 8]])
+    plan = SecAggPlan(modulus_q=DEFAULT_Q, q_max=DEFAULT_Q_MAX)
+    client = SecAggClient(0, plan, windows)
+    try:
+        client.mask_window(windows[0], torch.zeros(8))
+        assert False, "empty session should refuse mask"
+    except RuntimeError as exc:
+        assert "secagg_session_id" in str(exc)
+
+
+def test_peer_keys_includes_session():
+    windows = build_window_descriptors([[0, "w", 0, 8]])
+    plan = SecAggPlan(modulus_q=DEFAULT_Q, q_max=DEFAULT_Q_MAX)
+    coord = SecAggCoordinator(
+        round_idx=1, successful_round_index=0,
+        client_ids=[0, 1], windows=windows,
+        layout_hash="lh", mask_hash="mh", secagg_plan=plan,
+    )
+    waiting = coord.get_peer_keys()
+    assert waiting["status"] == "waiting"
+    assert waiting["secagg_session_id"] == coord.session_id
+    client_a = SecAggClient(0, _fresh_client_plan(), windows)
+    client_b = SecAggClient(1, _fresh_client_plan(), windows)
+    coord.submit_public_key(0, client_a.public_key, {"0": 1e-4})
+    result = coord.submit_public_key(1, client_b.public_key, {"0": 1e-4})
+    assert result["secagg_session_id"] == coord.session_id
+    ready = coord.get_peer_keys()
+    assert ready["status"] == "ready"
+    assert ready["secagg_session_id"] == coord.session_id
+    assert ready["cohort_hash"] == coord.cohort_hash
+
+
+def test_e2e_hadamard_padded_non_power_of_two():
+    """LayerNorm 一类非 2 的幂窗口 pad 后仍能还原。"""
+    errors = _run_e2e_secagg(n_windows=2, vector_len=896, delta_scale=0.01, hadamard=True)
+    for i, err in enumerate(errors):
+        assert err < 2e-3, f"padded hadamard window {i} error {err} too large"
+
+
+def test_session_desync_breaks_aggregation():
+    """client 用错 session 时 self-mask 无法抵消；大 scale 下泄漏可见（Hadamard 全局 scale 同理）。"""
+    windows = build_window_descriptors([[0, "ln.weight", 0, 896]])
+    server_plan = SecAggPlan(
+        modulus_q=DEFAULT_Q, q_max=DEFAULT_Q_MAX,
+        quantization_scale=2.0e-5,  # 模拟 Hadamard 全局 scale
+        window_scales={},
+    )
+    coord = SecAggCoordinator(
+        round_idx=1, successful_round_index=0,
+        client_ids=[0, 1], windows=windows,
+        layout_hash="lh", mask_hash="mh", secagg_plan=server_plan,
+    )
+    client_a = SecAggClient(0, _fresh_client_plan(), windows)
+    client_b = SecAggClient(1, _fresh_client_plan(), windows)
+    delta_a = {0: torch.full((896,), 1e-4, dtype=torch.float32)}
+    delta_b = {0: torch.full((896,), 2e-4, dtype=torch.float32)}
+    coord.submit_public_key(0, client_a.public_key)
+    coord.submit_public_key(1, client_b.public_key)
+    payload = coord.get_peer_keys()
+    _apply_peer_to_clients([client_a, client_b], payload)
+    client_a.plan.secagg_session_id = "wrong-session"
+    client_b.plan.secagg_session_id = "wrong-session"
+    peer_keys = payload["public_keys"]
+    client_a.setup_dh(peer_keys)
+    client_b.setup_dh(peer_keys)
+    z_a = client_a.mask_all_windows(delta_a)
+    z_b = client_b.mask_all_windows(delta_b)
+    coord.submit_masked_window(0, 0, z_a[0])
+    coord.submit_masked_window(1, 0, z_b[0])
+    coord.submit_self_master(0, client_a.self_master)
+    coord.submit_self_master(1, client_b.self_master)
+    coord.freeze_survivors()
+    agg = coord.aggregate_and_unmask()
+    actual = agg["ln.weight"][0][2]
+    expected = (delta_a[0] + delta_b[0]) / 2.0
+    err = float((actual - expected).abs().max().item())
+    assert err > 0.05, f"desynced session should leak self-mask, err={err}"
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_precision()
     test_quantize_clip()
@@ -579,4 +834,17 @@ if __name__ == "__main__":
     test_session_id_deterministic()
     test_cohort_hash_deterministic()
     test_hkdf_domain_separation()
+    test_sub_state_keep_fp32_avoids_fp16_roundtrip()
+    test_extract_window_to_send_fp32_uses_split_residual()
+    test_split_error_feedback_independent_decay()
+    test_fwht_roundtrip()
+    test_hadamard_roundtrip()
+    test_quant_error_metrics_identity()
+    test_e2e_hadamard_mask_cancellation()
+    test_hadamard_global_scale_hides_per_window_amax()
+    test_next_power_of_two_and_work_length()
+    test_mask_refuses_empty_session()
+    test_peer_keys_includes_session()
+    test_e2e_hadamard_padded_non_power_of_two()
+    test_session_desync_breaks_aggregation()
     print("All Phase B tests passed!")

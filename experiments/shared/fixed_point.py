@@ -24,10 +24,115 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Hadamard 旋转（量化前压低动态范围）
+# ---------------------------------------------------------------------------
+
+def generate_rademacher_signs(length: int, seed: int) -> torch.Tensor:
+    """生成 ±1 随机符号向量（Rademacher 分布），确定性种子。
+
+    所有 client 用相同种子 → 相同 D → 整数域求和兼容。
+    """
+    g = torch.Generator()
+    g.manual_seed(int(seed) & 0x7FFFFFFF)
+    signs = torch.randint(0, 2, (length,), generator=g, dtype=torch.int32)
+    return (signs * 2 - 1).to(dtype=torch.float32)
+
+
+def is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def next_power_of_two(n: int) -> int:
+    n = int(n)
+    if n <= 1:
+        return 1
+    if is_power_of_two(n):
+        return n
+    return 1 << (n - 1).bit_length()
+
+
+def hadamard_work_length(n: int, enabled: bool) -> int:
+    """Hadamard 工作长度：开启时 pad 到 2 的幂，否则保持原长。"""
+    n = int(n)
+    if n <= 0:
+        return 0
+    if not enabled:
+        return n
+    return next_power_of_two(n)
+
+
+def pad_to_length(x: torch.Tensor, length: int) -> torch.Tensor:
+    """把向量 pad/截成 length（右侧补零）。"""
+    flat = x.reshape(-1).to(dtype=torch.float32)
+    length = int(length)
+    if length <= 0:
+        return torch.zeros(0, dtype=torch.float32)
+    if int(flat.numel()) == length:
+        return flat.contiguous()
+    out = torch.zeros(length, dtype=torch.float32)
+    n = min(int(flat.numel()), length)
+    if n > 0:
+        out[:n] = flat[:n]
+    return out
+
+
+def fwht(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard Transform，长度必须是 2 的幂。
+
+    向量化实现：只有 log2(n) 次张量运算。旧版 Python 双层循环在 n=524288
+    时会跑数十秒/窗口，不能用于训练路径。
+
+    H @ x 的快速实现。Hadamard 矩阵 H 满足 H @ H^T = n @ I，因此 H^(-1) = H / n。
+    本函数返回 H @ x（不除 n），逆变换用 fwht(y) / n。
+    """
+    n = int(x.numel())
+    if not is_power_of_two(n):
+        raise ValueError(f"FWHT requires power-of-2 length, got {n}")
+    result = x.to(dtype=torch.float32).reshape(n).contiguous().clone()
+    h = 1
+    while h < n:
+        y = result.view(-1, 2, h)
+        a = y[:, 0, :]
+        b = y[:, 1, :]
+        new = torch.empty_like(result)
+        new_view = new.view(-1, 2, h)
+        new_view[:, 0, :] = a + b
+        new_view[:, 1, :] = a - b
+        result = new
+        h *= 2
+    return result
+
+
+def hadamard_transform(
+    x: torch.Tensor,
+    signs: torch.Tensor,
+) -> torch.Tensor:
+    """前向 Hadamard 旋转：y = FWHT(D ⊙ x)。
+
+    signs: ±1 随机符号向量（与 x 等长），所有 client 共享。
+    返回旋转后的向量，动态范围从 O(||x||_inf) 压到 O(||x||_2 / sqrt(n))。
+    """
+    return fwht(x * signs)
+
+
+def inverse_hadamard_transform(
+    y: torch.Tensor,
+    signs: torch.Tensor,
+) -> torch.Tensor:
+    """逆 Hadamard 旋转：x = D ⊙ FWHT(y) / n。
+
+    Hadamard 矩阵性质：H^(-1) = H / n，D^(-1) = D（D 是 ±1 对角矩阵）。
+    """
+    n = y.numel()
+    return fwht(y) * signs / float(n)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +192,37 @@ def _to_zq(clipped: torch.Tensor, q: int) -> torch.Tensor:
     return (q_zq + q) % q
 
 
+def quantization_error_metrics(
+    original: torch.Tensor,
+    reconstructed: torch.Tensor,
+) -> Dict[str, float]:
+    """量化误差指标：relative L2、cosine similarity、SQNR (dB)。"""
+    x = original.to(dtype=torch.float32).reshape(-1)
+    y = reconstructed.to(dtype=torch.float32).reshape(-1)
+    if x.numel() == 0:
+        return {"rel_l2": 0.0, "cosine": 1.0, "sqnr_db": float("inf")}
+    diff = x - y
+    x_norm = float(torch.norm(x).item())
+    y_norm = float(torch.norm(y).item())
+    diff_norm = float(torch.norm(diff).item())
+    rel_l2 = diff_norm / max(x_norm, 1e-12)
+    if x_norm <= 0.0 and y_norm <= 0.0:
+        cosine = 1.0
+    elif x_norm <= 0.0 or y_norm <= 0.0:
+        cosine = 0.0
+    else:
+        cosine = float(torch.dot(x, y).item()) / (x_norm * y_norm)
+    mse = float((diff * diff).mean().item())
+    signal = float((x * x).mean().item())
+    if mse <= 0.0:
+        sqnr_db = float("inf")
+    elif signal <= 0.0:
+        sqnr_db = 0.0
+    else:
+        sqnr_db = 10.0 * math.log10(signal / mse)
+    return {"rel_l2": rel_l2, "cosine": cosine, "sqnr_db": sqnr_db}
+
+
 def quantize_to_zq_with_feedback(
     delta: torch.Tensor,
     scale: float,
@@ -117,11 +253,15 @@ def quantize_to_zq_with_feedback(
     signed = torch.where(q_int > half_q, q_int - q, q_int)
     n_zero = int((signed == 0).sum().item())
     amax = float(delta_f32.abs().max().item()) if n else 0.0
+    metrics = quantization_error_metrics(delta_f32, reconstructed)
     stats = {
         "clip_frac": float(n_clip) / float(n),
         "zero_frac": float(n_zero) / float(n),
         "amax": amax,
         "scale": float(scale),
+        "rel_l2": metrics["rel_l2"],
+        "cosine": metrics["cosine"],
+        "sqnr_db": metrics["sqnr_db"],
     }
     return q_zq, residual, stats
 

@@ -144,6 +144,7 @@ class AggregationServer:
         secagg_scale: float = 0.0,
         secagg_stochastic_rounding: bool = False,
         secagg_q_min: int = 0,
+        secagg_hadamard: bool = False,
     ) -> None:
         self.minio = minio
         self.num_clients = num_clients
@@ -216,6 +217,7 @@ class AggregationServer:
         self.secagg_scale = float(secagg_scale)  # 0=per-window 当轮 amax；>0=固定全局 scale
         self.secagg_stochastic_rounding = bool(secagg_stochastic_rounding)
         self.secagg_q_min = int(secagg_q_min) if secagg_q_min > 0 else num_clients
+        self.secagg_hadamard = bool(secagg_hadamard)
         # per-round SecAgg coordinator
         self.secagg_coordinators: Dict[int, SecAggCoordinator] = {}
         if self.secagg_enabled:
@@ -238,6 +240,7 @@ class AggregationServer:
         self.round_log: List[Dict[str, Any]] = []
         self.round_meta: Dict[int, Dict[str, Any]] = {}
         self._aggregating = False
+        self._secagg_finalizing: set = set()  # round_idx 正在后台 finalize，避免重复聚合
         # 流式 per-block pipeline：round_idx -> {block_idx -> set(client_ids)} 已上传的 block
         self.round_block_uploads: Dict[int, Dict[int, set]] = {}
         # round_idx -> {block_idx -> agg_block_delta} 已聚合的 block 结果
@@ -589,21 +592,17 @@ class AggregationServer:
         round_idx: int,
         client_id: int,
         block_idx: int,
-        z_hex: str,
-        vector_len: int,
-        num_examples: int,
-        train_loss: float,
+        z_hex: str = "",
+        vector_len: int = 0,
+        num_examples: int = 1,
+        train_loss: float = 0.0,
         eval_loss: Optional[float] = None,
         block_energies: Optional[List[float]] = None,
+        z_key: str = "",
     ) -> Dict[str, Any]:
         """B-7a: SecAgg pipeline — client 上传一个 masked window (z_k)。
 
-        流程：
-        1. 解包 z_k (int16 packed bytes)
-        2. 存入 SecAggCoordinator
-        3. 检查该 window 的所有 client 是否都已上传
-        4. 是 → 等待 self_master 提交后聚合 unmask → 写 agg_block_key
-        5. 否 → 等待
+        优先从 MinIO raw bytes（z_key）读取；兼容旧的 JSON hex（z_hex）。
         """
         if client_id < 0 or client_id >= self.num_clients:
             raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
@@ -614,9 +613,13 @@ class AggregationServer:
         if coord is None:
             raise HTTPException(400, "SecAgg not enabled")
 
-        # 解包 z_k
         from shared.fixed_point import unpack_zq
-        z_data = bytes.fromhex(z_hex)
+        if z_key:
+            z_data = self.minio.get_bytes(z_key)
+        elif z_hex:
+            z_data = bytes.fromhex(z_hex)
+        else:
+            raise HTTPException(400, "missing z_key or z_hex")
         z_kw = unpack_zq(z_data, vector_len, self.secagg_modulus_bits)
 
         # 记录 client metadata
@@ -647,11 +650,29 @@ class AggregationServer:
             return {"aggregated": False, "waiting": len(uploaded_clients)}
 
         # 所有 client 的该 block 都已上传 → 检查是否所有 self_master 也已提交
+        n_windows = self._ensure_plan(round_idx).n_selected_blocks
+        all_windows_uploaded = len(block_uploads) >= n_windows
         logger.info(
             "SecAgg: all clients uploaded z_k for block %s round %s, checking self_masters",
             block_idx, round_idx,
         )
-        return {"aggregated": False, "waiting_self_masters": True}
+        return {
+            "aggregated": False,
+            "waiting_self_masters": True,
+            "all_windows_uploaded": all_windows_uploaded,
+        }
+
+    def secagg_schedule_finalize(self, round_idx: int) -> None:
+        """在后台 finalize，避免卡住 self-master / masked-window 的 HTTP 响应。"""
+        def _run() -> None:
+            try:
+                self.secagg_try_finalize_round(round_idx)
+            except Exception:
+                logger.exception("SecAgg: background finalize failed round=%s", round_idx)
+
+        threading.Thread(
+            target=_run, name=f"secagg-finalize-{round_idx}", daemon=True,
+        ).start()
 
     def secagg_try_finalize_round(self, round_idx: int) -> bool:
         """B-7a: 尝试完成 SecAgg 轮次。
@@ -668,23 +689,31 @@ class AggregationServer:
         n_windows = plan.n_selected_blocks
 
         with self.lock:
+            if round_idx in self.round_results:
+                return True
+            if round_idx in self._secagg_finalizing:
+                return False
             block_uploads = self.round_block_uploads.get(round_idx, {})
             n_blocks_uploaded = len(block_uploads)
             n_self_masters = len(coord.self_masters)
+            all_windows_done = n_blocks_uploaded >= n_windows
+            all_self_masters = n_self_masters >= self.effective_min_clients
+            if not (all_windows_done and all_self_masters):
+                return False
+            self._secagg_finalizing.add(round_idx)
 
-        # 检查所有 window 是否都有所有 client 的 z_k
-        all_windows_done = n_blocks_uploaded >= n_windows
-        all_self_masters = n_self_masters >= self.effective_min_clients
+        try:
+            return self._secagg_run_finalize(round_idx, coord, plan, n_windows)
+        except Exception:
+            with self.lock:
+                self._secagg_finalizing.discard(round_idx)
+                self._aggregating = False
+            raise
 
-        if not (all_windows_done and all_self_masters):
-            logger.info(
-                "SecAgg finalize round %s: windows=%s/%s self_masters=%s/%s, waiting",
-                round_idx, n_blocks_uploaded, n_windows,
-                n_self_masters, self.effective_min_clients,
-            )
-            return False
-
-        # 所有条件满足 → 聚合
+    def _secagg_run_finalize(
+        self, round_idx: int, coord: Any, plan: Any, n_windows: int,
+    ) -> bool:
+        """已抢到 finalize 名额后的实际聚合与落盘。"""
         logger.info("SecAgg: finalizing round %s (all z_k + self_masters received)", round_idx)
         try:
             coord.freeze_survivors()
@@ -699,6 +728,7 @@ class AggregationServer:
                     "reason": str(e),
                 }
                 self._aggregating = False
+                self._secagg_finalizing.discard(round_idx)
             return True
 
         # 写每个 block 的 agg_block_key（让 client 可以逐 block 下载）
@@ -815,6 +845,7 @@ class AggregationServer:
             else:
                 self.current_round = self.num_rounds + 1
             self._aggregating = False
+            self._secagg_finalizing.discard(round_idx)
 
         logger.info(
             "SecAgg: round %s complete, avg_train=%.4f delta_MiB=%.1f",
@@ -1358,6 +1389,8 @@ class AggregationServer:
                 modulus_q=self.secagg_q,
                 q_max=self.secagg_q_max,
                 stochastic_rounding=self.secagg_stochastic_rounding,
+                hadamard_enabled=self.secagg_hadamard,
+                hadamard_seed=round_idx,
             )
             client_ids = list(range(self.num_clients))
             if self.selected_client_ids is not None:
@@ -1380,13 +1413,19 @@ class AggregationServer:
         client_id: int,
         pk_hex: str,
         window_amax: Optional[Dict[str, float]] = None,
+        global_amax: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """B-6: client 提交 X25519 公钥 + per-window amax（当轮对齐 scale 用）。"""
+        """B-6: client 提交 X25519 公钥 + scale 统计。
+
+        Hadamard：只收 global_amax；否则收 per-window amax。
+        """
         coord = self._get_or_create_secagg_coordinator(round_idx)
         if coord is None:
             raise HTTPException(400, "SecAgg not enabled")
         pk_raw = bytes.fromhex(pk_hex)
-        return coord.submit_public_key(client_id, pk_raw, window_amax)
+        return coord.submit_public_key(
+            client_id, pk_raw, window_amax=window_amax, global_amax=global_amax,
+        )
 
     def secagg_get_peer_keys(self, round_idx: int) -> Dict[str, Any]:
         """B-6: client 获取所有 peer 的公钥。"""
@@ -1535,7 +1574,9 @@ def build_app(server: AggregationServer) -> FastAPI:
         round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
         return server.secagg_key_announce(
-            round_idx, client_id, body.get("pk_hex", ""), body.get("window_amax"),
+            round_idx, client_id, body.get("pk_hex", ""),
+            window_amax=body.get("window_amax"),
+            global_amax=body.get("global_amax"),
         )
 
     @app.get("/api/round/{round_idx}/secagg/peer-keys")
@@ -1548,6 +1589,7 @@ def build_app(server: AggregationServer) -> FastAPI:
         body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
         z_hex = body.get("z_hex", "")
+        z_key = body.get("z_key", "")
         vector_len = int(body.get("vector_len", 0))
         num_examples = int(body.get("num_examples", 1))
         train_loss = float(body.get("train_loss", 0.0))
@@ -1558,12 +1600,11 @@ def build_app(server: AggregationServer) -> FastAPI:
         result = server.secagg_block_uploaded(
             round_idx, client_id, window_id, z_hex, vector_len,
             num_examples, train_loss, eval_loss, block_energies,
+            z_key=z_key,
         )
-        # 如果所有 z_k 都已上传，尝试 finalize
-        if result.get("waiting_self_masters"):
-            finalized = server.secagg_try_finalize_round(round_idx)
-            if finalized:
-                result["aggregated"] = True
+        # 全部 window 齐了才后台 finalize；不要每个 block 都开线程
+        if result.get("all_windows_uploaded"):
+            server.secagg_schedule_finalize(round_idx)
         return result
 
     @app.post("/api/round/{round_idx}/client/{client_id}/secagg/self-master")
@@ -1571,8 +1612,8 @@ def build_app(server: AggregationServer) -> FastAPI:
         round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
         result = server.secagg_submit_self_master(round_idx, client_id, body.get("sm_hex", ""))
-        # 尝试 finalize（self_master 可能是最后到达的）
-        server.secagg_try_finalize_round(round_idx)
+        # 先回 200，聚合放到后台，避免最后一个 client 的 HTTP 超时
+        server.secagg_schedule_finalize(round_idx)
         return result
 
     @app.get("/api/round/{round_idx}/secagg/status")
@@ -1705,6 +1746,8 @@ def parse_args() -> argparse.Namespace:
                    help="B: 随机舍入（让低精度平均无偏）")
     p.add_argument("--secagg-q-min", type=int, default=0,
                    help="B: 最小成功参与者数；0=num_clients")
+    p.add_argument("--secagg-hadamard", action="store_true", default=False,
+                   help="B: 量化前 Hadamard 旋转（压低动态范围，提升精度）")
     return p.parse_args()
 
 
@@ -1771,6 +1814,7 @@ def main() -> None:
         secagg_scale=getattr(args, "secagg_scale", 0.0),
         secagg_stochastic_rounding=getattr(args, "secagg_stochastic_rounding", False),
         secagg_q_min=getattr(args, "secagg_q_min", 0),
+        secagg_hadamard=getattr(args, "secagg_hadamard", False),
     )
     # CFG-1：把生效的 run.yaml 写入 results 目录，保证可复现
     try:

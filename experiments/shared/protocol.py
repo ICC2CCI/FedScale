@@ -9,6 +9,7 @@ DEFAULT_SEED = 20260831
 DEFAULT_COVERAGE_H = 5
 DEFAULT_BLOCK_SIZE = 524288  # 元素数 ≈ 1MB @ fp16/bf16
 DEFAULT_MEMORY_DECAY = 0.9
+DEFAULT_QUANT_RESIDUAL_DECAY = 1.0
 DEFAULT_NUM_ROUNDS = 20
 DEFAULT_NUM_CLIENTS = 2
 DEFAULT_BUCKET = "fedscale-bucket"
@@ -39,6 +40,11 @@ def upload_blocks_key(round_idx: int, client_id: int) -> str:
 def upload_block_key(round_idx: int, client_id: int, block_idx: int) -> str:
     """流式：单个 block 的上传 key（per-block pipeline）。"""
     return f"uploads/round-{round_idx}/client-{client_id}/block-{block_idx}.pt"
+
+
+def upload_secagg_window_key(round_idx: int, client_id: int, window_id: int) -> str:
+    """SecAgg：单个 masked window 的 raw bytes key（不走 hex/JSON）。"""
+    return f"uploads/round-{round_idx}/client-{client_id}/secagg-window-{window_id}.bin"
 
 
 def agg_block_key(round_idx: int, block_idx: int) -> str:
@@ -175,6 +181,8 @@ class SecAggPlan:
     q_max: int = 16383                   # 量化值上界
     reconstruction_threshold: int = 1    # Shamir 恢复阈值（2-client 无掉线=1）
     stochastic_rounding: bool = False    # 随机舍入
+    hadamard_enabled: bool = False       # 量化前 Hadamard 旋转（压低动态范围）
+    hadamard_seed: int = 0               # Hadamard 随机符号种子（所有 client 共享）
 
     def get_window_scale(self, window_id: int) -> float:
         """取该 window 的定点 scale；未下发时回退到全局 quantization_scale。"""
@@ -185,6 +193,17 @@ class SecAggPlan:
             if val is not None and float(val) > 0.0:
                 return float(val)
         return float(self.quantization_scale)
+
+    def apply_session_from_server(self, payload: Dict[str, Any]) -> None:
+        """从 peer-keys / key-announce 写入 session，供 client 生成与 server 一致的 self-mask。"""
+        sid = str(payload.get("secagg_session_id") or "")
+        if not sid:
+            raise ValueError("SecAgg: server omitted secagg_session_id")
+        self.secagg_session_id = sid
+        if payload.get("cohort_hash") is not None:
+            self.cohort_hash = str(payload.get("cohort_hash") or "")
+        if payload.get("attempt_id") is not None:
+            self.attempt_id = int(payload["attempt_id"])
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -207,6 +226,8 @@ class SecAggPlan:
             q_max=int(data.get("q_max", 16383)),
             reconstruction_threshold=int(data.get("reconstruction_threshold", 1)),
             stochastic_rounding=bool(data.get("stochastic_rounding", False)),
+            hadamard_enabled=bool(data.get("hadamard_enabled", False)),
+            hadamard_seed=int(data.get("hadamard_seed", 0)),
         )
 
 

@@ -1,4 +1,5 @@
-# B-10 验证配置：SecAgg 开启，5 轮快速验证
+# B-10 验证配置：SecAgg 开启（Hadamard + Issue #1 + raw bytes）
+# 5 轮已通过（results/202609171717，R5 eval=1.364）；当前用于 20 轮对照
 # SEC-1/2/3 关闭（隔离测试 SecAgg），eval 每轮做
 federated:
   num_clients: 2
@@ -8,6 +9,7 @@ federated:
   seed: 20260831
   transfer_dtype: fp16
   memory_decay: 0.9
+  quant_residual_decay: 1.0
   block_size: 524288
   compressor: public_random
   rho: 0.0
@@ -44,6 +46,7 @@ security:
   secagg_scale: 0.0             # 自适应（round 1 用默认, 后续根据 delta max 调整）
   secagg_stochastic_rounding: true
   secagg_q_min: 0
+  secagg_hadamard: true        # 量化前 Hadamard 旋转（压低动态范围）
 
 scale:
   scale1_no_resident_global: false   # 关闭 SCALE-1，让 server 有 global_state（简化验证）
