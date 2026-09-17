@@ -52,6 +52,7 @@ from shared.block_selection import (  # noqa: E402
     encode_block_delta,
     resolve_transfer_dtype,
     update_block_memory,
+    update_block_memory_with_quant_residual,
 )
 from shared.block_crypto import (  # noqa: E402
     derive_round_key,
@@ -695,7 +696,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--secagg-modulus-bits", type=int, default=16,
                    help="B: 模数位宽 8/16/24/32")
     p.add_argument("--secagg-scale", type=float, default=0.0,
-                   help="B: 定点量化 scale；0=用默认")
+                   help="B: 定点量化 scale；0=per-window 公开聚合；>0=固定全局 scale")
     p.add_argument("--secagg-stochastic-rounding", action=argparse.BooleanOptionalAction, default=False,
                    help="B: 随机舍入")
     p.add_argument("--secagg-q-min", type=int, default=0,
@@ -1378,12 +1379,11 @@ def main() -> None:
             return timings
 
         def _secagg_upload_and_apply():
-            """B-7b: SecAgg pipeline — 量化 → DH → mask → 上传 z_k → 提交 self_master → 等聚合 → apply。"""
+            """B-7b: SecAgg pipeline — 公开聚合 scale → 量化 → DH → mask → 上传 z_k → 提交 self_master → apply。"""
             nonlocal local_global, local_version
             assert minio is not None and global_state is not None and mem_box[0] is not None and full_state is not None
-            from shared.secagg_client import SecAggClient
-            from shared.secagg_crypto import build_pair_domain_info
-            from shared.fixed_point import quantize_to_zq, pack_zq, DEFAULT_Q, DEFAULT_Q_MAX, DEFAULT_SCALE, compute_q_max
+            from shared.secagg_client import SecAggClient, extract_window_slices, window_amax_payload
+            from shared.fixed_point import pack_zq, compute_q_max
             from shared.protocol import SecAggPlan, build_window_descriptors
 
             t_enc0 = time.monotonic()
@@ -1402,46 +1402,44 @@ def main() -> None:
                 _delta_max, _fs_max, _fs_dtype, _gs_max, _gs_dtype,
             )
 
-            # 构建 SecAggPlan（与 server 一致）
             modulus_bits = int(getattr(args, "secagg_modulus_bits", 16))
             q = 1 << modulus_bits
             q_max = compute_q_max(modulus_bits, n_clients=2)
-            scale = float(getattr(args, "secagg_scale", 0.0))
-            if scale <= 0:
-                # 自适应 scale：根据 delta 的 max|值| 计算
-                # scale = max|delta| / q_max * 0.9 (留 10% 余量)
-                # 但所有 client 必须用相同 scale → 用 plan 中的 scale（server 下发）
-                # 如果 plan 中没有 scale，用保守默认值
-                if hasattr(plan, "secagg_scale") and plan.secagg_scale > 0:
-                    scale = float(plan.secagg_scale)
-                else:
-                    # 保守默认：覆盖 delta max ~0.1
-                    scale = 0.1 / q_max * 0.9
+            fixed_scale = float(getattr(args, "secagg_scale", 0.0))
+            use_per_window = fixed_scale <= 0.0
+            fallback_scale = fixed_scale if fixed_scale > 0.0 else (2.0 ** -20)
             stochastic = bool(getattr(args, "secagg_stochastic_rounding", False))
 
             windows = build_window_descriptors(plan.block_list)
+            # 量化用 fp32 slice，不要先经过 fp16 encode
+            delta_slices = extract_window_slices(to_send, windows)
+
             secagg_plan = SecAggPlan(
                 q_min=int(getattr(args, "secagg_q_min", 0)) or 2,
-                quantization_scale=scale,
+                quantization_scale=fallback_scale,
                 modulus_bits=modulus_bits,
                 modulus_q=q,
                 q_max=q_max,
                 stochastic_rounding=stochastic,
             )
 
-            # 创建 SecAgg client
             secagg_client = SecAggClient(args.client_id, secagg_plan, windows)
 
-            # Phase 1: 提交公钥
+            # Phase 1: 提交公钥 + per-window amax（当轮对齐 scale 用）。
+            # amax = max|delta|，每 window 一个 float（~1KB），泄露 L∞ 不泄露更新本身。
             t_dh0 = time.monotonic()
+            amax_payload = window_amax_payload(delta_slices)
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/key-announce",
-                json={"pk_hex": secagg_client.get_public_key_hex()},
+                json={
+                    "pk_hex": secagg_client.get_public_key_hex(),
+                    "window_amax": amax_payload,
+                },
                 timeout=30, headers=auth_headers, verify=_REQUESTS_VERIFY,
             )
             resp.raise_for_status()
 
-            # 等待所有 peer 公钥
+            # 等待所有 peer 公钥；window_scales 由 server 收齐 amax 后下发
             peer_keys = {}
             deadline_dh = time.time() + 300.0
             while time.time() < deadline_dh:
@@ -1453,48 +1451,49 @@ def main() -> None:
                 pk_status = resp.json()
                 if pk_status.get("status") == "ready":
                     peer_keys = pk_status["public_keys"]
+                    window_scales = pk_status.get("window_scales") or {}
+                    if window_scales:
+                        secagg_client.plan.window_scales = {
+                            str(k): float(v) for k, v in window_scales.items()
+                        }
                     break
                 time.sleep(args.poll_interval)
             else:
                 raise RuntimeError("SecAgg: timeout waiting for peer keys")
 
-            # DH 协商
             secagg_client.setup_dh(peer_keys)
             t_dh = time.monotonic() - t_dh0
-            logger.info("SecAgg: DH setup complete in %.2fs", t_dh)
+            logger.info("SecAgg: DH setup complete in %.2fs (per_window_scale=%s)", t_dh, use_per_window)
 
-            # 构建 delta slices（每个 window 的 delta）
-            block_delta = encode_block_delta(to_send, selected, dtype=transfer_dtype)
-            mem_box[0] = update_block_memory(to_send, selected, args.memory_decay)
-            t_encode = time.monotonic() - t_enc0
-
-            # Phase 3: 逐 window 量化 → mask → 上传 z_k
+            # Phase 3: 逐 window 量化 → mask → 上传 z_k；同时收集量化 residual
             logger.info("SecAgg: uploading %s masked windows", len(windows))
             t_up0 = time.monotonic()
             total_upload_bytes = 0
+            quant_residual = {}
+            clip_fracs = []
+            zero_fracs = []
+            scale_vals = []
 
             for window in windows:
                 wid = window.window_id
-                # 取出该 window 的 delta slice
-                delta_slice = None
-                for kn, blocks in block_delta.items():
-                    if kn == window.key_name:
-                        for s, e, sd in blocks:
-                            if s == window.start and e == window.end:
-                                delta_slice = sd.to(dtype=torch.float32)
-                                break
+                delta_slice = delta_slices.get(wid)
                 if delta_slice is None:
                     delta_slice = torch.zeros(window.vector_length, dtype=torch.float32)
 
-                # mask
-                z_k = secagg_client.mask_window(window, delta_slice)
-                # pack + 立即转 hex（不保存 z_k 和 z_packed 引用，让 GC 回收）
+                z_k, residual, stats = secagg_client.mask_window(
+                    window, delta_slice, return_feedback=True,
+                )
+                quant_residual.setdefault(window.key_name, []).append(
+                    (window.start, window.end, residual.cpu())
+                )
+                clip_fracs.append(float(stats["clip_frac"]))
+                zero_fracs.append(float(stats["zero_frac"]))
+                scale_vals.append(float(stats["scale"]))
+
                 z_hex = pack_zq(z_k, modulus_bits).hex()
                 del z_k
                 total_upload_bytes += len(z_hex) // 2
 
-                # 上传 z_k 到 server
-                # JSON 不支持 NaN/Inf，需替换
                 _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
                 _el = None
                 if eval_loss_val is not None:
@@ -1513,8 +1512,28 @@ def main() -> None:
                     json=body, timeout=120, headers=auth_headers, verify=_REQUESTS_VERIFY,
                 )
                 resp.raise_for_status()
+
+            mem_box[0] = update_block_memory_with_quant_residual(
+                to_send, selected, quant_residual, args.memory_decay,
+            )
+            t_encode = time.monotonic() - t_enc0
             t_upload = time.monotonic() - t_up0
-            logger.info("SecAgg: uploaded all z_k in %.2fs (%.1f MiB)", t_upload, total_upload_bytes / (1024*1024))
+            n_clip_windows = sum(1 for c in clip_fracs if c > 0.0)
+            mean_clip = (sum(clip_fracs) / len(clip_fracs)) if clip_fracs else 0.0
+            max_clip = max(clip_fracs) if clip_fracs else 0.0
+            mean_zero = (sum(zero_fracs) / len(zero_fracs)) if zero_fracs else 0.0
+            logger.info(
+                "SecAgg: uploaded all z_k in %.2fs (%.1f MiB) clip_windows=%s/%s mean_clip=%.4g max_clip=%.4g mean_zero=%.4g scale_min=%e scale_max=%e",
+                t_upload, total_upload_bytes / (1024 * 1024),
+                n_clip_windows, len(windows), mean_clip, max_clip, mean_zero,
+                min(scale_vals) if scale_vals else 0.0,
+                max(scale_vals) if scale_vals else 0.0,
+            )
+            if max_clip > 0.0:
+                logger.warning(
+                    "SecAgg: clip_frac>0 (max=%.4g) — per-window scale 仍偏小，大更新被截断",
+                    max_clip,
+                )
 
             # Phase 4: 提交 self_master
             t_sm0 = time.monotonic()

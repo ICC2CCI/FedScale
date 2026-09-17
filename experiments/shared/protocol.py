@@ -168,18 +168,30 @@ class SecAggPlan:
     mask_hash: str = ""                  # 来自 Block Mask
     window_plan_hash: str = ""           # H(all window descriptors)
     q_min: int = 2                       # 最小成功参与者数
-    quantization_scale: float = 2.0 ** -14  # cohort 共享定点 scale
+    quantization_scale: float = 2.0 ** -14  # 全局 fallback scale（无 per-window 时使用）
+    window_scales: Dict[str, float] = field(default_factory=dict)  # str(window_id) → scale
     modulus_bits: int = 16               # q = 2^modulus_bits
     modulus_q: int = 65536               # q = 2^modulus_bits
     q_max: int = 16383                   # 量化值上界
     reconstruction_threshold: int = 1    # Shamir 恢复阈值（2-client 无掉线=1）
     stochastic_rounding: bool = False    # 随机舍入
 
+    def get_window_scale(self, window_id: int) -> float:
+        """取该 window 的定点 scale；未下发时回退到全局 quantization_scale。"""
+        if self.window_scales:
+            val = self.window_scales.get(str(window_id))
+            if val is None:
+                val = self.window_scales.get(window_id)  # type: ignore[arg-type]
+            if val is not None and float(val) > 0.0:
+                return float(val)
+        return float(self.quantization_scale)
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SecAggPlan":
+        raw_scales = data.get("window_scales") or {}
         return cls(
             secagg_protocol_id=str(data.get("secagg_protocol_id", SECAGG_PROTOCOL_ID)),
             secagg_session_id=str(data.get("secagg_session_id", "")),
@@ -189,6 +201,7 @@ class SecAggPlan:
             window_plan_hash=str(data.get("window_plan_hash", "")),
             q_min=int(data.get("q_min", 2)),
             quantization_scale=float(data.get("quantization_scale", 2.0 ** -14)),
+            window_scales={str(k): float(v) for k, v in raw_scales.items()},
             modulus_bits=int(data.get("modulus_bits", 16)),
             modulus_q=int(data.get("modulus_q", 65536)),
             q_max=int(data.get("q_max", 16383)),

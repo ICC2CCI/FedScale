@@ -19,13 +19,12 @@
 
 接口全部参数化，后续切换 int8/int24/int32 只需改 yaml 配置：
     secagg_modulus_bits: 16   # 8/16/24/32
-    secagg_scale: 0.0         # 0=自适应（后续实现）
+    secagg_scale: 0.0         # 0=per-window 公开聚合；>0=固定全局 scale
     secagg_stochastic_rounding: false
 """
 from __future__ import annotations
 
-import struct
-from typing import Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -42,6 +41,15 @@ DEFAULT_Q_MAX = (DEFAULT_Q // 4) - 1  # 16383
 # scale 选择：可表示范围 = ±(Q_max × scale)
 # delta 实际范围可达 ±2.0（embed_tokens/lm_head），用 scale=2^-12 → ±4.0 覆盖
 DEFAULT_SCALE = 2.0 ** -(DEFAULT_MODULUS_BITS - 4)  # 2^-12 ≈ 2.44e-4
+# coverage>1：把 amax 映射到 Q_max/coverage，给当轮最大值留余量，避免 clip。
+# 旧代码用 0.9，会让 amax 自身被 clip，scale 每轮收缩。
+SCALE_COVERAGE = 1.05
+# 主路径：client 在 key-announce 上报当轮 per-window amax，server 取 max_k → scale。
+# 下面 PUBLIC_AGG_HEADROOM / update_public_block_scales 仅作回退（client 未报 amax 时），
+# 用「上一轮公开聚合 delta」估下一轮 scale，不再作为主路径。
+PUBLIC_AGG_HEADROOM = 3.0
+ROUND1_PUBLIC_SCALE = 2.0 ** -20  # 回退常数（client 未报 amax 时）
+_ZERO_AMAX = 1e-12
 
 
 def compute_q_max(modulus_bits: int, n_clients: int = 2) -> int:
@@ -65,6 +73,59 @@ def overflow_check(n_clients: int, q_max: int, q: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _round_scaled(scaled: torch.Tensor, stochastic: bool) -> torch.Tensor:
+    if stochastic:
+        floor_val = torch.floor(scaled)
+        frac = scaled - floor_val
+        rand = torch.rand_like(frac)
+        return floor_val + (rand < frac).to(dtype=torch.float32)
+    return torch.round(scaled)
+
+
+def _to_zq(clipped: torch.Tensor, q: int) -> torch.Tensor:
+    q_zq = clipped.to(dtype=torch.int64) % q
+    return (q_zq + q) % q
+
+
+def quantize_to_zq_with_feedback(
+    delta: torch.Tensor,
+    scale: float,
+    q_max: int,
+    q: int,
+    stochastic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """量化并返回 residual + clip/zero 统计，供 error-feedback 使用。
+
+    residual = delta - dequant(quant(delta))，选中 block 应把 residual 写入 memory。
+    """
+    if float(scale) <= 0.0:
+        raise ValueError(f"quantization scale must be > 0, got {scale}")
+    delta_f32 = delta.to(dtype=torch.float32)
+    scaled = delta_f32 / float(scale)
+    rounded = _round_scaled(scaled, stochastic)
+
+    n = max(int(rounded.numel()), 1)
+    n_clip = int((rounded.abs() > float(q_max)).sum().item())
+    clipped = rounded.clamp(-q_max, q_max)
+    q_zq = _to_zq(clipped, q)
+
+    reconstructed = dequantize_from_zq(q_zq, scale, q)
+    residual = delta_f32 - reconstructed
+
+    half_q = q // 2
+    q_int = q_zq % q
+    signed = torch.where(q_int > half_q, q_int - q, q_int)
+    n_zero = int((signed == 0).sum().item())
+    amax = float(delta_f32.abs().max().item()) if n else 0.0
+    stats = {
+        "clip_frac": float(n_clip) / float(n),
+        "zero_frac": float(n_zero) / float(n),
+        "amax": amax,
+        "scale": float(scale),
+    }
+    return q_zq, residual, stats
+
+
 def quantize_to_zq(
     delta: torch.Tensor,
     scale: float,
@@ -79,24 +140,9 @@ def quantize_to_zq(
 
     stochastic=True 时用随机舍入（期望无偏）。
     """
-    delta_f32 = delta.to(dtype=torch.float32)
-    scaled = delta_f32 / float(scale)
-
-    if stochastic:
-        # 随机舍入: floor(x) + Bernoulli(frac(x))
-        floor_val = torch.floor(scaled)
-        frac = scaled - floor_val
-        rand = torch.rand_like(frac)
-        rounded = floor_val + (rand < frac).to(dtype=torch.float32)
-    else:
-        rounded = torch.round(scaled)
-
-    # clip 到 [-q_max, q_max]
-    clipped = rounded.clamp(-q_max, q_max)
-
-    # 映射到 Z_q (非负): q_zq = (q_int % q + q) % q
-    q_zq = clipped.to(dtype=torch.int64) % q
-    q_zq = (q_zq + q) % q  # 确保非负
+    q_zq, _residual, _stats = quantize_to_zq_with_feedback(
+        delta, scale, q_max, q, stochastic=stochastic,
+    )
     return q_zq
 
 
@@ -212,18 +258,65 @@ def unpack_zq(data: bytes, length: int, modulus_bits: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def compute_window_scale(
+    amax: float,
+    q_max: int,
+    coverage: float = SCALE_COVERAGE,
+) -> float:
+    """由 max|delta| 计算定点 scale。
+
+    scale = amax / q_max * coverage
+    coverage>1：amax 映射到 Q_max/coverage，不 clip 该 amax。
+    主路径：amax 来自 client 当轮上报的 per-window max|delta|（secagg_coordinator._finalize_window_scales）。
+    回退路径：amax 来自上一轮公开聚合（update_public_block_scales, headroom=PUBLIC_AGG_HEADROOM）。
+    """
+    if amax < _ZERO_AMAX:
+        return 1.0
+    return float(amax) / float(q_max) * float(coverage)
+
+
+def block_scale_key(key_name: str, start: int, end: int) -> str:
+    """跨 round 稳定的 block 身份（window_id/gidx 每轮会变）。"""
+    return f"{key_name}:{int(start)}:{int(end)}"
+
+
+def update_public_block_scales(
+    prev_scales: dict,
+    windows,
+    agg_delta: dict,
+    q_max: int,
+    headroom: float = PUBLIC_AGG_HEADROOM,
+) -> dict:
+    """[回退路径] 用本轮公开聚合 delta 更新下一轮 per-block scale。
+
+    只读 agg_delta（所有 client 之和 / N），不读任何单 client 统计。
+    全零 block 保留 prev；未见过的 block 不写入。
+    主路径是 client 当轮上报 amax（见 secagg_coordinator._finalize_window_scales），
+    本函数仅作回退/兼容用。
+    """
+    out = dict(prev_scales or {})
+    for window in windows:
+        key = block_scale_key(window.key_name, window.start, window.end)
+        amax = 0.0
+        for item in (agg_delta or {}).get(window.key_name, []):
+            s, e, sd = item[0], item[1], item[2]
+            if int(s) == int(window.start) and int(e) == int(window.end):
+                amax = float(sd.abs().max().item())
+                break
+        if amax < _ZERO_AMAX:
+            continue
+        out[key] = compute_window_scale(amax, q_max, coverage=headroom)
+    return out
+
+
 def compute_adaptive_scale(
     deltas: list,
     q_max: int,
-    coverage_factor: float = 1.0,
+    coverage_factor: float = SCALE_COVERAGE,
 ) -> float:
-    """根据 delta 的 max|value| 计算自适应 scale。
+    """根据一组 delta 的 max|value| 计算 scale（测试/调试用）。
 
-    scale = max(|delta|) / q_max × coverage_factor
-    coverage_factor=1.0: 覆盖全部范围
-    coverage_factor=0.95: 保留 5% 余量（极端值会被 clip）
-
-    deltas: list of torch.Tensor（各 client 的 delta）
+    生产路径：client 当轮上报 per-window amax → server 取 max_k（_finalize_window_scales）。
     """
     max_abs = 0.0
     for delta in deltas:
@@ -231,6 +324,4 @@ def compute_adaptive_scale(
             m = float(delta.abs().max().item())
             if m > max_abs:
                 max_abs = m
-    if max_abs < 1e-12:
-        return 1.0  # 全零 delta，scale 无意义
-    return max_abs / float(q_max) * float(coverage_factor)
+    return compute_window_scale(max_abs, q_max, coverage=coverage_factor)

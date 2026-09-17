@@ -52,7 +52,7 @@ security:
   # B: Windowed SecAgg v2（pairwise+self mask, server 只见聚合和）
   secagg_enabled: false         # true=启用 SecAgg（默认关闭，联调验证后再开）
   secagg_modulus_bits: 16       # 模数位宽: 16=int16(2B,推荐) / 8=int8(需自适应scale) / 24/32
-  secagg_scale: 0.0             # 0=用默认 scale(2^-(bits-2))；>0=固定 scale
+  secagg_scale: 0.0             # 0=per-window 公开聚合；>0=固定全局 scale
   secagg_stochastic_rounding: false  # 随机舍入（让低精度平均无偏）
   secagg_q_min: 0               # 0=num_clients；>0=最小成功参与者数
 

@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from shared.fixed_point import quantize_to_zq
+from shared.fixed_point import quantize_to_zq, quantize_to_zq_with_feedback
 from shared.protocol import SecAggPlan, WindowDescriptor
 from shared.secagg_crypto import (
     apply_mask,
@@ -92,18 +92,27 @@ class SecAggClient:
         self,
         window: WindowDescriptor,
         delta_slice: torch.Tensor,
-    ) -> torch.Tensor:
+        return_feedback: bool = False,
+    ):
         """对单个 window 的 delta 做量化 + mask，返回 z_k (Z_q 整数向量)。
 
         z_k = q_k + Σ_{l>k} R_kl - Σ_{l<k} R_lk + B_k  (mod q)
+
+        return_feedback=True 时返回 (z_k, residual, stats)，residual 用于 memory error-feedback。
         """
         q = self.plan.modulus_q
         q_max = self.plan.q_max
-        scale = self.plan.quantization_scale
+        scale = self.plan.get_window_scale(window.window_id)
         stochastic = self.plan.stochastic_rounding
 
-        # 1. 定点量化
-        q_k = quantize_to_zq(delta_slice, scale, q_max, q, stochastic=stochastic)
+        # 1. 定点量化（per-window scale）
+        if return_feedback:
+            q_k, residual, stats = quantize_to_zq_with_feedback(
+                delta_slice, scale, q_max, q, stochastic=stochastic,
+            )
+        else:
+            q_k = quantize_to_zq(delta_slice, scale, q_max, q, stochastic=stochastic)
+            residual, stats = None, None
 
         # 2. 生成 pairwise masks
         pairwise_masks: List[Tuple[int, torch.Tensor]] = []
@@ -147,6 +156,8 @@ class SecAggClient:
 
         # 4. 加 mask
         z_k = apply_mask(q_k, pairwise_masks, B_k, self.client_id, q)
+        if return_feedback:
+            return z_k, residual, stats
         return z_k
 
     def mask_all_windows(
@@ -163,3 +174,38 @@ class SecAggClient:
             z_k = self.mask_window(window, delta_slice)
             results[window.window_id] = z_k
         return results
+
+
+def extract_window_slices(
+    to_send: Dict[str, torch.Tensor],
+    windows: List[WindowDescriptor],
+) -> Dict[int, torch.Tensor]:
+    """从 fp32/fp16 state 抽出每个 window 的 fp32 slice（量化必须用 fp32，不要先转 fp16）。"""
+    slices: Dict[int, torch.Tensor] = {}
+    for window in windows:
+        tensor = to_send.get(window.key_name)
+        if tensor is None or not tensor.is_floating_point():
+            slices[window.window_id] = torch.zeros(window.vector_length, dtype=torch.float32)
+            continue
+        flat = tensor.contiguous().view(-1)
+        end = min(int(window.end), int(flat.numel()))
+        start = min(int(window.start), end)
+        sl = flat[start:end].detach().to(dtype=torch.float32)
+        if sl.numel() < window.vector_length:
+            padded = torch.zeros(window.vector_length, dtype=torch.float32)
+            if sl.numel() > 0:
+                padded[: sl.numel()] = sl
+            sl = padded
+        slices[window.window_id] = sl.contiguous()
+    return slices
+
+
+def window_amax_payload(slices: Dict[int, torch.Tensor]) -> Dict[str, float]:
+    """构造 key-announce 用的 per-window max|delta|（JSON 键必须是 str）。"""
+    out: Dict[str, float] = {}
+    for wid, tensor in slices.items():
+        if tensor is None or tensor.numel() == 0:
+            out[str(wid)] = 0.0
+        else:
+            out[str(wid)] = float(tensor.abs().max().item())
+    return out

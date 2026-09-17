@@ -29,7 +29,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from shared.fixed_point import (
+    ROUND1_PUBLIC_SCALE,
+    SCALE_COVERAGE,
     aggregate_zq,
+    compute_window_scale,
     dequantize_from_zq,
     unmask_aggregate,
 )
@@ -94,6 +97,12 @@ class SecAggCoordinator:
         self.masked_windows: Dict[int, Dict[int, torch.Tensor]] = {}  # window_id → {client_id → z_kw}
         self.self_masters: Dict[int, bytes] = {}      # client_id → self_master (32 bytes)
         self.survivors: Optional[List[int]] = None    # 冻结后的幸存者集合
+        # window_id → {client_id → amax}，收齐后取 max_k 算当轮 scale
+        self.window_amax: Dict[int, Dict[int, float]] = {}
+        # per-window scale：收齐所有 client amax 后才就绪
+        self.window_scales: Dict[int, float] = {}
+        self.scales_ready: bool = False
+        self._init_window_scales()
 
         logger.info(
             "SecAggCoordinator: round=%s session=%s cohort=%s windows=%s clients=%s",
@@ -101,23 +110,104 @@ class SecAggCoordinator:
             len(windows), self.client_ids,
         )
 
+    def _init_window_scales(self) -> None:
+        """初始化为 fallback（公开常数）；收齐 client amax 后由 _finalize_window_scales 覆盖。
+
+        fallback 只在 client 还没上报 amax 时使用（例如 key-announce 尚未完成）。
+        不读任何单 client 私有统计作为最终 scale。
+        """
+        fallback = float(self.secagg_plan.quantization_scale)
+        if fallback <= 0.0:
+            fallback = ROUND1_PUBLIC_SCALE
+        for window in self.windows:
+            self.window_scales[window.window_id] = fallback
+        self.secagg_plan.window_scales = {
+            str(k): float(v) for k, v in self.window_scales.items()
+        }
+        if self.window_scales:
+            vals = list(self.window_scales.values())
+            logger.info(
+                "SecAgg: window scales fallback n=%s min=%e max=%e (waiting for client amax)",
+                len(vals), min(vals), max(vals),
+            )
+
+    def _finalize_window_scales(self) -> None:
+        """收齐所有 client 的 per-window amax 后，取 max_k 算当轮 scale。
+
+        scale_b = max_k(|delta_{k,b}|) / Q_max * SCALE_COVERAGE
+        SCALE_COVERAGE=1.05 → amax 映射到 0.95*Q_max，不 clip。
+        所有 client 用同一套 scale（整数域求和的前提）。
+        """
+        q_max = self.secagg_plan.q_max
+        for window in self.windows:
+            wid = window.window_id
+            amax_per_client = self.window_amax.get(wid, {})
+            if not amax_per_client:
+                continue
+            amax = max(amax_per_client.values())
+            self.window_scales[wid] = compute_window_scale(amax, q_max, coverage=SCALE_COVERAGE)
+        self.secagg_plan.window_scales = {
+            str(k): float(v) for k, v in self.window_scales.items()
+        }
+        self.scales_ready = True
+        vals = list(self.window_scales.values())
+        logger.info(
+            "SecAgg: window scales finalized (current-round amax) n=%s min=%e max=%e median=%e",
+            len(vals), min(vals), max(vals), sorted(vals)[len(vals) // 2],
+        )
+
     # ----------------------------------------------------------------------- #
     # Phase 1: 公钥收集 + relay
     # ----------------------------------------------------------------------- #
 
-    def submit_public_key(self, client_id: int, pk_raw: bytes) -> Dict[str, Any]:
-        """client 提交自己的 X25519 公钥。"""
+    def submit_public_key(
+        self,
+        client_id: int,
+        pk_raw: bytes,
+        window_amax: Optional[Dict[Any, float]] = None,
+    ) -> Dict[str, Any]:
+        """client 提交 X25519 公钥 + per-window amax（当轮对齐 scale 用）。
+
+        window_amax: {str(window_id): max|delta|}，泄露每 window 的 L∞（非更新本身）。
+        收齐所有 client 后取 max_k → scale_b = max_k / Q_max * 1.05，本轮使用。
+        """
         with self.lock:
             self.public_keys[client_id] = pk_raw
+            n_keys = len(self.public_keys)
+            # 收集 per-window amax
+            if window_amax:
+                for wid_str, amax_val in window_amax.items():
+                    try:
+                        wid = int(wid_str)
+                    except (TypeError, ValueError):
+                        continue
+                    self.window_amax.setdefault(wid, {})[client_id] = float(amax_val)
+            all_received = n_keys >= len(self.client_ids)
+            # 收齐公钥（且至少有一个 client 报了 amax）→ 用当轮 amax 定 scale
+            if all_received and not self.scales_ready:
+                if any(self.window_amax.get(w.window_id) for w in self.windows):
+                    self._finalize_window_scales()
+                else:
+                    # 没有任何 client 报 amax（兼容旧 client）：保持 fallback，标记就绪
+                    self.scales_ready = True
+            scales_ready = self.scales_ready
+            window_scales = dict(self.window_scales)
             logger.info(
-                "SecAgg: received public key from client %s (%s/%s)",
-                client_id, len(self.public_keys), len(self.client_ids),
+                "SecAgg: received public key from client %s (%s/%s) scales_ready=%s",
+                client_id, n_keys, len(self.client_ids), scales_ready,
             )
-            all_received = len(self.public_keys) >= len(self.client_ids)
 
+        result: Dict[str, Any] = {
+            "received": n_keys,
+            "scales_ready": scales_ready,
+        }
         if all_received:
-            return {"status": "ready", "public_keys": self._get_peer_keys()}
-        return {"status": "waiting", "received": len(self.public_keys)}
+            result["status"] = "ready"
+            result["public_keys"] = self._get_peer_keys()
+        else:
+            result["status"] = "waiting"
+        result["window_scales"] = {str(k): float(v) for k, v in window_scales.items()}
+        return result
 
     def _get_peer_keys(self) -> Dict[str, str]:
         """返回所有 client 的公钥（hex 编码，用于 JSON 传输）。"""
@@ -127,11 +217,24 @@ class SecAggCoordinator:
         }
 
     def get_peer_keys(self) -> Dict[str, Any]:
-        """client 获取所有其他 client 的公钥。"""
+        """client 获取所有其他 client 的公钥，以及已对齐的 per-window scale。"""
         with self.lock:
+            scales_payload = {str(k): float(v) for k, v in self.window_scales.items()}
             if len(self.public_keys) >= len(self.client_ids):
-                return {"status": "ready", "public_keys": self._get_peer_keys()}
-            return {"status": "waiting", "received": len(self.public_keys)}
+                result: Dict[str, Any] = {
+                    "status": "ready",
+                    "public_keys": self._get_peer_keys(),
+                    "scales_ready": self.scales_ready,
+                    "received": len(self.public_keys),
+                }
+                if self.scales_ready:
+                    result["window_scales"] = scales_payload
+                return result
+            return {
+                "status": "waiting",
+                "received": len(self.public_keys),
+                "scales_ready": self.scales_ready,
+            }
 
     # ----------------------------------------------------------------------- #
     # Phase 3: 收集 masked windows
@@ -220,7 +323,6 @@ class SecAggCoordinator:
             )
 
         q = self.secagg_plan.modulus_q
-        scale = self.secagg_plan.quantization_scale
         n_survivors = len(self.survivors)
 
         # 按 window 聚合
@@ -266,7 +368,8 @@ class SecAggCoordinator:
             # 4. 移除 self_mask
             sum_q = unmask_aggregate(sum_z, sum_B, q)
 
-            # 5. dequant → delta
+            # 5. dequant → delta（per-window scale）
+            scale = self.secagg_plan.get_window_scale(wid)
             delta_slice = dequantize_from_zq(sum_q, scale, q)
 
             # 6. 加权平均（等权：delta / N）
@@ -300,4 +403,6 @@ class SecAggCoordinator:
                 "self_masters_received": len(self.self_masters),
                 "survivors": self.survivors,
                 "q_min": self.secagg_plan.q_min,
+                "scales_ready": self.scales_ready,
+                "n_window_scales": len(self.window_scales),
             }

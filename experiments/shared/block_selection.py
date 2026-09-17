@@ -456,3 +456,30 @@ def update_block_memory(
                 flat[s:e] = 0.0
         new_memory[key_name] = (flat * decay).to(dtype=tensor.dtype).view(tensor.shape)
     return new_memory
+
+
+def update_block_memory_with_quant_residual(
+    to_send: Dict[str, torch.Tensor],
+    selected_by_key: SelectedByKey,
+    quant_residual: BlockDelta,
+    decay: float,
+) -> Dict[str, torch.Tensor]:
+    """未选中 block 保留 to_send；选中 block 保留量化 residual；再整体 * decay。
+
+    residual = true_delta - dequant(quant(true_delta))。
+    没有 residual 的选中 block 仍置 0（与 update_block_memory 一致）。
+    """
+    new_memory: Dict[str, torch.Tensor] = {}
+    for key_name, tensor in to_send.items():
+        if not tensor.is_floating_point():
+            new_memory[key_name] = tensor.clone()
+            continue
+        flat = tensor.contiguous().view(-1).to(dtype=torch.float32).clone()
+        if key_name in selected_by_key:
+            for s, e in selected_by_key[key_name]:
+                flat[s:e] = 0.0
+        for item in quant_residual.get(key_name, []):
+            s, e, res = int(item[0]), int(item[1]), item[2]
+            flat[s:e] = res.to(dtype=torch.float32)
+        new_memory[key_name] = (flat * decay).to(dtype=tensor.dtype).view(tensor.shape)
+    return new_memory

@@ -2,7 +2,7 @@
 # SEC-1/2/3 关闭（隔离测试 SecAgg），eval 每轮做
 federated:
   num_clients: 2
-  num_rounds: 5
+  num_rounds: 20
   coverage_h: 10
   slots_per_round: 1
   seed: 20260831

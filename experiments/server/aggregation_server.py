@@ -58,6 +58,7 @@ from shared.fixed_point import (
     DEFAULT_Q,
     DEFAULT_Q_MAX,
     DEFAULT_SCALE,
+    ROUND1_PUBLIC_SCALE,
     compute_q_max,
 )
 from server.secagg_coordinator import SecAggCoordinator
@@ -212,20 +213,17 @@ class AggregationServer:
         self.secagg_modulus_bits = int(secagg_modulus_bits)
         self.secagg_q = 1 << self.secagg_modulus_bits
         self.secagg_q_max = compute_q_max(self.secagg_modulus_bits, n_clients=max(num_clients, 2))
-        self.secagg_scale = float(secagg_scale)  # 0=自适应, >0=固定
+        self.secagg_scale = float(secagg_scale)  # 0=per-window 当轮 amax；>0=固定全局 scale
         self.secagg_stochastic_rounding = bool(secagg_stochastic_rounding)
         self.secagg_q_min = int(secagg_q_min) if secagg_q_min > 0 else num_clients
         # per-round SecAgg coordinator
         self.secagg_coordinators: Dict[int, SecAggCoordinator] = {}
         if self.secagg_enabled:
-            # round 1 的自适应 scale：用保守默认值
-            # delta max 通常 ~0.0003 (lr=1e-5, 30 steps)，用 scale=2^-20 覆盖
-            if self.secagg_scale <= 0:
-                self.secagg_scale = 2.0 ** -20  # ~9.5e-7, 可表示 ±0.0156
             logger.info(
-                "SecAgg enabled: modulus_bits=%s q=%s q_max=%s scale=%s q_min=%s",
+                "SecAgg enabled: modulus_bits=%s q=%s q_max=%s scale_mode=%s q_min=%s",
                 self.secagg_modulus_bits, self.secagg_q, self.secagg_q_max,
-                self.secagg_scale, self.secagg_q_min,
+                ("fixed:%g" % self.secagg_scale) if self.secagg_scale > 0 else "per-window-current-round-amax",
+                self.secagg_q_min,
             )
 
         self.current_round = 1
@@ -814,28 +812,6 @@ class AggregationServer:
                 self.current_round = round_idx + 1
                 self._ensure_plan(self.current_round)
                 self._mark_round_open(self.current_round)
-                # B-debug: 自适应 scale — 根据本轮 delta max 更新下一轮的 scale
-                if self.secagg_enabled:
-                    # 计算本轮 delta 的 max
-                    delta_max = 0.0
-                    for kn, blocks in agg_delta.items():
-                        for s, e, sd in blocks:
-                            m = float(sd.abs().max().item())
-                            if m > delta_max:
-                                delta_max = m
-                    if delta_max > 0:
-                        # scale = delta_max / q_max * 0.9 (留 10% 余量)
-                        new_scale = delta_max / float(self.secagg_q_max) * 0.9
-                        # 更新 secagg_scale 供下一轮使用
-                        self.secagg_scale = new_scale
-                        # 更新下一轮的 plan
-                        next_plan = self.round_plans.get(self.current_round)
-                        if next_plan:
-                            next_plan.secagg_scale = new_scale
-                        logger.info(
-                            "SecAgg: adaptive scale updated to %e (delta_max=%.4f)",
-                            new_scale, delta_max,
-                        )
             else:
                 self.current_round = self.num_rounds + 1
             self._aggregating = False
@@ -1366,12 +1342,18 @@ class AggregationServer:
             if round_idx in self.secagg_coordinators:
                 return self.secagg_coordinators[round_idx]
             plan = self._ensure_plan(round_idx)
-            # 把当前 secagg_scale 写入 plan，让 client 能读到
-            plan.secagg_scale = self.secagg_scale
+            fallback_scale = self.secagg_scale if self.secagg_scale > 0 else ROUND1_PUBLIC_SCALE
             windows = build_window_descriptors(plan.block_list)
+            # 固定 scale 模式：每 window 都用固定值；per-window 模式：留空，
+            # 由 coordinator 收齐 client amax 后 _finalize_window_scales 填充。
+            window_scales: Dict[str, float] = {}
+            if self.secagg_scale > 0:
+                for w in windows:
+                    window_scales[str(w.window_id)] = float(self.secagg_scale)
             secagg_plan = SecAggPlan(
                 q_min=self.secagg_q_min,
-                quantization_scale=self.secagg_scale,
+                quantization_scale=fallback_scale,
+                window_scales=window_scales,
                 modulus_bits=self.secagg_modulus_bits,
                 modulus_q=self.secagg_q,
                 q_max=self.secagg_q_max,
@@ -1392,13 +1374,19 @@ class AggregationServer:
             self.secagg_coordinators[round_idx] = coord
             return coord
 
-    def secagg_key_announce(self, round_idx: int, client_id: int, pk_hex: str) -> Dict[str, Any]:
-        """B-6: client 提交 X25519 公钥。"""
+    def secagg_key_announce(
+        self,
+        round_idx: int,
+        client_id: int,
+        pk_hex: str,
+        window_amax: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """B-6: client 提交 X25519 公钥 + per-window amax（当轮对齐 scale 用）。"""
         coord = self._get_or_create_secagg_coordinator(round_idx)
         if coord is None:
             raise HTTPException(400, "SecAgg not enabled")
         pk_raw = bytes.fromhex(pk_hex)
-        return coord.submit_public_key(client_id, pk_raw)
+        return coord.submit_public_key(client_id, pk_raw, window_amax)
 
     def secagg_get_peer_keys(self, round_idx: int) -> Dict[str, Any]:
         """B-6: client 获取所有 peer 的公钥。"""
@@ -1546,7 +1534,9 @@ def build_app(server: AggregationServer) -> FastAPI:
     def secagg_key_announce(
         round_idx: int, client_id: int, body: dict, _: None = Depends(_auth),
     ) -> Dict[str, Any]:
-        return server.secagg_key_announce(round_idx, client_id, body.get("pk_hex", ""))
+        return server.secagg_key_announce(
+            round_idx, client_id, body.get("pk_hex", ""), body.get("window_amax"),
+        )
 
     @app.get("/api/round/{round_idx}/secagg/peer-keys")
     def secagg_peer_keys(round_idx: int, _: None = Depends(_auth)) -> Dict[str, Any]:
@@ -1710,7 +1700,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--secagg-modulus-bits", type=int, default=16,
                    help="B: 模数位宽 8/16/24/32；16=int16(2B,推荐)；8=int8(需自适应scale)")
     p.add_argument("--secagg-scale", type=float, default=0.0,
-                   help="B: 定点量化 scale；0=用默认(2^-(bits-2))")
+                   help="B: 定点量化 scale；0=per-window 公开聚合；>0=固定全局 scale")
     p.add_argument("--secagg-stochastic-rounding", action="store_true", default=False,
                    help="B: 随机舍入（让低精度平均无偏）")
     p.add_argument("--secagg-q-min", type=int, default=0,
