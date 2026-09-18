@@ -4,8 +4,6 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Set, Tuple
 
-import torch
-
 logger = logging.getLogger(__name__)
 
 from shared.block_selection import (
@@ -14,11 +12,7 @@ from shared.block_selection import (
     build_permutations,
     build_selected_blocks,
     count_selected_elems,
-)
-from shared.block_vote import (
-    COMPRESSORS,
     flatten_group_blocks,
-    select_topk_indices,
     selected_from_flat,
 )
 from shared.canonical_encoding import (
@@ -35,6 +29,9 @@ from shared.protocol import (
     selected_to_jsonable,
 )
 from shared.state_dict_utils import floating_elem_count
+
+# public_random：S3R12v3 公开 mask（默认）。dense：全量上传（对照/调试）。
+COMPRESSORS = {"public_random", "dense"}
 
 
 class BlockScheduler:
@@ -65,7 +62,6 @@ class BlockScheduler:
         self.flat_blocks = flatten_group_blocks(self.group_blocks)
         self.total_elems = floating_elem_count(reference_state)
         self._perm_cache: Dict[int, Dict[str, list]] = {}
-        self._energy = None
         # SEC-1：gidx -> (key_name, start, end) 全局映射表（所有 block，不仅是选中的）
         # 从 flat_blocks 构建顺序 gidx 映射（flat_blocks 已按 group 顺序排列）
         self.gidx_layout: List[Tuple[str, int, int]] = list(self.flat_blocks)
@@ -94,20 +90,6 @@ class BlockScheduler:
             active.add((slot + i) % self.coverage_h)
         return active
 
-    def ingest_energy(self, energy: torch.Tensor) -> None:
-        if energy.numel() != len(self.flat_blocks):
-            logger.warning(
-                "drop energy vector len=%s expected=%s",
-                int(energy.numel()),
-                len(self.flat_blocks),
-            )
-            return
-        vec = energy.detach().to(dtype=torch.float32).reshape(-1)
-        if self._energy is None:
-            self._energy = vec.clone()
-        else:
-            self._energy = 0.5 * self._energy + 0.5 * vec
-
     def _public_selected(self, round_idx: int):
         slot = (round_idx - 1) % self.coverage_h
         epoch = (round_idx - 1) // self.coverage_h
@@ -135,11 +117,6 @@ class BlockScheduler:
             raise ValueError("round_idx must be >= 1")
         if self.compressor == "dense":
             selected = selected_from_flat(self.flat_blocks, range(len(self.flat_blocks)))
-            epoch = (round_idx - 1) // self.coverage_h
-            slot = (round_idx - 1) % self.coverage_h
-        elif self.compressor == "block_vote_lag" and self._energy is not None:
-            ids = select_topk_indices(self._energy.tolist(), self.rho)
-            selected = selected_from_flat(self.flat_blocks, ids)
             epoch = (round_idx - 1) // self.coverage_h
             slot = (round_idx - 1) % self.coverage_h
         else:

@@ -363,11 +363,6 @@ class AggregationServer:
         )
         return plan
 
-    def _ingest_energies(self, energies: List[float]) -> None:
-        if not energies:
-            return
-        self.scheduler.ingest_energy(torch.tensor(energies, dtype=torch.float32))
-
     def _round_key_for(self, round_idx: int) -> bytes:
         """SEC-2：从 plan 的 (seed, epoch) 派生 per-round 密钥。"""
         plan = self._ensure_plan(round_idx)
@@ -479,7 +474,6 @@ class AggregationServer:
             meta["client_upload_mono"][client_id] = time.monotonic()
             if body.timings:
                 meta["client_timings"][client_id] = dict(body.timings)
-            self._ingest_energies(body.block_energies)
             logger.info(
                 "Upload complete round=%s client=%s (%s/%s, min=%s) loss=%.4f n=%s timings=%s",
                 round_idx,
@@ -568,7 +562,6 @@ class AggregationServer:
                 "train_loss": train_loss,
                 "eval_loss": eval_loss,
             }
-            self._ingest_energies(block_energies or [])
 
             # 检查该 block 是否所有 client 都已上传
             all_uploaded = len(uploaded_clients) >= self.effective_min_clients
@@ -639,7 +632,6 @@ class AggregationServer:
                 "train_loss": train_loss,
                 "eval_loss": eval_loss,
             }
-            self._ingest_energies(block_energies or [])
             all_uploaded = len(uploaded_clients) >= self.effective_min_clients
 
         if not all_uploaded:
@@ -1209,7 +1201,7 @@ class AggregationServer:
                         logger.warning("SEC-4: rejected clients %s for round %s", sec4_rejected, round_idx)
 
                 t_apply0 = time.monotonic()
-                if self.compressor in {"block_topk", "dense"}:
+                if self.compressor == "dense":
                     selected = {}
                     seen: Dict[str, set] = {}
                     for delta in deltas:
@@ -1715,10 +1707,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--compressor",
         default="public_random",
-        choices=["public_random", "block_vote_lag", "block_topk", "dense"],
-        help="block 选择器：随机公共 mask / 滞后能量投票 / 本地 topk / 稠密",
+        choices=["public_random", "dense"],
+        help="block 选择：public_random=S3R12v3 公开 mask；dense=全量",
     )
-    p.add_argument("--rho", type=float, default=0.0, help="vote/topk 选择比例；0 则用 1/coverage_h")
+    p.add_argument(
+        "--rho",
+        type=float,
+        default=0.0,
+        help="保留字段（yaml 兼容）；public_random 不使用",
+    )
     p.add_argument("--always-on-threshold", type=int, default=4096,
                    help="numel <= this → always_on (LayerNorm/bias/gate scalars); 0=disable")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)

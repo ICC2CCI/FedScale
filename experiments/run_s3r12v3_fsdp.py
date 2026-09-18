@@ -50,21 +50,17 @@ from shared.block_selection import (  # noqa: E402
     add_block_delta,
     build_group_blocks,
     encode_block_delta,
+    flatten_group_blocks,
+    merge_quant_residual_memory,
     resolve_transfer_dtype,
+    selected_from_flat,
     update_block_memory,
     update_block_memory_from_states,
-    merge_quant_residual_memory,
 )
 from shared.block_crypto import (  # noqa: E402
     derive_round_key,
     encode_sec_block_payload,
     pad_slice,
-)
-from shared.block_vote import (  # noqa: E402
-    block_energies,
-    flatten_group_blocks,
-    select_topk_indices,
-    selected_from_flat,
 )
 from shared.minio_client import MinIOClient  # noqa: E402
 from shared.protocol import (  # noqa: E402
@@ -660,9 +656,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--compressor",
         default="public_random",
-        choices=["public_random", "block_vote_lag", "block_topk", "dense"],
+        choices=["public_random", "dense"],
+        help="block 选择：public_random=S3R12v3 公开 mask；dense=全量",
     )
-    p.add_argument("--rho", type=float, default=0.0, help="vote/topk 比例；0 表示跟随 yaml/coverage")
+    p.add_argument(
+        "--rho",
+        type=float,
+        default=0.0,
+        help="保留字段（yaml 兼容）；public_random 不使用",
+    )
     p.add_argument("--always-on-threshold", type=int, default=4096,
                    help="numel <= this → always_on (LayerNorm/bias/gate scalars); 0=disable")
     p.add_argument("--poll-interval", type=float, default=2.0)
@@ -937,10 +939,9 @@ def main() -> None:
         plan = RoundPlan.from_dict(plan_raw)
         selected = selected_from_jsonable(plan.selected_by_key)
         # 流式 pipeline：plan 带 block_list 时用 per-block 上传+下载
-        use_pipeline = bool(plan.block_list) and str(getattr(args, "compressor", "public_random")) not in {
-            "block_topk",
-            "dense",
-        }
+        use_pipeline = bool(plan.block_list) and str(
+            getattr(args, "compressor", "public_random")
+        ) != "dense"
 
         # OPS-3：Client 选择。未选中则跳过训练，但仍对齐 delta 并等待聚合结果
         selected_client_ids = plan_raw.get("selected_client_ids")
@@ -1183,17 +1184,11 @@ def main() -> None:
             delta = sub_state(full_state, global_state)
             to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
-            groups, _ = build_group_blocks(to_send, block_size=args.block_size)
-            flat = flatten_group_blocks(groups)
-            energies = block_energies(to_send, flat)
             compressor = str(getattr(args, "compressor", "public_random") or "public_random")
-            rho = float(getattr(args, "rho", 0.0) or 0.0)
-            if rho <= 0:
-                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
             local_selected = selected
-            if compressor == "block_topk":
-                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
-            elif compressor == "dense":
+            if compressor == "dense":
+                groups, _ = build_group_blocks(to_send, block_size=args.block_size)
+                flat = flatten_group_blocks(groups)
                 local_selected = selected_from_flat(flat, range(len(flat)))
             block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
             mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
@@ -1256,7 +1251,7 @@ def main() -> None:
                         "num_examples": int(num_examples),
                         "train_loss": float(train_loss),
                         "eval_loss": float(eval_loss_val) if eval_loss_val is not None else None,
-                        "block_energies": energies if int(gidx) == 0 else [],
+                        "block_energies": [],
                     },
                     timeout=30,
                     headers=auth_headers,
@@ -1335,17 +1330,11 @@ def main() -> None:
             delta = sub_state(full_state, global_state)
             to_send = add_state(delta, mem_box[0])
             assert transfer_dtype is not None
-            groups, _ = build_group_blocks(to_send, block_size=args.block_size)
-            flat = flatten_group_blocks(groups)
-            energies = block_energies(to_send, flat)
             compressor = str(getattr(args, "compressor", "public_random") or "public_random")
-            rho = float(getattr(args, "rho", 0.0) or 0.0)
-            if rho <= 0:
-                rho = 1.0 / max(int(plan.coverage_h or 1), 1)
             local_selected = selected
-            if compressor == "block_topk":
-                local_selected = selected_from_flat(flat, select_topk_indices(energies, rho))
-            elif compressor == "dense":
+            if compressor == "dense":
+                groups, _ = build_group_blocks(to_send, block_size=args.block_size)
+                flat = flatten_group_blocks(groups)
                 local_selected = selected_from_flat(flat, range(len(flat)))
             block_delta = encode_block_delta(to_send, local_selected, dtype=transfer_dtype)
             mem_box[0] = update_block_memory(to_send, local_selected, args.memory_decay)
@@ -1421,7 +1410,7 @@ def main() -> None:
                 "model_delta_bytes": int(upload_bytes),
             }
             t_notify0 = time.monotonic()
-            body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings, "block_energies": energies}
+            body = {"num_examples": int(num_examples), "train_loss": float(train_loss), "timings": timings}
             if eval_loss_val is not None:
                 body["eval_loss"] = float(eval_loss_val)
             resp = requests.post(

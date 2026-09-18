@@ -17,9 +17,8 @@ federated:
   transfer_dtype: fp16
   memory_decay: 0.9
   block_size: 524288
-  # BlockVote / selection (default keeps legacy public random mask)
-  compressor: public_random   # public_random | block_vote_lag | block_topk | dense
-  rho: 0.0                    # 0 => 1/coverage_h
+  compressor: public_random   # 默认 S3R12v3 公开 mask；dense=全量对照
+  rho: 0.0                    # 保留字段；public_random 不使用
   always_on_threshold: 4096   # A-4: numel <= this → always_on (LayerNorm/bias/gate scalars)
 
 train:

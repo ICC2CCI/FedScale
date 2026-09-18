@@ -34,8 +34,9 @@ app = FastAPI(title="FedScale Evaluation Dashboard")
 _MODE_LABELS = {
     "dense": "基线·全量上传",
     "public_random": "分片·随机轮转",
-    "block_vote_lag": "分片·能量投票",
-    "block_topk": "分片·TopK",
+    # 历史实验目录仍可能带这些 compressor 名，仅作展示
+    "block_vote_lag": "分片·能量投票（已下线）",
+    "block_topk": "分片·TopK（已下线）",
 }
 
 

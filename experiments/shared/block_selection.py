@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -201,6 +201,30 @@ def get_always_on_blocks(
             if kn in always_on_keys:
                 always_on.append((kn, s, e))
     return always_on
+
+
+def flatten_group_blocks(group_blocks: GroupBlocks) -> List[Tuple[str, int, int]]:
+    """Canonical order: sorted group id, then that group's blocks."""
+    flat: List[Tuple[str, int, int]] = []
+    for gid in sorted(group_blocks):
+        for key_name, start, end in group_blocks[gid]:
+            flat.append((key_name, start, end))
+    return flat
+
+
+def selected_from_flat(
+    flat: Sequence[Tuple[str, int, int]],
+    indices: Iterable[int],
+) -> SelectedByKey:
+    selected: SelectedByKey = {}
+    n = len(flat)
+    for idx in indices:
+        i = int(idx)
+        if i < 0 or i >= n:
+            continue
+        key_name, start, end = flat[i]
+        selected.setdefault(key_name, []).append((start, end))
+    return selected
 
 
 def build_permutations(

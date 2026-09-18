@@ -19,7 +19,6 @@ from shared.block_selection import (
     count_selected_elems,
     recompute_selected_blocks,
 )
-from shared.block_vote import flatten_group_blocks
 from shared.canonical_encoding import (
     MASK_POLICY_ID,
     compute_layout_hash,
