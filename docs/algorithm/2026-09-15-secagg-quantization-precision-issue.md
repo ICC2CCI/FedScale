@@ -431,8 +431,9 @@ PYTHONPATH=experiments python experiments/tests/test_secagg.py
 ## 6. 后续（可选）
 
 1. ~~Hadamard + raw bytes + Issue #1~~：**已完成**（`202609180941` 复跑确认）。
-2. **int24 / EF21 / Kashin / SCAFFOLD**：仅当要再压带宽或换更大模型时再评估。
-3. 更强隐私：去掉 `global_amax` 或加密上报 train/eval loss（精度/工程权衡）。
+2. **时间效率（通用，不改量化）**：合并上传对象、通知不拉 MinIO、复用 FWHT 等，见 [active：SecAgg 时间效率](../exec-plans/active/2026-09-18-secagg-time-efficiency.md)。
+3. **int24 / EF21 / Kashin / SCAFFOLD**：仅当要再压带宽或换更大模型时再评估。
+4. 更强隐私：去掉 `global_amax` 或加密上报 train/eval loss（精度/工程权衡）。
 
 ## 7. 环境注意事项
 

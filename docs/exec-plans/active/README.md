@@ -2,7 +2,13 @@
 
 此处只放 **尚未结项** 的计划。做完后把对应文件移到 [`../completed/`](../completed/)，并在文首把状态改为 `completed`。
 
-当前：**无进行中计划**（`2026-09-11-dual-cluster-to-production` 已归档到 [`../completed/`](../completed/)）。
+当前进行中：
+
+| 计划 | 说明 |
+|---|---|
+| [SecAgg 时间效率](2026-09-18-secagg-time-efficiency.md) | 通用：少 RTT、合并 blob、复用 FWHT；不关 Hadamard、不增大传输 |
+
+已归档：`2026-09-11-dual-cluster-to-production` → [`../completed/`](../completed/)。
 
 新实验 / SecAgg 对照以这些为准：
 

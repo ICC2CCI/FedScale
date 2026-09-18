@@ -30,7 +30,9 @@
 
 ## active
 
-当前无进行中计划。见 [`active/README.md`](active/README.md)。
+| 计划 | 说明 |
+|---|---|
+| [SecAgg 时间效率](active/2026-09-18-secagg-time-efficiency.md) | 通用优化（少 RTT / 合并 blob / 复用 FWHT）；保 Hadamard 与传输量 |
 
 ## completed
 

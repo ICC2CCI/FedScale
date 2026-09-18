@@ -21,6 +21,7 @@
 | [复现参数](reference/federated-training-reproduction-params.md) | 完整复现参数表 |
 | [已完成：双集群 FSDP 联调](exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) | 测试床落地结项 |
 | [已完成：联调 → 真实联邦](exec-plans/completed/2026-09-11-dual-cluster-to-production.md) | CFG/SEC/SCALE 等切片结项 |
+| [进行中：SecAgg 时间效率](exec-plans/active/2026-09-18-secagg-time-efficiency.md) | 通用加速（不特化 0.5B）；保 eval、不增大传输 |
 
 ## 历史 / 部分过时（勿当操作手册）
 
