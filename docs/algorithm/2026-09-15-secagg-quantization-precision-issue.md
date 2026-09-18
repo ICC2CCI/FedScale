@@ -1,17 +1,18 @@
 # SecAgg 量化精度问题分析与优化方案
 
-> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（旧 20 轮验证）/ 2026-09-18（Hadamard 20 轮对齐 fp16）
-> 状态：**收敛问题已解决，当前默认路径为 Hadamard + Issue #1**。
+> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（旧 20 轮）/ 2026-09-18（Hadamard 对齐 fp16，含复跑）
+> 状态：**已解决并成为默认路径**（Hadamard + Issue #1 + raw bytes + 异步 finalize）。
 >
 > | 阶段 | 结果目录 | R20 eval | 说明 |
 > |---|---|---|---|
 > | 修复前发散 | 早期 5 轮 | — | R5 飙到 2.36 |
 > | per-window amax 修复 | `202609162025` | **1.328** | 不再发散，但仍落后 fp16 |
 > | Hadamard + Issue #1 | `202609171809` | **0.985** | ≈ fp16 `final-clean` **0.987** |
+> | 关掉 profiler 复跑 | **`202609180941`** | **0.985** | `train≈38s`，整轮≈148s；传输记账正常 |
 >
-> 当前端到端流程以 §3.1「Hadamard 默认路径」为准；§3.1.1 保留旧 per-window 流程作历史对照。
-> 详细调研与 Phase 记录见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。
-> 双集群联调总览见 `docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1。
+> **当前端到端流程以 §3.1「Hadamard 默认路径」为准**；§2 / §3.1.1 的 per-window 描述是历史中间态。  
+> 调研与 Phase：`docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。  
+> 联调总览：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1。
 
 ## 1. 问题概述
 
@@ -23,8 +24,11 @@ SecAgg（安全聚合）5 轮端到端测试中，Round 1 与 fp16 基线一致�
 修复前（5 轮）:
 R1: eval=1.498  R2: eval=1.733  R3: eval=1.960  R4: eval=2.244  R5: eval=2.362  ← 上升
 
-修复后（20 轮）:
-R1: eval=1.498  R5: eval=1.432  R9: eval=1.377  R20: eval=1.328  ← 下降收敛
+per-window amax 修复后（20 轮, 202609162025）:
+R1: eval=1.498  R5: eval=1.432  R20: eval=1.328  ← 下降但仍落后 fp16
+
+Hadamard + Issue #1（当前默认, 202609180941）:
+R1: eval=1.498  R5: eval=1.364  R10: eval=1.091  R20: eval=0.985  ← 对齐 fp16≈0.987
 ```
 
 ### 1.2 排除项
@@ -46,9 +50,12 @@ SecAgg 必须在整数域加 mask，所以 delta 只能先变成定点。fp16 �
 
 ### 2.1 核心思路
 
-把 fp16 的「per-value 指数」改为「per-window scale」，让每个 window（block，约 269 个）的量化精度匹配自己的动态范围。同时修复旧自适应逻辑的三个缺陷。
+**历史（§2.2）**：先把「一个全局 scale」改成 **per-window 当轮 amax**，修好 coverage / 滞后 scale / 无 residual，eval 从发散变为可下降（R20=1.328）。
 
-### 2.2 五项修复
+**当前默认**：在此基础上再上 **Hadamard 旋转 + 全局 `global_amax`（1 个标量）+ Issue #1（FP32 delta / quant residual 不衰减）+ MinIO raw bytes**，R20 eval≈0.985。  
+下面 §2.2 保留 per-window 五项修复记录；实现与配置以 §3.1 / §5.2 为准。
+
+### 2.2 五项修复（per-window 中间态，已归档）
 
 #### A. Per-window scale（`SecAggPlan.window_scales: Dict[window_id, float]`）
 
@@ -249,12 +256,12 @@ FP16 模型参数
 #### 3.4.5 安全模型总结
 
 ```
-Server 能看到:
-  - 每轮 per-window L∞ (269 floats) ← 本方案新增，可回退到公开聚合 max
-  - masked z_k (被 mask 保护，看不到 q_k)
-  - self_master (能看到 B_k，但缺 R_kl 无法分离)
-  - train/eval loss (pipeline 本身泄露，非 SecAgg 引入)
-  - 聚合后的 agg_delta (设计上公开)
+Server 能看到（Hadamard 当前默认）:
+  - 每轮 1 个 global_amax（旋转域 L∞）← scale 对齐；旧路径曾是 269 个 per-window L∞
+  - masked z_k（被 mask 保护，看不到 q_k）
+  - self_master（能看到 B_k，但缺 R_kl 无法分离）
+  - train/eval loss（pipeline 本身泄露，非 SecAgg 引入）
+  - 聚合后的 agg_delta（设计上公开）
 
 Server 看不到:
   - 单 client 的 delta 方向/具体值
@@ -262,7 +269,7 @@ Server 看不到:
   - q_k（需 R_kl + B_k 同时泄露）
 ```
 
-**结论（旧方案）**：per-window 当轮 amax 会额外泄露 269 个 L∞ 标量/轮。Hadamard 路径已改为只上报 1 个 `global_amax`，所有 window 共用同一 scale，见调研文档 §3.2。
+**结论**：Hadamard 路径只额外泄露 1 个 `global_amax`；旧 per-window 路径泄露 269 个 L∞。详见调研文档 §3.2。
 
 ## 4. 验证结果
 
@@ -368,50 +375,51 @@ fp16 upload ~7s，SecAgg upload ~48s。传输量接近（125 vs 135 MiB），差
 2. **逐 window 串行上传**：269 个 window 逐个 POST，每个请求的 HTTP/JSON 开销累积
 3. fp16 路径是批量打包一次上传，SecAgg 是逐 window 上传
 
-### 4x.5 可能的优化方向
+### 4x.5 优化方向（落地状态，2026-09-18）
 
-| 优化 | 解决什么 | 预期效果 |
+| 优化 | 解决什么 | 状态 |
 |---|---|---|
-| **raw bytes 上传（不走 hex）** | upload 慢 + 传输量翻倍 | upload 从 48s→~10s，传输量减半 |
-| **批量 pack + 批量上传** | 逐 window 串行开销 | encode 从 55s→~30s |
-| **int24 + raw bytes** | 定点精度不足 | 精度接近 fp16，但流量 +50% |
-| **Hadamard 变换** | window 内动态范围 | 压低 min/max ratio，小值相对误差降低 |
-| **memory_decay=1.0** | residual 衰减 | error-feedback 不衰减，但可能引入振荡 |
-| **fp16 传输 + 定点 mask**（非标准） | 定点精度损失 | mask 在 fp16 域加（有残余误差），但精度好 |
+| **raw bytes 上传（不走 hex）** | upload 慢 + 传输量翻倍 | ✅ 已落地（`z_key` + MinIO） |
+| **Hadamard + 全局 scale** | window 内动态范围 / per-window L∞ | ✅ 已落地；R20≈0.985 |
+| **quant residual decay=1.0** | 量化误差被 0.9 吃掉 | ✅ Issue #1 |
+| **异步 finalize** | self-master HTTP 超时 | ✅ 已落地 |
+| **默认关 detailed-train-metrics** | train 被 profiler 拖到 ~300s | ✅ 默认关；正式跑 `train≈38s` |
+| int24 / EF21 / Kashin | 进一步压缩或精度 | 后备，当前不需要 |
+
+> §4x.1–4x.4 描述的是 **hex 时代** 的慢因分析，请勿当成当前瓶颈清单。当前剩余开销主要是 Hadamard+量化 encode（~50s）与 raw 上传（~40s）。
 
 ## 5. 代码实现
 
 ### 5.1 核心文件
 
-| 文件 | 改动 |
+| 文件 | 当前职责 |
 |---|---|
-| `experiments/shared/fixed_point.py` | `quantize_to_zq_with_feedback`（返回 residual+stats）、`compute_window_scale`、`SCALE_COVERAGE=1.05` |
-| `experiments/shared/protocol.py` | `SecAggPlan.window_scales: Dict[str,float]`、`get_window_scale()` |
-| `experiments/server/secagg_coordinator.py` | `_init_window_scales`（fallback）、`_finalize_window_scales`（当轮 amax → scale）、`submit_public_key`（收集 amax） |
-| `experiments/shared/secagg_client.py` | `mask_window(return_feedback=True)`、`extract_window_slices`（fp32）、`window_amax_payload` |
-| `experiments/shared/block_selection.py` | `update_block_memory_with_quant_residual`（error-feedback） |
-| `experiments/server/aggregation_server.py` | 删除 `update_public_block_scales` 调用，per-window 模式由 coordinator 按 amax 填充 |
-| `experiments/run_s3r12v3_fsdp.py` | key-announce 带 `window_amax_payload`，量化用 fp32 slice，收集 clip/zero 日志 |
-| `experiments/tests/test_secagg.py` | `test_public_scales_use_current_round_amax`、`test_window_scale_does_not_clip_amax`、`test_quant_error_feedback_identity` 等 |
+| `experiments/shared/fixed_point.py` | 向量化 FWHT、量化+feedback、误差指标 |
+| `experiments/shared/protocol.py` | `SecAggPlan`（hadamard / session / scale） |
+| `experiments/server/secagg_coordinator.py` | global_amax→统一 scale；pad-p2 逆变换；聚合 |
+| `experiments/shared/secagg_client.py` | Hadamard amax、mask、raw 上传辅助 |
+| `experiments/shared/block_selection.py` | block_memory / quant_residual 拆分 |
+| `experiments/server/aggregation_server.py` | `z_key` 读 MinIO；后台 finalize |
+| `experiments/run_s3r12v3_fsdp.py` | SecAgg 主路径；session 同步；`post_delta_MiB`；`--detailed-train-metrics` |
+| `experiments/tests/test_secagg.py` | 量化 / mask / scale 单测 |
 
-### 5.2 配置
+### 5.2 配置（当前默认）
 
 ```yaml
 # configs/s3r12v3-fsdp-secagg-verify.yaml
 federated:
-  num_rounds: 20
+  num_rounds: 20                 # 可用 NUM_ROUNDS_ENV 覆盖
   coverage_h: 10
-  compressor: public_random
-  transfer_dtype: fp16
-  memory_decay: 0.9
+  memory_decay: 0.9              # 仅未选中 block
+  quant_residual_decay: 1.0      # 量化残差不衰减
   block_size: 524288
 
 security:
   secagg_enabled: true
-  secagg_modulus_bits: 16       # int16 (2B)
-  secagg_scale: 0.0             # 0=per-window 当轮 amax；>0=固定全局 scale
+  secagg_modulus_bits: 16
+  secagg_scale: 0.0              # Hadamard 下用 global_amax 定全局 scale
   secagg_stochastic_rounding: true
-  secagg_q_min: 0
+  secagg_hadamard: true
 ```
 
 ### 5.3 单元测试
@@ -420,18 +428,17 @@ security:
 PYTHONPATH=experiments python experiments/tests/test_secagg.py
 ```
 
-覆盖：量化精度、当轮 amax 对齐 scale（`max_k` + `SCALE_COVERAGE`）、per-window 混合量级、error-feedback 恒等性、mask 抵消、端到端 2-client SecAgg。
+## 6. 后续（可选）
 
-## 6. 后续方案（已部分落地）
-
-1. **Hadamard 变换 + 全局 scale + raw bytes**：**已落地**。5 轮 R5 eval=1.364。见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。
-2. **int24**：仍为后备。raw bytes 上传已不再是瓶颈。
-3. **EF21 / Kashin / SCAFFOLD**：调研明确为后备，Hadamard 5 轮已接近 fp16 R5，20 轮对照后再决定。
+1. ~~Hadamard + raw bytes + Issue #1~~：**已完成**（`202609180941` 复跑确认）。
+2. **int24 / EF21 / Kashin / SCAFFOLD**：仅当要再压带宽或换更大模型时再评估。
+3. 更强隐私：去掉 `global_amax` 或加密上报 train/eval loss（精度/工程权衡）。
 
 ## 7. 环境注意事项
 
 运行 SecAgg 验证时需注意：
 
-1. **端口**：server 必须跑在防火墙开放的端口（如 8081）。8080 可能被 K8s/iptables 规则挡住（`curl 127.0.0.1:8080` 超时但 `ss` 显示 LISTEN）。
-2. **干扰进程**：`/home/pcllgr/fedscale-eval/` 下的 `launch_sharded.sh`、`launch_dense.sh`、`anti_rogue_watchdog.sh` 可能用 `pkill -f aggregation_server.py` 杀掉所有 server。运行前确认这些脚本已更新（只杀 8081，不杀 8080），或停掉相关自动重启机制。
-3. **远端代码同步**：修改 SecAgg 代码后需 rsync 到两个远端 repo（`~/liuchao/fedscale-icc-1` 和 `~/liuchao/fedscale-icc-2`），否则 client 跑旧代码不上报 amax，server 走 fallback 导致 scale 不对。
+1. **端口**：SecAgg 验证常用 **8081**（`AGGREGATION_PORT_OVERRIDE=8081`）。
+2. **干扰进程**：其他目录里的 watchdog / `pkill -f aggregation_server.py` 可能误杀；开跑前确认端口与 pid。
+3. **远端代码同步**：改 client 后需同步到 `~/liuchao/fedscale-icc-1` 与 `~/liuchao/fedscale-icc-2`。
+4. **观测开关**：正式对照勿开 `--detailed-train-metrics`（默认关）。

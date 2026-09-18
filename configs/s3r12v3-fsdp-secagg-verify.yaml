@@ -1,5 +1,5 @@
 # B-10 验证配置：SecAgg 开启（Hadamard + Issue #1 + raw bytes）
-# 5 轮回归已通过（results/202609180911）；当前用于 20 轮对照
+# 正式 20 轮对照：results/202609180941（R20 eval=0.985）；观测开着时见 202609171809
 # SEC-1/2/3 关闭（隔离测试 SecAgg），eval 每轮做
 federated:
   num_clients: 2

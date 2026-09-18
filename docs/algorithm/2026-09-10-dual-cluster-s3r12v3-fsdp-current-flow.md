@@ -1,14 +1,15 @@
 # 双集群 S3R12v3 + FSDP 当前联调流程说明
 
-- **日期**：2026-09-10（初稿）/ 2026-09-18（补 SecAgg 当前路径）
-- **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO 假死恢复；可选 Windowed SecAgg）
+- **日期**：2026-09-10（初稿）/ 2026-09-18（SecAgg 路径 + 正式复跑）
+- **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO；可选 Windowed SecAgg）
 - **参考跑次**：
   - 非 SecAgg（fp16 blocks）：`results/20260911-10pct-pipe2/`、`results/20260914-final-clean/`（R20 eval≈0.95–0.99）
-  - SecAgg（Hadamard 默认）：`results/202609171809/`（R20 eval=**0.985**）
+  - SecAgg Hadamard（观测曾开着）：`results/202609171809/`（R20=**0.985**，train 被 profiler 拉到 ~300s）
+  - **SecAgg Hadamard（正式）**：`results/202609180941/`（R20=**0.985**，`train≈38s`，整轮≈148s）
 - **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`
-- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg 验证用 `configs/s3r12v3-fsdp-secagg-verify.yaml`）
+- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg：`configs/s3r12v3-fsdp-secagg-verify.yaml` + 常用 `AGGREGATION_PORT_OVERRIDE=8081`）
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分内容已过时，以本文为准）。执行跟踪：已落地部分见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md)；未完成项见 [active TODO](../exec-plans/active/2026-09-11-dual-cluster-to-production.md)。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md)（`active/` 当前为空）。
 
 ---
 
@@ -33,11 +34,12 @@
                            ▼
               ┌────────────────────────────┐
               │     Central Server          │
-              │  Aggregation Server :8080   │
+              │  Aggregation Server :8080*  │
               │  MinIO               :9000  │
               └────────────────────────────┘
 ```
 
+\* SecAgg 验证常用 `AGGREGATION_PORT_OVERRIDE=8081`，避免与默认 8080 冲突。
 ---
 
 ## 2. 启动前准备（只做一次或换模型时做）
@@ -65,16 +67,16 @@
   ③ 装进 FSDP 模型（多卡 load/broadcast）
   ④ 本地训练若干 step
   ⑤ 在线 eval（可选）→ 得到 eval_loss
-  ⑥ 算更新：delta + memory → 只编码 plan 选中的 ~20% blocks
-  ⑦ 上传到 MinIO：uploads/round-N/client-C/blocks.pt
+  ⑥ 算更新：delta + memory → 只编码 plan 选中的 blocks（验证配置常约 **10%**，`coverage_h=10`）
+  ⑦ 上传到 MinIO：非 SecAgg 为 `blocks.pt`；SecAgg 为 masked INT16 raw（`z_key`）
   ⑧ HTTP 通知 Server：我传完了（附带 train/eval loss、分段耗时）
 
 【Server】
-  ⑨ 收齐 2 个 client 后：从 MinIO 拉两端 blocks
-  ⑩ FedAvg 应用到 global_state
+  ⑨ 收齐 2 个 client 后：从 MinIO 拉两端上传
+  ⑩ FedAvg（SecAgg 则先 unmask / 反量化 / 可选 iHadamard）应用到 global_state
   ⑪ 写出：
         global_delta/round-N/blocks.pt   ← 本轮增量（客户端下一轮主要靠它）
-        global_state/round-N/state.pt    ← 全量备份/兜底
+        global_state/round-N/state.pt    ← 全量备份/兜底（可按配置降频）
   ⑫ 标记本轮 done；记入 round_log.json
 
 【两端各自】
@@ -83,7 +85,7 @@
   ⑮ 进入下一轮（多数时候训练前 download=0，即 cache）
 ```
 
-对应时间图 `figures/time_breakdown.png`（以 ICC1 为例）：
+SecAgg 逐步细节见 §3.1；对应时间图 `figures/time_breakdown.png`（以 ICC1 为例）：
 
 | 图上名字 | 实际阶段 |
 |----------|----------|

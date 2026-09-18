@@ -1,9 +1,11 @@
 # SecAgg 量化优化：文献调研与技术方案
 
-> 日期：2026-09-17（落地）/ 2026-09-18（20 轮对照完成）
-> 状态：**Phase 3b 完成**。Issue #1 + 向量化 Hadamard + 全局 `global_amax` + MinIO raw bytes + session 同步 / 异步 finalize 已落地并验证。
+> 日期：2026-09-17（落地）/ 2026-09-18（20 轮对照 + profiler 关闭复跑）
+> 状态：**完成并复跑确认**。Issue #1 + Hadamard + `global_amax` + raw bytes + session / 异步 finalize。
 > - 5 轮：`results/202609171717`，R5 eval=**1.364**
-> - 20 轮：`results/202609171809`，R20 eval=**0.985**（对照 fp16 `20260914-final-clean` R20=**0.987**；旧 per-window SecAgg `202609162025` R20=**1.328**）
+> - 20 轮（观测曾开着）：`results/202609171809`，R20 eval=**0.985**（train≈300s，被 profiler 污染）
+> - **20 轮（正式，观测关）**：`results/202609180941`，R20 eval=**0.985**，`train≈38s`，整轮≈148s
+> - 对照：fp16 `20260914-final-clean` R20=**0.987**；旧 per-window SecAgg `202609162025` R20=**1.328**
 > 关联：
 > - [ICC2CCI/FedScale#1](https://github.com/ICC2CCI/FedScale/issues/1)
 > - `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`
@@ -30,7 +32,7 @@
 2. **时间更长**：hex 编码导致传输翻倍 + 逐 window 串行
 3. **仍有泄露**：per-window L∞（269 个标量/轮）
 
-**当前状态（Hadamard + Issue #1 + raw bytes，`202609171809`）**：R20 eval=**0.985** ≈ fp16 **0.987**；amax 降为 1 个 `global_amax`；上传走 MinIO raw bytes。原先「不能把剩余差距直接归因于 INT16」的判断已被 20 轮对照支持。
+**当前状态（Hadamard + Issue #1 + raw bytes，正式 `202609180941`）**：R20 eval=**0.985** ≈ fp16 **0.987**；amax 降为 1 个 `global_amax`；上传走 MinIO raw bytes；`train≈38s` / 整轮≈148s。原先「不能把剩余差距直接归因于 INT16」的判断已被 20 轮对照支持。
 
 ### 1.1 Issue #1：量化前多余的精度损失
 
@@ -252,7 +254,7 @@ Phase 1b: Issue #1         ✅ FP32 delta / 独立 residual decay / rel_L2·cosi
 Phase 2: Raw Bytes 上传    ✅ MinIO z_key；hex 兼容保留
 Phase 2b: 生产修复         ✅ session 同步；self-master 后台 finalize
 Phase 3a: 5 轮验证         ✅ 202609171717，R5 eval=1.364
-Phase 3b: 20 轮对照        ✅ 202609171809，R20 eval=0.985 ≈ fp16 0.987
+Phase 3b: 20 轮对照        ✅ 202609171809 / **202609180941**，R20 eval=0.985 ≈ fp16 0.987
 Phase 4（后备）            未做：EF21 / Kashin / int24
 ```
 
@@ -339,7 +341,20 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 | `upload_minio_s` | ~16s（fp16） | ~43s | raw bytes ~115–140 MiB/client |
 | 墙钟 / `round_total_s` | ~90s | ~420s | 主要由 train 观测膨胀主导 |
 
-自 2026-09-18 起，`--detailed-train-metrics` **默认关闭**；正式对照应看到 `train_local_s` 回到 ~38s 量级。需要 dashboard 细粒度指标时再显式打开。
+自 2026-09-18 起，`--detailed-train-metrics` **默认关闭**。正式对照见 **`results/202609180941`**：`train_local_s≈38s`，`round_total_s≈148s`，`post_delta_MiB` 已正确记账（约 115–140 MiB）。
+
+### 3.7b 正式复跑（观测关闭，`results/202609180941`）
+
+与 `171809` 同配置，仅关掉训练细粒度观测：
+
+| 轮次 | eval | train_s（约） | round_total_s（约） |
+|---|---|---|---|
+| R1 | 1.498 | 40 | 161 |
+| R5 | 1.364 | 38 | 145 |
+| R10 | 1.091 | 38 | — |
+| R20 | **0.985** | 38 | 148 |
+
+结论：eval 与 `171809` 一致；时间回到「train≈38s + SecAgg encode/upload」量级，整轮仍慢于无 SecAgg 的 ~90s（慢在 encode≈50s、upload≈44s，而非训练）。
 
 ### 3.8 当前每轮端到端流程（Hadamard 默认路径）
 

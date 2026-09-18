@@ -9,7 +9,7 @@
 | ICC1 训练划分 (client-0) | `data/splits/icc1_client0_train.json` |
 | 节点角色 | ICC1 = Client 0 |
 
-启动示例（FSDP 脚本就绪后）：
+推荐用 Central 一键脚本（根 `README.md`）。本机手动示例：
 
 ```bash
 accelerate launch --config_file accelerate_config.yaml \

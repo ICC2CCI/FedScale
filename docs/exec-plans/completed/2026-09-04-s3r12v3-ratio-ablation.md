@@ -15,4 +15,4 @@
 
 - 脚本 `experiments/run_s3r12v3_ratio.py` 与各比例 round log
 - 结论：20% 是带宽与 loss 的常用折中；更低比例明显变差
-- **未做**：把同一套比例开关接到双集群启动路径（仍在 [active 计划](../active/2026-09-11-dual-cluster-to-production.md) 的 ALG-1 / ALG-2）
+- **未做（历史）**：把同一套比例开关接到双集群启动路径；跟踪见 [联调 → 真实联邦](2026-09-11-dual-cluster-to-production.md) ALG-1 / ALG-2（该计划已迁入 completed）

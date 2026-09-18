@@ -7,7 +7,7 @@
 - **流程说明（以代码为准）**：[当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
 - **早期规划（部分过时）**：[部署规划](../../algorithm/2026-09-09-dual-cluster-fsdp-deployment.md)
 - **算法**：[S3R12v3](../../algorithm/2026-09-04-s3r12v3-block-uniform.md)
-- **后续未完成项**：[active：联调 → 真实联邦](../active/2026-09-11-dual-cluster-to-production.md)
+- **后续项**：已结项见 [联调 → 真实联邦](2026-09-11-dual-cluster-to-production.md)；当前流程以 `docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` 为准
 
 ## 目标
 

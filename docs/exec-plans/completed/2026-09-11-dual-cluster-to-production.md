@@ -2,11 +2,12 @@
 
 - **状态**：completed（切片 A–J 已落地；SEC-0~5 + SCALE-1/3 全部实现并验证）
 - **创建**：2026-09-11
-- **更新**：2026-09-11
-- **当前阶段**：配置化 + 真实联邦能力已具备，等待双集群实跑验证
-- **目录约定**：本文件已完成，归档于此。已落地的联调见 [2026-09-10-dual-cluster FSDP](2026-09-10-dual-cluster-s3r12v3-fsdp.md)。
+- **更新**：2026-09-18（双集群实跑 + SecAgg Hadamard 正式对照 `202609180941`）
+- **当前阶段**：配置化与真实联邦能力已具备；双集群非 SecAgg / SecAgg 均已实跑验证
+- **目录约定**：本文件已完成，归档于此。联调见 [2026-09-10](2026-09-10-dual-cluster-s3r12v3-fsdp.md)；操作手册见 [current-flow](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)。
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
+  - [SecAgg 精度 / 流程](../../algorithm/2026-09-15-secagg-quantization-precision-issue.md)
   - [早期部署规划](../../algorithm/2026-09-09-dual-cluster-fsdp-deployment.md)（部分已过时）
   - [上传安全方案](../../algorithm/2026-09-08-upload-security-plan.md)
   - [S3R12v3 ratio 消融](../../experiment-records/2026-09-04-s3r12v3-ratio-ablation.md)

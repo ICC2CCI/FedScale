@@ -1,71 +1,90 @@
-# FedScale — 大模型联邦微调实验工作区
+# FedScale — 双集群大模型联邦微调（S3R12v3 + SecAgg）
 
-本仓库包含基于 Flower 框架的大模型联邦微调完整实验代码、数据、文档与结果，核心是 **S3R12v3 block 级分片上传算法**（在保证收敛的前提下将带宽降至全量上传的 20% 甚至更低）。
+本仓库当前主力路径是 **ICC1 / ICC2 + Central Server（Aggregation + MinIO）**：  
+用 **S3R12v3 block 分片** 降低上传带宽，可选 **Windowed SecAgg（Hadamard + INT16）** 做安全聚合。  
+旧 Flower / K8s 代码仍在 `flowertune-llm/`，**不要当作当前入口**。
 
 ## 快速导航
 
 | 你想… | 去这里 |
 |---|---|
-| **看当前双集群 / SecAgg 怎么跑** | [`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md`](docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) |
-| 了解 S3R12v3 算法原理 | [`docs/algorithm/2026-09-04-s3r12v3-block-uniform.md`](docs/algorithm/2026-09-04-s3r12v3-block-uniform.md) |
-| 看完整复现参数 | [`docs/reference/federated-training-reproduction-params.md`](docs/reference/federated-training-reproduction-params.md) |
-| 在新服务器上部署 | [`deployment/README.md`](deployment/README.md) |
-| 运行某个实验 | [`experiments/`](experiments/)（主力：`run_s3r12v3_fsdp.py` + `scripts/start_s3r12v3_fsdp_run.sh`） |
-| 查看实验结果 | [`results/`](results/) |
-| 历史 Flower 代码（勿作当前入口） | [`flowertune-llm/`](flowertune-llm/) |
+| **看当前整轮怎么跑（首选）** | [`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md`](docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) |
+| SecAgg 完整流程 / 隐私 | [`docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`](docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md) §3 |
+| SecAgg 优化与 20 轮结论 | [`docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`](docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md) |
+| S3R12v3 算法原理 | [`docs/algorithm/2026-09-04-s3r12v3-block-uniform.md`](docs/algorithm/2026-09-04-s3r12v3-block-uniform.md) |
+| 复现参数 | [`docs/reference/federated-training-reproduction-params.md`](docs/reference/federated-training-reproduction-params.md) |
+| 部署 / 节点 | [`deployment/README.md`](deployment/README.md)、[`deployment/dual-cluster-nodes.md`](deployment/dual-cluster-nodes.md) |
+| 一键启动 | `bash scripts/start_s3r12v3_fsdp_run.sh` |
+| 实验结果 | [`results/`](results/)（如 `results/202609180941/`） |
+| 文档索引 | [`docs/README.md`](docs/README.md) |
 
-## 仓库结构
+## 当前系统一览
+
+| 项 | 当前默认 |
+|---|---|
+| 角色 | Central（聚合+MinIO）+ ICC1（client0）+ ICC2（client1） |
+| 模型 | Qwen2.5-0.5B（各端 `model/Qwen/Qwen2.5-0.5B`） |
+| 数据 | medical_flashcards；切分见 `data/splits/` |
+| 训练 | Accelerate FSDP，`local_steps=30`，在线 eval |
+| 上传 | 约 10% blocks（`coverage_h=10`）或按 yaml；SecAgg 时为 masked INT16 raw |
+| 配置 | `configs/s3r12v3-fsdp-run.yaml` / `configs/s3r12v3-fsdp-secagg-verify.yaml` |
+| 客户端脚本 | `experiments/run_s3r12v3_fsdp.py` |
+| 服务端 | `experiments/server/aggregation_server.py` |
+| 端口 | 聚合默认见 `deployment/central-server.env`；SecAgg 验证常用 **8081** |
+| 结果 | `results/YYYYMMDDHHMM/`（`round_log.json` + `figures/`） |
+
+## 仓库结构（当前相关）
 
 ```
-FedScale/
-├── flowertune-llm/            # 核心代码：ServerApp / ClientApp / 聚合 / 状态管理
-├── experiments/               # 实验脚本（S2/S3/S3R*/FedRolex）
-│   ├── run_s3r12v3_block_uniform.py   # 主力算法
-│   ├── run_s3r12v3_ratio.py           # ratio 消融
-│   └── plotting/                      # 画图脚本
-├── data/                      # 测试数据（medical_flashcards）
-├── configs/                   # 训练配置（LLaMA-Factory YAML）
-├── docs/
-│   ├── algorithm/             # 算法文档（S3R12v3 / S3R12v2 / FedRolex / 安全方案）
-│   ├── experiment-records/    # 各实验的执行记录与结果
-│   └── reference/             # 复现参数等参考文档
-├── results/
-│   ├── round_logs/            # 每个实验的逐轮日志（JSON）
-│   └── figures/               # 对比图（PNG）
-├── deployment/                # 多集群部署指南
-├── scripts/                   # 部署/运维与启动脚本（含 start_s3r12v3_fsdp_run.sh）
-├── configs/                   # 训练 yaml +（历史）K8s/对象存储配置
-└── README.md                  # 本文件
+fedscale-icc-server/
+├── experiments/
+│   ├── run_s3r12v3_fsdp.py          # 双集群 FSDP 客户端（主力）
+│   ├── server/aggregation_server.py # 聚合服务
+│   └── shared/                      # MinIO / SecAgg / block 选择等
+├── configs/
+│   ├── s3r12v3-fsdp-run.yaml        # 非 SecAgg 默认
+│   ├── s3r12v3-fsdp-secagg-verify.yaml
+│   └── accelerate_config.yaml
+├── scripts/start_s3r12v3_fsdp_run.sh
+├── data/                            # medical_flashcards + splits
+├── model/                           # 各端本地模型目录约定
+├── docs/algorithm/                  # 联调流程 + SecAgg + S3R12v3
+├── results/                         # 每次 run 一个子目录
+├── deployment/                      # 环境、节点、MinIO
+└── flowertune-llm/                  # 【历史】Flower 路径，勿作当前入口
 ```
 
-## 实验场景概览
+## 核心结果（双集群实测）
 
-| 场景 | 说明 | 带宽 | eval loss |
+| 路径 | 参考目录 | R20 eval | 备注 |
 |---|---|---|---|
-| S1-D | 全量训练（非联邦，LLaMA-Factory） | 100% | ~0.86 |
-| S2 | 联邦全量上传 | 100% | 1.0069 |
-| S3 | 联邦固定分片 20% | 20% | 1.12（不收敛） |
-| S3R5/6 | 论文方法（SGD memory + decay） | 20% | ~1.09 |
-| S3R11 | 随机层选择 + memory + decay | 20% | 1.0462 |
-| **S3R12v3** | **block 级均匀分片 + memory** | **20%** | **1.0514** |
-| S3R12v3 10% | 低带宽消融 | 10% | 1.0979 |
-| FedRolex | 部分训练（轮训层） | 100% | 1.1829 |
+| 非 SecAgg fp16 | `20260914-final-clean` | ≈0.987 | 明文 block 上传 |
+| 旧 SecAgg（per-window amax） | `202609162025` | 1.328 | 已收敛但仍落后 |
+| **SecAgg Hadamard（当前）** | `202609171809` / **`202609180941`** | **0.985** | 对齐 fp16；`train≈38s`，整轮≈148s |
 
-## 核心结果
+带宽：S3R12v3 只传选中 blocks（验证配置约 10%）；相对全量上传可大幅节省。算法消融历史见 `docs/experiment-records/`。
 
-- **S3R12v3 在 20% 带宽下 eval loss = 1.0514**，接近 S2 全量上传的 1.0069
-- 在目标 loss 1.10 处，10% ratio 仅需 2.5 GB 带宽 vs S2 的 11.3 GB，**节省 78%**
-- block 级分片使上传比例方差从 30%（key 级）降至 3%，保证每轮带宽稳定
+## 环境要求（当前双集群）
 
-## 环境要求
+| 角色 | 要求 |
+|---|---|
+| Central | CPU 即可；Docker MinIO；conda `fedscale-server`（跑聚合） |
+| ICC1 / ICC2 | 多卡 GPU（实测 8×V100）；conda `flwr-ft`；Accelerate FSDP |
+| Python | 3.10 |
+| 关键依赖 | PyTorch（CUDA）、Transformers、Accelerate、MinIO 客户端 |
+| 模型路径 | 各端 `model/Qwen/Qwen2.5-0.5B`（见 `ICC1_PATHS.md` / `ICC2_PREP.md`） |
+| 数据路径 | `data/medical_flashcards_*.json`，`data/splits/icc1_client0_train.json` 等 |
 
-- Python 3.10
-- PyTorch 2.8.0 + CUDA 12.8
-- Transformers 4.45.2, TRL 0.8.6, Flower 1.18.0
-- GPU: 1× H100 80GB（或同等显存）
-- 基础模型: Qwen2.5-0.5B（`/data/models/Qwen/Qwen2.5-0.5B`）
+启动 SecAgg 20 轮示例：
 
-详见 [`deployment/`](deployment/) 下的部署指南。
+```bash
+RUN_CONFIG=$PWD/configs/s3r12v3-fsdp-secagg-verify.yaml \
+AGGREGATION_PORT_OVERRIDE=8081 \
+NUM_ROUNDS_ENV=20 \
+bash scripts/start_s3r12v3_fsdp_run.sh
+```
+
+正式对照请保持 `--detailed-train-metrics` **关闭**（默认关），否则 `train_local_s` 会膨胀到 ~300s。
 
 ## License
 

@@ -3,7 +3,7 @@
 - **状态**：planned
 - **创建**：2026-09-08
 - **更新**：2026-09-08
-- **关联**：`docs/exec-plans/completed/2026-09-04-s3r12v3-block-uniform.md`；未实现项见 `docs/exec-plans/active/2026-09-11-dual-cluster-to-production.md`（SEC-1~3）
+- **关联**：`docs/exec-plans/completed/2026-09-04-s3r12v3-block-uniform.md`；SEC 跟踪见 `docs/exec-plans/completed/2026-09-11-dual-cluster-to-production.md`（SEC-1~3）。**当前默认安全路径**为 Windowed SecAgg（Hadamard），见 `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`
 
 ## 1. 背景与威胁模型
 

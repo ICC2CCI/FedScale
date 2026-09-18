@@ -1,6 +1,14 @@
 # 联邦微调实验复现参数 — Qwen2.5-0.5B + Medical Flashcards
 
-本文档列出复现 S3R12v3 联邦分片实验所需的全部参数和配置。
+本文档列出复现 S3R12v3 / SecAgg 实验所需的参数。
+
+> **路径以当前双集群为准**（2026-09 起）：  
+> - 代码入口：`experiments/run_s3r12v3_fsdp.py` + `scripts/start_s3r12v3_fsdp_run.sh`  
+> - 配置：`configs/s3r12v3-fsdp-run.yaml` / `configs/s3r12v3-fsdp-secagg-verify.yaml`  
+> - 模型：各端 `model/Qwen/Qwen2.5-0.5B`（见 `ICC1_PATHS.md` / `ICC2_PREP.md`）  
+> - 数据：`data/medical_flashcards_*.json`，切分 `data/splits/`  
+> - 联调流程：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md`  
+> 下文部分表格仍保留早期单机 / LLaMA-Factory 路径作历史对照；**新实验请用上面路径**。
 
 ## 1. 基础模型
 
@@ -8,12 +16,10 @@
 |---|---|
 | 模型名称 | Qwen/Qwen2.5-0.5B（base，非 instruct） |
 | 下载来源 | ModelScope（`modelscope.snapshot_download`） |
-| 存放路径 | `/data/models/Qwen/Qwen2.5-0.5B` |
-| dtype | bfloat16 |
-| 参数量 | 630.2M（浮点参数），24 层 transformer |
-| attn_implementation | eager |
-| trust_remote_code | False |
-| 加载代码 | `AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16, trust_remote_code=False, attn_implementation="eager")` |
+| **当前双集群存放** | 各端仓库内 `model/Qwen/Qwen2.5-0.5B` |
+| 历史单机路径 | `/data/models/Qwen/Qwen2.5-0.5B`（若仍使用） |
+| 训练常用 dtype | fp16（FSDP + `transfer_dtype: fp16`）；加载可为 fp32/bf16 再进 Accelerate |
+| 参数量 | ~630M，24 层 transformer |
 
 ## 2. 数据集
 
@@ -24,8 +30,11 @@
 | 训练集 | 30176 samples |
 | 验证集 | 3352 samples |
 | 数据格式 | JSON 数组，每条 3 字段：`instruction` / `input` / `output` |
-| 训练集路径 | `flower-llm/llamafactory-local/assets/datasets/medical_flashcards_train.json` |
-| 验证集路径 | `flower-llm/llamafactory-local/assets/datasets/medical_flashcards_eval.json` |
+| 训练集路径（当前） | `data/medical_flashcards_train.json` |
+| 验证集路径（当前） | `data/medical_flashcards_eval.json` |
+| ICC1 切分 | `data/splits/icc1_client0_train.json` |
+| ICC2 切分 | `data/splits/client1_train.json`（或节点文档约定路径） |
+| 历史 LLaMA-Factory 路径 | `flower-llm/llamafactory-local/assets/datasets/...`（勿作当前入口） |
 
 ### 数据切分
 
@@ -74,13 +83,15 @@ The introns are the portion of eukaryotic hnRNA...<|im_end|>
 
 | 参数 | 值 |
 |---|---|
-| 客户端数 | 2 |
-| 联邦轮数 | 20 |
+| 客户端数 | 2（ICC1=0，ICC2=1） |
+| 联邦轮数 | 常用 20（yaml / `NUM_ROUNDS_ENV`） |
 | 每轮本地步数 | 30 |
-| 聚合方式 | FedAvg（按客户端数据量加权平均） |
+| 聚合方式 | FedAvg（按客户端数据量加权）；SecAgg 时先 unmask 再平均 |
 | 客户端选择 | 全选（每轮 2 个客户端都训练） |
-| 每轮覆盖样本数 | 30 steps × 16 effective batch = 480 samples/客户端 |
+| 覆盖比例 | 验证配置常 `coverage_h=10`（约 10% blocks） |
+| 传输 | `transfer_dtype: fp16`；SecAgg 为 INT16 masked raw |
 | seed | 20260831 |
+| 入口 | `experiments/run_s3r12v3_fsdp.py` + `configs/s3r12v3-fsdp-*.yaml` |
 
 ### 聚合公式
 
@@ -142,11 +153,13 @@ TrainingArguments(
 
 > **注意**：联邦训练每轮用 `max_steps=30` 而非 `num_train_epochs`，lr scheduler 在 30 步内完成 warmup + cosine 衰减到 0。每轮独立调度，不跨轮累积。
 
-### 4.2 全量训练（S1-D 基线，LLaMA-Factory CLI）
+### 4.2 全量训练（历史基线 S1-D，LLaMA-Factory CLI）
 
-全量训练使用 LLaMA-Factory CLI（`llamafactory-cli train`），参数通过 YAML 配置文件指定。这是单集群非联邦的基准实验。
+> **历史单机路径**，不是当前双集群入口。当前联邦训练用 `experiments/run_s3r12v3_fsdp.py` + Accelerate FSDP。
 
-配置文件路径：`flower-llm/llamafactory-local/configs/qwen25-0.5b-medical-flashcards-full.yaml`
+全量训练曾使用 LLaMA-Factory CLI（`llamafactory-cli train`），参数通过 YAML 配置文件指定。
+
+配置文件路径（历史）：`flower-llm/llamafactory-local/configs/qwen25-0.5b-medical-flashcards-full.yaml`
 
 | 参数 | 值 | 说明 |
 |---|---|---|
@@ -412,56 +425,96 @@ result = flat.view(original_shape)   # 1D → 多维（写回）
 
 ## 9. 运行环境
 
+### 9.1 当前双集群（优先）
+
+| 组件 | 值 |
+|---|---|
+| 拓扑 | Central（CPU + MinIO）+ ICC1 / ICC2（各 8×V100 32GB） |
+| Python | 3.10 |
+| Client conda | `flwr-ft` |
+| Server conda | `fedscale-server`（聚合进程） |
+| PyTorch | 2.8.0+cu128（实测；V100 driver 可向下兼容） |
+| Transformers / Accelerate | 见 `deployment/environment-setup.md` |
+| 模型 | 各端 `model/Qwen/Qwen2.5-0.5B` |
+| 数据 | `data/medical_flashcards_*.json`，`data/splits/` |
+| 配置 | `configs/s3r12v3-fsdp-run.yaml` / `configs/s3r12v3-fsdp-secagg-verify.yaml` |
+| 启动 | `bash scripts/start_s3r12v3_fsdp_run.sh` |
+| 结果 | `results/YYYYMMDDHHMM/` |
+
+路径约定：`ICC1_PATHS.md`、`ICC2_PREP.md`、`deployment/dual-cluster-nodes.md`。
+
+### 9.2 历史单机消融（勿作当前入口）
+
 | 组件 | 版本 |
 |---|---|
-| OS | Linux |
-| Python | 3.10 |
-| PyTorch | 2.8.0+cu128 |
-| Transformers | 4.45.2 |
-| TRL | 0.8.6 |
-| PEFT | 0.11.1 |
-| datasets | (flwr-ft conda env) |
-| GPU | 1× NVIDIA H100 80GB |
-| CUDA | 12.8 |
-| Conda 环境 | `flwr-ft`，路径 `/data/home/qiaoyanchen/miniconda3/envs/flwr-ft/bin/python` |
+| GPU | 曾用 1× H100 80GB |
+| Conda | `flwr-ft`（单机路径） |
+| 脚本 | `scripts/run_s3r12v3_block_uniform.py` 等 |
+| 模型/数据 | `/data/models/...`、`flower-llm/llamafactory-local/...` |
 
 ## 10. 脚本与输出
 
+### 10.1 当前双集群
+
 | 文件 | 说明 |
 |---|---|
-| `scripts/run_s3r12v3_block_uniform.py` | S3R12v3 主脚本（20% 带宽） |
-| `scripts/run_s3r12v3_ratio.py --ratio 0.X` | 参数化版本（支持 5%/10%/30%/40%/50%） |
-| `output/s3r12v3-block-uniform/round_log.json` | 20% 结果日志 |
-| `output/s3r12v3-ratio-{5pct,10pct,30pct,40pct,50pct}/round_log.json` | 各 ratio 结果日志 |
-| `output/s3r12v3-ratio-ablation.png` | ratio 消融对比图 |
-| `output/s3r12v3-equal-convergence.png` | 等收敛带宽对比图 |
+| `scripts/start_s3r12v3_fsdp_run.sh` | 一键启动 Server + 两端 |
+| `experiments/run_s3r12v3_fsdp.py` | FSDP 客户端 |
+| `experiments/server/aggregation_server.py` | 聚合服务 |
+| `scripts/plot_s3r12v3_fsdp_run.py` | 画 `figures/` |
+| `results/<run_id>/round_log.json` | 主日志 |
+| `results/<run_id>/figures/` | loss / time / transfer 图 |
+
+### 10.2 历史单机消融
+
+| 文件 | 说明 |
+|---|---|
+| `scripts/run_s3r12v3_block_uniform.py` | 单机 S3R12v3（早期） |
+| `scripts/run_s3r12v3_ratio.py --ratio 0.X` | ratio 消融 |
+| `output/s3r12v3-*/round_log.json` | 单机结果 |
 
 ## 11. 复现步骤
 
+### 11.1 当前双集群（推荐）
+
 ```bash
-# 1. 激活环境
+# 各端：conda activate flwr-ft；模型与数据路径见 ICC1_PATHS.md / ICC2_PREP.md
+# Central：MinIO + aggregation_server（脚本会拉起）
+
+# 非 SecAgg
+bash scripts/start_s3r12v3_fsdp_run.sh
+
+# SecAgg 20 轮（常用 8081）
+RUN_CONFIG=$PWD/configs/s3r12v3-fsdp-secagg-verify.yaml \
+AGGREGATION_PORT_OVERRIDE=8081 \
+NUM_ROUNDS_ENV=20 \
+bash scripts/start_s3r12v3_fsdp_run.sh
+
+# 正式对照保持 --detailed-train-metrics 关闭（默认关）
+```
+
+参考正式跑次：`results/202609180941/`（SecAgg Hadamard，R20 eval=0.985）。
+
+### 11.2 历史单机消融
+
+```bash
 conda activate flwr-ft
-
-# 2. 确认模型已下载
-ls /data/models/Qwen/Qwen2.5-0.5B/
-
-# 3. 确认数据已准备
-ls flower-llm/llamafactory-local/assets/datasets/medical_flashcards_{train,eval}.json
-
-# 4. 运行 S3R12v3（20% 带宽）
+ls /data/models/Qwen/Qwen2.5-0.5B/   # 或当前仓库 model/...
 python scripts/run_s3r12v3_block_uniform.py
-
-# 5. 运行其他 ratio（可选）
 python scripts/run_s3r12v3_ratio.py --ratio 0.10
-python scripts/run_s3r12v3_ratio.py --ratio 0.30
-python scripts/run_s3r12v3_ratio.py --ratio 0.50
-
-# 6. 生成对比图
-python scripts/plot_s3r12v3_ratio_ablation.py
-python scripts/plot_s3r12v3_equal_convergence.py
 ```
 
 ## 12. 预期结果
+
+### 12.1 当前双集群（实测）
+
+| 路径 | 参考目录 | R20 eval |
+|---|---|---|
+| 非 SecAgg fp16 | `results/20260914-final-clean` | ≈0.987 |
+| SecAgg Hadamard（正式） | `results/202609180941` | **0.985** |
+| 旧 SecAgg per-window | `results/202609162025` | 1.328 |
+
+### 12.2 历史单机 ratio 消融（20 轮）
 
 | ratio | H | 终点 eval loss | 总上传 | gap vs S2 |
 |---|---|---|---|---|
