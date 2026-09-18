@@ -169,6 +169,8 @@ r*-eval/
 data/alpaca_gpt4_*
 data/medical_meadow_medqa.json
 data/medical_medqa_*
+data/databricks-dolly-15k.jsonl
+data/dolly_15k*.json
 
 # Model weights
 /data/models/

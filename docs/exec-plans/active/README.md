@@ -2,7 +2,11 @@
 
 此处只放 **尚未结项** 的计划。做完后把对应文件移到 [`../completed/`](../completed/)，并在文首把状态改为 `completed`。
 
-当前进行中：**无。**
+当前进行中：
+
+| 计划 | 说明 |
+|---|---|
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 先 Dolly IID vs Dirichlet；跨机构后置；3B/7B |
 
 已归档：
 

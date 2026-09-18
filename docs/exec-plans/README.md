@@ -30,7 +30,9 @@
 
 ## active
 
-当前无进行中的计划。
+| 计划 | 说明 |
+|---|---|
+| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | 先 Dolly IID vs Dirichlet；跨机构后置；3B/7B |
 
 ## completed
 
