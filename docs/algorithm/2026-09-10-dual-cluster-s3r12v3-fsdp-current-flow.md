@@ -7,10 +7,11 @@
   - SecAgg Hadamard（观测曾开着）：`results/202609171809/`（R20=**0.985**，train 被 profiler 拉到 ~300s）
   - **SecAgg Hadamard（精度对照）**：`results/202609180941/`（R20=**0.985**，`train≈38s`，整轮≈148s）
   - **SecAgg 时间优化 5 轮**：`results/202609181151/`（R5 eval=**1.364** 与 941 逐轮一致；`wait_agg≈10s`，整轮≈110–134s）
+  - **SecAgg 时间优化 20 轮**：`results/202609181406/`（R20 eval=**0.985**，整轮≈113s）
 - **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`
 - **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg：`configs/s3r12v3-fsdp-secagg-verify.yaml` + 常用 `AGGREGATION_PORT_OVERRIDE=8081`）
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md)；时间切片见 [active：SecAgg 时间效率](../exec-plans/active/2026-09-18-secagg-time-efficiency.md)。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md) / [completed：SecAgg 时间效率](../exec-plans/completed/2026-09-18-secagg-time-efficiency.md)。
 
 ---
 

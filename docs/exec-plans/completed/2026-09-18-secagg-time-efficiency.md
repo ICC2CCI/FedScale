@@ -1,8 +1,9 @@
 # SecAgg 时间效率（通用；不改量化语义、不增大传输量）
 
-- **状态**：active
+- **状态**：completed
 - **创建**：2026-09-18
-- **更新**：2026-09-18（P0/P1 已落地；5 轮对照 `202609181151`；20 轮算法验证进行中）
+- **更新**：2026-09-18
+- **结项**：2026-09-18
 - **原则**：流程对任意 HF `state_dict` + FSDP 通用；**禁止**按某个模型（含 Qwen2.5-0.5B）写死层名、窗数、并发度。0.5B 只作回归载体。
 - **约束**：
   1. 保住当前量化路径的效果：Hadamard + INT16 + Issue #1（FP32 delta、quant residual 不衰减）
@@ -12,7 +13,15 @@
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) §3.1
   - [SecAgg 精度 / 默认路径](../../algorithm/2026-09-15-secagg-quantization-precision-issue.md)
   - [量化调研](../../algorithm/2026-09-17-secagg-quantization-optimization-survey.md)
-  - 基线跑次：无 SecAgg `results/20260914-final-clean`（稳态整轮≈88s，eval 每 5 轮）；SecAgg 精度对照 `results/202609180941`（R20 eval=0.985，整轮≈148s）；时间优化 5 轮 `results/202609181151`（R5 eval=1.364 与 941 逐轮一致，整轮≈110–134s）
+  - 基线跑次：无 SecAgg `results/20260914-final-clean`（稳态整轮≈88s，eval 每 5 轮）；SecAgg 精度对照 `results/202609180941`（R20 eval=0.985，整轮≈148s）；时间优化 5 轮 `results/202609181151`（R5 eval=1.364 与 941 逐轮一致，整轮≈110–134s）；时间优化 20 轮 `results/202609181406`（R20 eval=0.985，整轮≈113s）
+
+## 结项说明
+
+P0/P1（PERF-0/1/2/3/5/6/9/11）已落地并对照通过。0.5B 双集群上，N 窗同步链已拆掉：单 blob、通知不拉对象、server 并行 unmask、全量 `global_state` 异步写。验收：5 轮 eval 与 `202609180941` 逐轮相同；20 轮 `202609181406` R20=0.984994。
+
+相对无 SecAgg，扣掉每轮 eval 后剩余税约 +15–20s，主要是 Hadamard+INT16+mask 计算，不是协议排队。PERF-7/8/10 只剩几秒级、且多数削不到整轮墙钟，**本计划不做**（见看板 `won't do`）。大模型 / 多 client 若 SHAKE 变成 encode 瓶颈，另开计划再做 PERF-7。
+
+---
 
 ## 0. 怎么读
 
@@ -49,15 +58,13 @@
 | PERF-4 | P1 | cancelled | 默认已是单 blob（先算完再一次 PUT）；多对象流水线不再作为默认 | PERF-1 |
 | PERF-5 | P1 | **done** | MinIO 进程级线程池；假死仍 rebuild | — |
 | PERF-6 | P1 | **done** | FWHT 双缓冲，每级不再 `empty_like` | PERF-3 |
-| PERF-7 | P2 | todo | Mask PRG：SHAKE-256 → 同 seed 的 AES-CTR/ChaCha | — |
-| PERF-8 | P2 | todo | GPU FWHT（同一矩阵，可选） | PERF-3 |
+| PERF-7 | P2 | **won't do** | Mask PRG：SHAKE-256 → 同 seed 的 AES-CTR/ChaCha | — |
+| PERF-8 | P2 | **won't do** | GPU FWHT（同一矩阵，可选） | PERF-3 |
 | PERF-9 | P2 | **done** | client 一次拉 `global_delta`；server 不再写 N 个 `agg_block` | PERF-1 |
-| PERF-10 | P3 | todo | DH 公钥与训练重叠；amax 仍在 delta 之后 | — |
+| PERF-10 | P3 | **won't do** | DH 公钥与训练重叠；amax 仍在 delta 之后 | — |
 | PERF-11 | P1 | **done** | server finalize：按窗并行 unmask/iHadamard；`global_delta` 写完即标记 `done`；全量 `global_state` 异步 PUT | PERF-9 |
 
-建议落地顺序：**PERF-0 → PERF-1 → PERF-2 → PERF-3**（已合入代码），其余按需。
-
-**已合入（2026-09-18）**：单 blob 上传 + 通知不拉对象 + 复用 FWHT + 拆分计时 + MinIO 常驻线程池 + FWHT 双缓冲 + 一份 `global_delta` 回写 + server 并行 unmask + 全量 state 异步写盘。单元测试 `experiments/tests/test_secagg.py` 已过。**5 轮对照 `202609181151` 已过**（见 §5）；20 轮用于确认 R20≈0.985。
+**已合入（2026-09-18）**：单 blob 上传 + 通知不拉对象 + 复用 FWHT + 拆分计时 + MinIO 常驻线程池 + FWHT 双缓冲 + 一份 `global_delta` 回写 + server 并行 unmask + 全量 state 异步写盘。单元测试 `experiments/tests/test_secagg.py` 已过。**5 轮对照 `202609181151` 已过**（见 §5）；**20 轮 `202609181406` 已过**（R20=0.984994，见 §6）。
 
 0.5B 上墙钟只是标尺；**同一套改动必须在 window 数变多时仍然成立**（用更大 `coverage` 或假 window 压测，不必真上 7B 才能合入）。
 
@@ -139,17 +146,19 @@
 
 ---
 
-### PERF-7 更快的 mask PRG（P2）
+### PERF-7 更快的 mask PRG（P2）— won't do
 
 SHAKE-256 生成 pairwise + self mask，代价 ∝ 选中元素数。可换成 **确定性** AES-CTR / ChaCha20，双方同 seed 即可抵消。
 
-**验收**：mask 互消测试通过；eval 对齐。文档写明 PRG 算法，便于跨语言/跨端复现。
+**结项决定**：0.5B / 2 client 上 encode 税大约 8s，换 PRG 只剩几秒；不挡当前主路径。若以后上 7B 或多 client（pairwise 随 client 数涨），另开计划。
 
 ---
 
-### PERF-8 GPU FWHT（P2，可选）
+### PERF-8 GPU FWHT（P2，可选）— won't do
 
 同一 Walsh–Hadamard，设备可切 CPU/GPU。自动：张量已在 CUDA 或 `secagg_fwht_device=auto`。没有 GPU 的 Central 仍走 CPU。
+
+**结项决定**：Central 无 GPU，server unmask 仍走 CPU；client 上还要 CPU↔GPU 搬运再打包 INT16。0.5B 窗长收益不明，还要保证逐元素一致。不做。
 
 ---
 
@@ -166,9 +175,11 @@ finalize 按窗（或按 blob 内切片）unmask → iHadamard → 写出，不�
 
 ---
 
-### PERF-10 DH 与训练重叠（P3）
+### PERF-10 DH 与训练重叠（P3）— won't do
 
 公钥与 delta 无关，可在训练后半段 announce；**`global_amax` / `global_scale` 仍必须等本轮 delta**，量化不能提前。预期只削 `secagg_dh_s` 量级，不是大头。
+
+**结项决定**：日志里一端 DH≈0、另一端 2–6s，那是先到的人在等对端训练结束。整轮时间由慢的一端决定，重叠几乎削不到墙钟。不做。
 
 ---
 
@@ -180,13 +191,13 @@ finalize 按窗（或按 blob 内切片）unmask → iHadamard → 写出，不�
 - Hadamard 仍按窗长 pad-p2，与层名无关
 - 新模型上线仍需 **该模型自己的 fp16 基线** 对照 eval（通用流程 ≠ 数值从 0.5B 自动成立）
 
-更大模型还依赖显存 / 少写全量 `global_state` / client 数与 INT16 overflow，那些不在本计划（见 [completed 生产切片](../completed/2026-09-11-dual-cluster-to-production.md) SCALE / SEC）。
+更大模型还依赖显存 / 少写全量 `global_state` / client 数与 INT16 overflow，那些不在本计划（见 [completed 生产切片](2026-09-11-dual-cluster-to-production.md) SCALE / SEC）。
 
 ---
 
 ## 4. 预期（0.5B 标尺，非目标函数）
 
-P0/P1 之后，对照 `202609180941`：整轮从 ~148s 落到 ~110–120s（5 轮实测 R2–R5≈110–115s）。无 SecAgg 稳态 ~88s（且往往跳过每轮 eval）**不是必须打平**：扣掉「每轮 eval ~10s」后，SecAgg 税大约 +15–20s，主要是 Hadamard+INT16+mask 计算。验收以 eval + 字节 + 「N 增大时墙钟主要跟带宽/计算走、不跟 RTT×N 走」为准。
+P0/P1 之后，对照 `202609180941`：整轮从 ~148s 落到 ~110–120s（5 轮实测 R2–R5≈110–115s；20 轮 `202609181406` 平均≈113s）。无 SecAgg 稳态 ~88s（且往往跳过每轮 eval）**不是必须打平**：扣掉「每轮 eval ~10s」后，SecAgg 税大约 +15–20s，主要是 Hadamard+INT16+mask 计算。验收以 eval + 字节 + 「N 增大时墙钟主要跟带宽/计算走、不跟 RTT×N 走」为准。
 
 ## 5. 5 轮对照（`202609181151`）
 
@@ -202,4 +213,8 @@ P0/P1 之后，对照 `202609180941`：整轮从 ~148s 落到 ~110–120s（5 �
 
 Server 临界路径：`materialize ~1s + 8-worker unmask ~4s + put_delta ~2s`。全量 `global_state` ~942 MiB 仍约 15s，但在 `done` 之后异步写，不再进 `pipeline_wait_agg`。
 
-相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：现在 R2 有 eval ≈115s。扣掉 eval 后剩余税主要是 encode ~15s vs fp16 ~7s；**上传反而更快**（单 blob ~9s vs 多 block ~16s）。再往下是 PERF-7/8/10（更快 PRG / GPU FWHT / DH 重叠），只剩几秒级，不是协议排队。
+相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：现在 R2 有 eval ≈115s。扣掉 eval 后剩余税主要是 encode ~15s vs fp16 ~7s；**上传反而更快**（单 blob ~9s vs 多 block ~16s）。
+
+## 6. 20 轮算法验证（`202609181406`）
+
+同一 yaml、同一套 P0/P1 实现。R20 eval=**0.984994**（与精度对照 `202609180941` 的 0.985 对齐），平均整轮≈113s。

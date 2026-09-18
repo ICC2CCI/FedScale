@@ -6,12 +6,13 @@
 > - 20 轮（观测曾开着）：`results/202609171809`，R20 eval=**0.985**（train≈300s，被 profiler 污染）
 > - **20 轮（精度对照，观测关）**：`results/202609180941`，R20 eval=**0.985**，`train≈38s`，整轮≈148s
 > - **时间优化 5 轮**：`results/202609181151`，R5 eval=**1.364**（与 941 逐轮一致），整轮≈110–134s，`wait_agg≈10s`
+> - **时间优化 20 轮**：`results/202609181406`，R20 eval=**0.985**，整轮≈113s
 > - 对照：fp16 `20260914-final-clean` R20=**0.987**；旧 per-window SecAgg `202609162025` R20=**1.328**
 > 关联：
 > - [ICC2CCI/FedScale#1](https://github.com/ICC2CCI/FedScale/issues/1)
 > - `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`
 > - 联调总流程：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1
-> - 时间切片：`docs/exec-plans/active/2026-09-18-secagg-time-efficiency.md`
+> - 时间切片（已结项）：`docs/exec-plans/completed/2026-09-18-secagg-time-efficiency.md`
 
 ## 0. 实现对照（相对 opencode 半成品）
 
@@ -257,8 +258,8 @@ Phase 2: Raw Bytes 上传    ✅ MinIO z_key；hex 兼容保留
 Phase 2b: 生产修复         ✅ session 同步；self-master 后台 finalize
 Phase 3a: 5 轮验证         ✅ 202609171717，R5 eval=1.364
 Phase 3b: 20 轮对照        ✅ 202609171809 / **202609180941**，R20 eval=0.985 ≈ fp16 0.987
-Phase 3c: 时间优化          ✅ 单 blob + 并行 unmask + 异步写盘；5 轮 `202609181151` 对齐 eval
-Phase 4（后备）            未做：EF21 / Kashin / int24 / 更快 PRG（见时间效率计划 PERF-7/8/10）
+Phase 3c: 时间优化          ✅ 单 blob + 并行 unmask + 异步写盘；5 轮 `202609181151` / 20 轮 `202609181406`
+Phase 4（后备）            不做（本仓库）：更快 PRG / GPU FWHT / DH 重叠已从时间计划标 won't do；EF21 / Kashin / int24 仅当再压带宽时另开
 ```
 
 关键文件：
@@ -369,7 +370,7 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 | R1 | 1.498 | ~16 | ~9 | ~10 | 134 |
 | R5 | **1.364** | ~14 | ~8 | ~10 | 114 |
 
-相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：扣掉每轮 eval ~10s 后，SecAgg 税约 +15–20s，主要在 encode（Hadamard+mask），上传已经更快。细节见 [时间效率计划](../exec-plans/active/2026-09-18-secagg-time-efficiency.md) §5。
+相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：扣掉每轮 eval ~10s 后，SecAgg 税约 +15–20s，主要在 encode（Hadamard+mask），上传已经更快。细节见 [时间效率计划](../exec-plans/completed/2026-09-18-secagg-time-efficiency.md) §5–§6。
 
 ### 3.8 当前每轮端到端流程（Hadamard 默认路径）
 

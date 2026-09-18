@@ -30,14 +30,13 @@
 
 ## active
 
-| 计划 | 说明 |
-|---|---|
-| [SecAgg 时间效率](active/2026-09-18-secagg-time-efficiency.md) | P0/P1 已落地（blob / 并行 unmask / 异步写盘）；5 轮 `202609181151` |
+当前无进行中的计划。
 
 ## completed
 
 | 计划 | 结项 | 说明 |
 |---|---|---|
+| [SecAgg 时间效率](completed/2026-09-18-secagg-time-efficiency.md) | 2026-09-18 | P0/P1 落地；5 轮 `202609181151` / 20 轮 `202609181406`；PERF-7/8/10 不做 |
 | [双集群联调 → 真实联邦](completed/2026-09-11-dual-cluster-to-production.md) | 2026-09-11（2026-09-18 补实跑说明） | CFG/SEC/SCALE 已落地；双集群 + SecAgg 已实跑 |
 | [三场景 loss 对比](completed/2026-09-02-three-scenario-loss-comparison.md) | 2026-09-02 | S1/S2/S3 单机联邦对比主线 |
 | [S3R12v2 key 级排列](completed/2026-09-04-s3r12v2-block-permutation.md) | 2026-09-04 | 真 20% 带宽（key 级） |

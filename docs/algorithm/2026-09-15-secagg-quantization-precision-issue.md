@@ -10,11 +10,12 @@
 > | Hadamard + Issue #1 | `202609171809` | **0.985** | ≈ fp16 `final-clean` **0.987** |
 > | 关掉 profiler 复跑 | **`202609180941`** | **0.985** | `train≈38s`，整轮≈148s；传输记账正常 |
 > | 时间优化 5 轮 | **`202609181151`** | （R5=1.364，与 941 逐轮一致） | 单 blob + 并行 unmask + 异步写盘；整轮≈110–134s |
+> | 时间优化 20 轮 | **`202609181406`** | **0.985** | 与 941 对齐；整轮≈113s |
 >
 > **当前端到端流程以 §3.1「Hadamard 默认路径」为准**；§2 / §3.1.1 的 per-window 描述是历史中间态。  
 > 调研与 Phase：`docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。  
 > 联调总览：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1。  
-> 时间切片：`docs/exec-plans/active/2026-09-18-secagg-time-efficiency.md`。
+> 时间切片（已结项）：`docs/exec-plans/completed/2026-09-18-secagg-time-efficiency.md`。
 
 ## 1. 问题概述
 
@@ -436,7 +437,7 @@ PYTHONPATH=experiments python experiments/tests/test_secagg.py
 ## 6. 后续（可选）
 
 1. ~~Hadamard + raw bytes + Issue #1~~：**已完成**（`202609180941` 复跑确认）。
-2. **时间效率（通用，不改量化）**：合并上传对象、通知不拉 MinIO、复用 FWHT 等，见 [active：SecAgg 时间效率](../exec-plans/active/2026-09-18-secagg-time-efficiency.md)。
+2. ~~时间效率（通用，不改量化）~~：**已结项**（5 轮 `202609181151` / 20 轮 `202609181406`），见 [completed：SecAgg 时间效率](../exec-plans/completed/2026-09-18-secagg-time-efficiency.md)。
 3. **int24 / EF21 / Kashin / SCAFFOLD**：仅当要再压带宽或换更大模型时再评估。
 4. 更强隐私：去掉 `global_amax` 或加密上报 train/eval loss（精度/工程权衡）。
 
