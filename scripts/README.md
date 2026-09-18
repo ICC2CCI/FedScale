@@ -81,8 +81,9 @@ DDP 对照实验只需将 `--strategy fsdp` 换为 `--strategy ddp`。提交前�
 先用 1 轮、2 steps 做内存和传输门禁。当前单卡节点不能通过 TKE 配置生成 NVLink；
 需要更换为同机多卡 GPU 实例并用 `nvidia-smi topo -m` 验证。
 
-完整的模型缓存、模板分支和 FSDP/DDP 对照要求见
-[联邦实验预检与启动规范](../docs/联邦实验预检与启动规范.md)。
+完整的双集群 S3R12v3 / SecAgg 联调与运维说明见
+[当前双集群联调流程](../docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)。
+（下文 `run-federated.sh` / Flower K8s 相关命令属于历史路径，勿与当前 ICC 实验混淆。）
 
 ## 自动恢复实验
 

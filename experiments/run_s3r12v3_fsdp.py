@@ -267,15 +267,18 @@ def train_local_steps(
     accelerator,
     local_steps: int,
     grad_accum: int,
+    detailed_metrics: bool = False,
 ) -> tuple[float, dict]:
     """Run local training and return (avg_loss, step_metrics).
 
-    step_metrics contains per-step timing and resource data that the
-    evaluation package can aggregate (category 1 + 2).
+    detailed_metrics=False (default): fast path for normal runs — no torch.profiler,
+    no per-step nvidia-smi, no cuda.synchronize timing fences.
+
+    detailed_metrics=True: dashboard instrumentation (forward/backward/NCCL/GPU util).
+    Only enable for dedicated profiling runs; it can inflate train_local_s ~8x.
     """
     model.train()
     step = 0
-    micro = 0
     loss_sum = 0.0
     loss_count = 0
     total_tokens_processed = 0
@@ -287,13 +290,11 @@ def train_local_steps(
     if torch.cuda.is_available():
         gpu_mem_base = torch.cuda.memory_allocated() / (1024 * 1024)
 
-    # Per-step resource sampling helpers
     _gpu_util_samples: list[float] = []
     _cpu_util_samples: list[float] = []
     _gpu_mem_samples: list[float] = []
 
     def _sample_gpu_util() -> float | None:
-        """Sample current GPU utilization (non-blocking, works across ranks)."""
         try:
             import subprocess as _sp
             _r = _sp.run(
@@ -310,7 +311,6 @@ def train_local_steps(
         return None
 
     def _sample_gpu_mem() -> float | None:
-        """Sample current GPU memory usage in MB."""
         if torch.cuda.is_available():
             try:
                 return round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
@@ -319,51 +319,47 @@ def train_local_steps(
         return None
 
     def _sample_cpu_util() -> float | None:
-        """Sample current CPU utilization."""
         try:
             import psutil as _ps
             return round(_ps.cpu_percent(interval=None), 2)
         except Exception:
             return None
 
-    # Initialize psutil cpu_percent baseline
-    _sample_cpu_util()
-
-    # NCCL collective tracking via torch.profiler
     from collections import defaultdict as _dd
     _nccl_stats: dict = _dd(lambda: {"count": 0, "total_us": 0, "bytes": 0})
-
-    # Estimate NCCL communication bytes from model parameter count and FSDP pattern.
-    # FSDP FULL_SHARD per optimizer step:
-    #   - All-Gather: collect full params from all ranks  → bytes = total_params * dtype_size
-    #   - Reduce-Scatter: scatter grad shards             → bytes = total_params / world_size * dtype_size
-    #   - All-Reduce (if used): equivalent to RS + AG      → bytes = total_params * 2 / world_size * dtype_size
     _fsdp_param_count = 0
-    try:
-        _fsdp_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    except Exception:
-        pass
-    _world_size = getattr(accelerator, 'num_processes', 1) or 1
-    _dtype_bytes = 2  # fp16
-    # Per-step estimates: FSDP does 1 All-Gather (unshard before fwd) + 1 Reduce-Scatter (grad sync)
-    _est_ar_bytes = 0  # All-Reduce not typically used in FSDP
-    _est_ag_bytes = _fsdp_param_count * _dtype_bytes      # full param gather per step
-    _est_rs_bytes = _fsdp_param_count * _dtype_bytes // _world_size  # grad shard per step
+    _est_ar_bytes = 0
+    _est_ag_bytes = 0
+    _est_rs_bytes = 0
+    _prof = None
 
-    def _make_profiler():
-        """Create a torch.profiler instance that tracks NCCL collectives."""
+    if detailed_metrics:
+        _sample_cpu_util()
         try:
-            from torch.profiler import profile, ProfilerActivity
-            return profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=False,
-                with_stack=False,
-                with_modules=False,
-            )
+            _fsdp_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         except Exception:
-            return None
+            pass
+        _world_size = getattr(accelerator, "num_processes", 1) or 1
+        _dtype_bytes = 2  # fp16
+        _est_ag_bytes = _fsdp_param_count * _dtype_bytes
+        _est_rs_bytes = _fsdp_param_count * _dtype_bytes // _world_size
 
-    _prof = _make_profiler()
+        def _make_profiler():
+            try:
+                from torch.profiler import profile, ProfilerActivity
+                return profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=False,
+                    with_stack=False,
+                    with_modules=False,
+                )
+            except Exception:
+                return None
+
+        _prof = _make_profiler()
+    else:
+        def _make_profiler():
+            return None
 
     while step < local_steps:
         try:
@@ -371,25 +367,24 @@ def train_local_steps(
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
-        # Track tokens processed (input_ids count)
         if "input_ids" in batch:
             total_tokens_processed += int(batch["input_ids"].numel())
         step_start = time.monotonic()
         if _prof is not None:
             _prof.start()
         with accelerator.accumulate(model):
-            if torch.cuda.is_available():
+            if detailed_metrics and torch.cuda.is_available():
                 torch.cuda.synchronize()
             fwd_start = time.monotonic()
             outputs = model(**batch)
             loss = outputs.loss
-            if torch.cuda.is_available():
+            if detailed_metrics and torch.cuda.is_available():
                 torch.cuda.synchronize()
             fwd_ms = (time.monotonic() - fwd_start) * 1000
 
             bwd_start = time.monotonic()
             accelerator.backward(loss)
-            if torch.cuda.is_available():
+            if detailed_metrics and torch.cuda.is_available():
                 torch.cuda.synchronize()
             bwd_ms = (time.monotonic() - bwd_start) * 1000
 
@@ -398,65 +393,92 @@ def train_local_steps(
             if accelerator.sync_gradients:
                 if _prof is not None:
                     _prof.stop()
-                    # Extract NCCL collective stats from profiler
                     try:
                         events = _prof.key_averages()
                         for evt in events:
                             key = evt.key
-                            if "nccl" in key.lower() or "all_reduce" in key.lower() or "all_gather" in key.lower() or "reduce_scatter" in key.lower():
-                                cat = "all_reduce" if "all_reduce" in key.lower() else \
-                                      "all_gather" if "all_gather" in key.lower() else \
-                                      "reduce_scatter" if "reduce_scatter" in key.lower() else "other_nccl"
+                            key_l = key.lower()
+                            if (
+                                "nccl" in key_l
+                                or "all_reduce" in key_l
+                                or "all_gather" in key_l
+                                or "reduce_scatter" in key_l
+                            ):
+                                cat = (
+                                    "all_reduce" if "all_reduce" in key_l else
+                                    "all_gather" if "all_gather" in key_l else
+                                    "reduce_scatter" if "reduce_scatter" in key_l else
+                                    "other_nccl"
+                                )
                                 _nccl_stats[cat]["count"] += evt.count
-                                _nccl_stats[cat]["total_us"] += evt.self_device_time_total if hasattr(evt, 'self_device_time_total') else 0
-                        _prof = _make_profiler()  # Fresh profiler for next step
+                                _nccl_stats[cat]["total_us"] += (
+                                    evt.self_device_time_total
+                                    if hasattr(evt, "self_device_time_total") else 0
+                                )
+                        _prof = _make_profiler()
                     except Exception:
                         _prof = _make_profiler()
                 opt_start = time.monotonic()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
+                if detailed_metrics and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 opt_ms = (time.monotonic() - opt_start) * 1000
                 step += 1
                 total_ms = (time.monotonic() - step_start) * 1000
-                # Aggregate NCCL stats for this step
-                ar_ms = round(_nccl_stats["all_reduce"]["total_us"] / 1000.0 / max(_nccl_stats["all_reduce"]["count"], 1), 2) if _nccl_stats["all_reduce"]["count"] > 0 else 0.0
-                ag_ms = round(_nccl_stats["all_gather"]["total_us"] / 1000.0 / max(_nccl_stats["all_gather"]["count"], 1), 2) if _nccl_stats["all_gather"]["count"] > 0 else 0.0
-                rs_ms = round(_nccl_stats["reduce_scatter"]["total_us"] / 1000.0 / max(_nccl_stats["reduce_scatter"]["count"], 1), 2) if _nccl_stats["reduce_scatter"]["count"] > 0 else 0.0
-                ar_bytes = _est_ar_bytes
-                ag_bytes = _est_ag_bytes
-                rs_bytes = _est_rs_bytes
-                # Sample resource utilization during active training
-                _gpu_u = _sample_gpu_util()
-                _cpu_u = _sample_cpu_util()
-                _gpu_m = _sample_gpu_mem()
-                if _gpu_u is not None:
-                    _gpu_util_samples.append(_gpu_u)
-                if _cpu_u is not None:
-                    _cpu_util_samples.append(_cpu_u)
-                if _gpu_m is not None:
-                    _gpu_mem_samples.append(_gpu_m)
-
-                step_records.append({
-                    "step": step,
-                    "forward_ms": round(fwd_ms, 2),
-                    "backward_ms": round(bwd_ms, 2),
-                    "optimizer_ms": round(opt_ms, 2),
-                    "comm_ms": round(max(0.0, total_ms - fwd_ms - bwd_ms - opt_ms), 2),
-                    "total_ms": round(total_ms, 2),
-                    "loss": round(loss_sum / max(loss_count, 1), 6),
-                    "all_reduce_ms": ar_ms,
-                    "all_gather_ms": ag_ms,
-                    "reduce_scatter_ms": rs_ms,
-                    "all_reduce_bytes": ar_bytes,
-                    "all_gather_bytes": ag_bytes,
-                    "reduce_scatter_bytes": rs_bytes,
-                    "gpu_util_pct": _gpu_u,
-                    "gpu_mem_mb": _gpu_m,
-                    "cpu_util_pct": _cpu_u,
-                })
+                if detailed_metrics:
+                    ar_ms = (
+                        round(
+                            _nccl_stats["all_reduce"]["total_us"] / 1000.0
+                            / max(_nccl_stats["all_reduce"]["count"], 1),
+                            2,
+                        )
+                        if _nccl_stats["all_reduce"]["count"] > 0 else 0.0
+                    )
+                    ag_ms = (
+                        round(
+                            _nccl_stats["all_gather"]["total_us"] / 1000.0
+                            / max(_nccl_stats["all_gather"]["count"], 1),
+                            2,
+                        )
+                        if _nccl_stats["all_gather"]["count"] > 0 else 0.0
+                    )
+                    rs_ms = (
+                        round(
+                            _nccl_stats["reduce_scatter"]["total_us"] / 1000.0
+                            / max(_nccl_stats["reduce_scatter"]["count"], 1),
+                            2,
+                        )
+                        if _nccl_stats["reduce_scatter"]["count"] > 0 else 0.0
+                    )
+                    _gpu_u = _sample_gpu_util()
+                    _cpu_u = _sample_cpu_util()
+                    _gpu_m = _sample_gpu_mem()
+                    if _gpu_u is not None:
+                        _gpu_util_samples.append(_gpu_u)
+                    if _cpu_u is not None:
+                        _cpu_util_samples.append(_cpu_u)
+                    if _gpu_m is not None:
+                        _gpu_mem_samples.append(_gpu_m)
+                    step_records.append({
+                        "step": step,
+                        "forward_ms": round(fwd_ms, 2),
+                        "backward_ms": round(bwd_ms, 2),
+                        "optimizer_ms": round(opt_ms, 2),
+                        "comm_ms": round(max(0.0, total_ms - fwd_ms - bwd_ms - opt_ms), 2),
+                        "total_ms": round(total_ms, 2),
+                        "loss": round(loss_sum / max(loss_count, 1), 6),
+                        "all_reduce_ms": ar_ms,
+                        "all_gather_ms": ag_ms,
+                        "reduce_scatter_ms": rs_ms,
+                        "all_reduce_bytes": _est_ar_bytes,
+                        "all_gather_bytes": _est_ag_bytes,
+                        "reduce_scatter_bytes": _est_rs_bytes,
+                        "gpu_util_pct": _gpu_u,
+                        "gpu_mem_mb": _gpu_m,
+                        "cpu_util_pct": _cpu_u,
+                    })
                 if accelerator.is_main_process and step % 10 == 0:
                     logger.info(
                         "local step %s/%s loss=%.4f",
@@ -467,7 +489,6 @@ def train_local_steps(
             else:
                 if _prof is not None:
                     _prof.stop()
-                micro += 1
 
     train_time_s = time.monotonic() - train_start
     gpu_mem_peak_mb = 0.0
@@ -477,12 +498,10 @@ def train_local_steps(
             torch.cuda.max_memory_allocated() / (1024 * 1024),
         )
 
-    # Compute GPU/CPU utilization from per-step samples (not end-of-training snapshot)
     gpu_util_pct = None
     if _gpu_util_samples:
         gpu_util_pct = round(sum(_gpu_util_samples) / len(_gpu_util_samples), 2)
-    elif torch.cuda.is_available():
-        # Fallback: single snapshot if no per-step samples were collected
+    elif detailed_metrics and torch.cuda.is_available():
         try:
             gpu_util_pct = round(torch.cuda.utilization(), 2)
         except Exception:
@@ -499,7 +518,6 @@ def train_local_steps(
             except Exception:
                 gpu_util_pct = None
 
-    # CPU memory (RSS) via resource module
     cpu_mem_peak_mb = 0.0
     cpu_util_pct = 0.0
     try:
@@ -510,41 +528,40 @@ def train_local_steps(
         pass
     if _cpu_util_samples:
         cpu_util_pct = round(sum(_cpu_util_samples) / len(_cpu_util_samples), 2)
-    else:
+    elif detailed_metrics:
         try:
             import psutil
             cpu_util_pct = round(psutil.cpu_percent(interval=0.1), 2)
         except Exception:
             pass
 
-    # GPU memory stats from per-step samples
     gpu_mem_avg_mb = None
     if _gpu_mem_samples:
         gpu_mem_avg_mb = round(sum(_gpu_mem_samples) / len(_gpu_mem_samples), 2)
 
     avg_loss = loss_sum / max(loss_count, 1)
     n = len(step_records)
-    # Aggregate NCCL stats across all steps
     total_ar_ms = sum(s.get("all_reduce_ms", 0) for s in step_records)
     total_ag_ms = sum(s.get("all_gather_ms", 0) for s in step_records)
     total_rs_ms = sum(s.get("reduce_scatter_ms", 0) for s in step_records)
     total_ar_bytes = sum(s.get("all_reduce_bytes", 0) for s in step_records)
     total_ag_bytes = sum(s.get("all_gather_bytes", 0) for s in step_records)
     total_rs_bytes = sum(s.get("reduce_scatter_bytes", 0) for s in step_records)
-    # Throughput: tokens per second (only count on main process to avoid overcounting)
-    throughput_tokens_per_s = round(total_tokens_processed / train_time_s, 2) if train_time_s > 0 else 0.0
-    # Network traffic via psutil (per-process NIC counters)
+    throughput_tokens_per_s = (
+        round(total_tokens_processed / train_time_s, 2) if train_time_s > 0 else 0.0
+    )
     net_rx = None
     net_tx = None
     net_total = None
-    try:
-        import psutil as _ps
-        _net = _ps.net_io_counters()
-        net_rx = _net.bytes_recv
-        net_tx = _net.bytes_sent
-        net_total = net_rx + net_tx
-    except Exception:
-        pass
+    if detailed_metrics:
+        try:
+            import psutil as _ps
+            _net = _ps.net_io_counters()
+            net_rx = _net.bytes_recv
+            net_tx = _net.bytes_sent
+            net_total = net_rx + net_tx
+        except Exception:
+            pass
     summary = {
         "steps": step_records,
         "total_train_time_s": round(train_time_s, 2),
@@ -561,7 +578,8 @@ def train_local_steps(
         "total_reduce_scatter_bytes": total_rs_bytes,
         "throughput_tokens_per_s": throughput_tokens_per_s,
         "total_tokens": total_tokens_processed,
-        "num_steps": n,
+        "num_steps": n if n else step,
+        "detailed_metrics": detailed_metrics,
     }
     resources = {
         "gpu_memory_peak_mb": round(gpu_mem_peak_mb, 2),
@@ -576,7 +594,12 @@ def train_local_steps(
         "network_tx_bytes": net_tx,
         "network_total_bytes": net_total,
         "total_nccl_bytes": total_ar_bytes + total_ag_bytes + total_rs_bytes,
-        "nccl_collective_calls": sum(1 for s in step_records if s.get("all_reduce_ms", 0) > 0 or s.get("all_gather_ms", 0) > 0 or s.get("reduce_scatter_ms", 0) > 0),
+        "nccl_collective_calls": sum(
+            1 for s in step_records
+            if s.get("all_reduce_ms", 0) > 0
+            or s.get("all_gather_ms", 0) > 0
+            or s.get("reduce_scatter_ms", 0) > 0
+        ),
         "avg_nccl_comm_ms": round((total_ar_ms + total_ag_ms + total_rs_ms) / n, 2) if n else 0.0,
     }
     return avg_loss, {"training": summary, "resources": resources}
@@ -723,6 +746,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="从 --client-state-dir 恢复 memory / local_global（RES-2）",
+    )
+    p.add_argument(
+        "--detailed-train-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="训练细粒度观测（torch.profiler / 每步 nvidia-smi / cuda.synchronize）；"
+             "默认关。仅专项 profiling 时开启，否则 train_local_s 会膨胀约 8x",
     )
     return p.parse_args()
 
@@ -1114,6 +1144,7 @@ def main() -> None:
             accelerator=accelerator,
             local_steps=args.local_steps,
             grad_accum=args.grad_accum,
+            detailed_metrics=bool(getattr(args, "detailed_train_metrics", False)),
         )
         accelerator.wait_for_everyone()
         t_train = time.monotonic() - t_train0
@@ -1288,6 +1319,9 @@ def main() -> None:
                 "upload_blocks_MiB": round(total_upload_bytes / (1024 * 1024), 3),
                 "pipeline_wait_agg_s": round(t_wait, 3),
                 "pipeline_post_apply_s": round(t_post, 3),
+                # 聚合后下行（pipeline 路径在此记账；勿依赖外层 post_delta 覆盖）
+                "post_delta_s": round(t_post, 3),
+                "post_delta_MiB": round(post_bytes / (1024 * 1024), 3),
                 # Evaluation-compatible WAN timing aliases
                 "wan_download_s": round(t_download, 3),
                 "wan_upload_s": round(t_upload, 3),
@@ -1658,6 +1692,10 @@ def main() -> None:
                 "secagg_self_master_s": round(t_sm, 3),
                 "pipeline_wait_agg_s": round(t_wait, 3),
                 "pipeline_post_apply_s": round(t_post, 3),
+                # SecAgg 在上传路径内已 apply 聚合 block；必须在此记账，
+                # 否则外层因 local_version 已推进而 post_delta_MiB=0，图上 ICC recv 全 0。
+                "post_delta_s": round(t_post, 3),
+                "post_delta_MiB": round(post_bytes / (1024 * 1024), 3),
             }
             return timings
 
@@ -1735,10 +1773,15 @@ def main() -> None:
             full_timings = {
                 **(pre_wait_timings or {}),
                 "wait_aggregate_s": round(t_wait, 3),
-                "post_delta_s": round(float((post or {}).get("seconds", 0.0)), 3),
-                "post_delta_MiB": round(float((post or {}).get("bytes", 0.0)) / (1024 * 1024), 3),
                 "round_total_s": round(time.monotonic() - t_round0, 3),
             }
+            # SecAgg/pipeline 已在 upload 路径内 apply 并写入 post_delta_*；
+            # 外层因 local_version 已是 round_idx 会得到 bytes=0，不能覆盖。
+            if "post_delta_MiB" not in full_timings:
+                full_timings["post_delta_s"] = round(float((post or {}).get("seconds", 0.0)), 3)
+                full_timings["post_delta_MiB"] = round(
+                    float((post or {}).get("bytes", 0.0)) / (1024 * 1024), 3
+                )
 
             # Write metrics_detailed.json for evaluation package compatibility
             try:

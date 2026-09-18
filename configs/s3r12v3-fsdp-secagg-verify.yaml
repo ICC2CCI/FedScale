@@ -1,5 +1,5 @@
 # B-10 验证配置：SecAgg 开启（Hadamard + Issue #1 + raw bytes）
-# 5 轮已通过（results/202609171717，R5 eval=1.364）；当前用于 20 轮对照
+# 5 轮回归已通过（results/202609180911）；当前用于 20 轮对照
 # SEC-1/2/3 关闭（隔离测试 SecAgg），eval 每轮做
 federated:
   num_clients: 2
@@ -43,7 +43,7 @@ security:
   sec_upload_privacy: false     # 关闭 SEC-1/2/3，隔离测试 SecAgg
   secagg_enabled: true
   secagg_modulus_bits: 16       # int16 (2B)
-  secagg_scale: 0.0             # 自适应（round 1 用默认, 后续根据 delta max 调整）
+  secagg_scale: 0.0             # 0=自适应（Hadamard 下用 global_amax）
   secagg_stochastic_rounding: true
   secagg_q_min: 0
   secagg_hadamard: true        # 量化前 Hadamard 旋转（压低动态范围）

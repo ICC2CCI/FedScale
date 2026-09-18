@@ -60,7 +60,8 @@ bash scripts/docker-central-up.sh
 
 - [`../deploy_multinode.sh`](../deploy_multinode.sh) — 多节点部署脚本
 - [`../configs/`](../configs/) — K8s 部署配置
-- [`../DESIGN.md`](../DESIGN.md) — 整体架构设计
+- [`../docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md`](../docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) — 当前双集群联调流程
+- [`../docs/README.md`](../docs/README.md) — 文档索引
 
 ## 常见问题
 

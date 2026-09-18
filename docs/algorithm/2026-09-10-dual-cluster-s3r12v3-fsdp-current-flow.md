@@ -1,12 +1,14 @@
 # 双集群 S3R12v3 + FSDP 当前联调流程说明
 
-- **日期**：2026-09-10
-- **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO 假死恢复）
-- **参考跑次**：`results/202609101345/`
-- **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`
-- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`
+- **日期**：2026-09-10（初稿）/ 2026-09-18（补 SecAgg 当前路径）
+- **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO 假死恢复；可选 Windowed SecAgg）
+- **参考跑次**：
+  - 非 SecAgg（fp16 blocks）：`results/20260911-10pct-pipe2/`、`results/20260914-final-clean/`（R20 eval≈0.95–0.99）
+  - SecAgg（Hadamard 默认）：`results/202609171809/`（R20 eval=**0.985**）
+- **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`
+- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg 验证用 `configs/s3r12v3-fsdp-secagg-verify.yaml`）
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分内容已过时，以本文为准）。执行跟踪：已落地部分见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md)；未完成项见 [active TODO](../exec-plans/active/2026-09-11-dual-cluster-to-production.md)。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分内容已过时，以本文为准）。执行跟踪：已落地部分见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md)；未完成项见 [active TODO](../exec-plans/active/2026-09-11-dual-cluster-to-production.md)。
 
 ---
 
@@ -95,6 +97,45 @@
 | round_wall（虚线） | Server 视角整轮墙钟 |
 
 说明：在线 eval 耗时目前未画进堆叠条，但已写入日志/上报。
+
+---
+
+## 3.1 SecAgg 路径（当前默认：Hadamard）
+
+与上面 §3 相同的三角色与 MinIO/HTTP 分工；差别在 **第 ⑥–⑪ 步换成整数域安全聚合**。配置入口：`configs/s3r12v3-fsdp-secagg-verify.yaml`（`security.secagg_enabled` + `secagg_hadamard: true`）。
+
+```
+【两端各自】
+  ①–⑤ 同 §3（问 plan → 装权重 → 训练 → 在线 eval）
+  ⑥ 算 FP32 delta；叠加 block_memory + quant_residual（Issue #1：不 round 回 FP16）
+  ⑥b key-announce：上报 X25519 公钥 + **global_amax**（1 个标量）
+  ⑥c peer-keys：拿到对端公钥、**统一 scale**、**secagg_session_id**（必须同步）
+  ⑦ 逐 window：pad→2^p → Hadamard → INT16 随机舍入 → pairwise+self mask
+       → MinIO 写 raw bytes；HTTP 只通知 z_key（不再 hex 塞 JSON）
+  ⑧ 提交 self_master；拆分更新 quant_residual（decay=1.0）/ block_memory（0.9）
+
+【Server】
+  ⑨ 收齐 amax → 定全局 scale；收齐 z_key + self_master
+  ⑩ 后台 finalize：Σz → 去 self-mask → 反量化 → 逆 Hadamard → FedAvg
+  ⑪ 写 global_delta（+ 按需全量）；标记 done
+
+【两端各自】
+  ⑫–⑮ 同 §3（等 done → apply delta → 下一轮）
+```
+
+相对非 SecAgg 的关键差异：
+
+| 项 | 非 SecAgg（§3） | SecAgg Hadamard（§3.1） |
+|----|-----------------|-------------------------|
+| 上传对象 | `blocks.pt`（选中 block，fp16） | 每 window 一份 masked INT16 raw + `z_key` |
+| Server 可见 | 各 client 明文 block delta | 仅 masked `z_k` + 1 个 `global_amax` |
+| 额外控制面 | 无 | key-announce / peer-keys / self-master |
+| 收敛（20 轮） | R20≈0.95–0.99 | R20=**0.985**（`202609171809`） |
+| 典型额外耗时 | — | encode（Hadamard+量化）+ DH；train 本身不应变慢 |
+
+**训练变慢排查**：若 `train_local_s` 从 ~38s 变成 ~300s，检查客户端是否误开了 `--detailed-train-metrics`（`torch.profiler` / 每步 `nvidia-smi`）。该开关 **默认关**，与 SecAgg 无关。
+
+更细的量化/隐私/踩坑记录：[精度问题 §3](2026-09-15-secagg-quantization-precision-issue.md) · [调研 §3.7–3.8](2026-09-17-secagg-quantization-optimization-survey.md)。
 
 ---
 
@@ -230,7 +271,9 @@ ICC1                         Server                         ICC2
 | 全量写盘频率 | 每轮 | yaml `io.write_full_global_every_n_rounds`（5/10/0 减负，IO-1） |
 | 写盘超参 | timeout 1800s | yaml `io.client_upload_timeout_s` |
 | 鉴权 | 关 | yaml `security.auth_token`（非空启用 Bearer，SEC-0） |
-| 结果目录示例 | `results/202609101345/`（内含 `run.yaml` + `run_meta.json`） | — |
+| SecAgg | 验证配置默认开 | `configs/s3r12v3-fsdp-secagg-verify.yaml`：`secagg_enabled` + `secagg_hadamard` + `quant_residual_decay=1.0` |
+| 训练细粒度观测 | **默认关** | `--detailed-train-metrics`；正式对照勿开 |
+| 结果目录示例 | `results/202609171809/`（SecAgg）/ `results/20260914-final-clean/`（fp16） | 含 `run.yaml` + `run_meta.json` |
 | 画图 | `python scripts/plot_s3r12v3_fsdp_run.py results/<id>` | — |
 | 实时监控 | `bash scripts/check_rerun_status.sh --watch`（OPS-1） | — |
 
@@ -244,5 +287,7 @@ ICC1                         Server                         ICC2
 | `scripts/plot_s3r12v3_fsdp_run.py` | 出 train/eval/时间/传输图 |
 | `scripts/check_rerun_status.sh` | 看当前轮进度 |
 | `experiments/server/README.md` | 聚合服务 API 与增量协议要点 |
+| `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md` | SecAgg 量化精度、当前完整流程、amax 隐私 |
+| `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md` | Hadamard / Issue #1 / 20 轮对照结论 |
 | `results/README.md` | 结果目录约定 |
 | `deployment/dual-cluster-nodes.md` | 节点与启动顺序（运维） |

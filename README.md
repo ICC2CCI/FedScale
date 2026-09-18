@@ -6,12 +6,13 @@
 
 | 你想… | 去这里 |
 |---|---|
+| **看当前双集群 / SecAgg 怎么跑** | [`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md`](docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) |
 | 了解 S3R12v3 算法原理 | [`docs/algorithm/2026-09-04-s3r12v3-block-uniform.md`](docs/algorithm/2026-09-04-s3r12v3-block-uniform.md) |
 | 看完整复现参数 | [`docs/reference/federated-training-reproduction-params.md`](docs/reference/federated-training-reproduction-params.md) |
 | 在新服务器上部署 | [`deployment/README.md`](deployment/README.md) |
-| 运行某个实验 | [`experiments/`](experiments/) 目录下的 `run_*.py` |
-| 查看实验结果 | [`results/`](results/) 目录下的 round_logs 与 figures |
-| 了解核心代码 | [`flowertune-llm/`](flowertune-llm/) 目录 |
+| 运行某个实验 | [`experiments/`](experiments/)（主力：`run_s3r12v3_fsdp.py` + `scripts/start_s3r12v3_fsdp_run.sh`） |
+| 查看实验结果 | [`results/`](results/) |
+| 历史 Flower 代码（勿作当前入口） | [`flowertune-llm/`](flowertune-llm/) |
 
 ## 仓库结构
 
@@ -32,9 +33,8 @@ FedScale/
 │   ├── round_logs/            # 每个实验的逐轮日志（JSON）
 │   └── figures/               # 对比图（PNG）
 ├── deployment/                # 多集群部署指南
-├── scripts/                   # 原始部署/运维脚本
-├── configs/                   # K8s 部署、对象存储配置
-├── DESIGN.md                  # 整体设计说明
+├── scripts/                   # 部署/运维与启动脚本（含 start_s3r12v3_fsdp_run.sh）
+├── configs/                   # 训练 yaml +（历史）K8s/对象存储配置
 └── README.md                  # 本文件
 ```
 

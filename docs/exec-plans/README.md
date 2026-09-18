@@ -30,14 +30,13 @@
 
 ## active
 
-| 计划 | 说明 |
-|---|---|
-| [双集群联调 → 真实联邦](active/2026-09-11-dual-cluster-to-production.md) | 配置参数化、部分参与、续训、安全与规模化（未完成项） |
+当前无进行中计划。见 [`active/README.md`](active/README.md)。
 
 ## completed
 
 | 计划 | 结项 | 说明 |
 |---|---|---|
+| [双集群联调 → 真实联邦](completed/2026-09-11-dual-cluster-to-production.md) | 2026-09-11 | CFG/SEC/SCALE 等已落地 |
 | [三场景 loss 对比](completed/2026-09-02-three-scenario-loss-comparison.md) | 2026-09-02 | S1/S2/S3 单机联邦对比主线 |
 | [S3R12v2 key 级排列](completed/2026-09-04-s3r12v2-block-permutation.md) | 2026-09-04 | 真 20% 带宽（key 级） |
 | [S3R12v3 block 均匀](completed/2026-09-04-s3r12v3-block-uniform.md) | 2026-09-04 | block 级均匀上传 |

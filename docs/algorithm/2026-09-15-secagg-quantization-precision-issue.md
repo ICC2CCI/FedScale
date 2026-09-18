@@ -1,8 +1,17 @@
 # SecAgg 量化精度问题分析与优化方案
 
-> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（旧 20 轮验证通过）
-> 状态：**eval loss 上升问题已解决**（不再发散）。per-window 当轮 amax + error-feedback + stochastic rounding，旧 20 轮 eval 1.498→1.328。
-> 后续：实现层 FP16 rounding 与 quant residual×0.9 已按 [Issue #1](https://github.com/ICC2CCI/FedScale/issues/1) 去掉；Hadamard 全局 scale + raw bytes 已落地。5 轮验证（`results/202609171717`）R5 eval=**1.364**（旧 SecAgg R5=1.432，fp16 R5≈1.377）。详见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。20 轮 Hadamard 对照进行中，完成前不把剩余差距直接归因于 INT16 位宽。
+> 日期：2026-09-15（问题定位）/ 2026-09-16（方案实现）/ 2026-09-17（旧 20 轮验证）/ 2026-09-18（Hadamard 20 轮对齐 fp16）
+> 状态：**收敛问题已解决，当前默认路径为 Hadamard + Issue #1**。
+>
+> | 阶段 | 结果目录 | R20 eval | 说明 |
+> |---|---|---|---|
+> | 修复前发散 | 早期 5 轮 | — | R5 飙到 2.36 |
+> | per-window amax 修复 | `202609162025` | **1.328** | 不再发散，但仍落后 fp16 |
+> | Hadamard + Issue #1 | `202609171809` | **0.985** | ≈ fp16 `final-clean` **0.987** |
+>
+> 当前端到端流程以 §3.1「Hadamard 默认路径」为准；§3.1.1 保留旧 per-window 流程作历史对照。
+> 详细调研与 Phase 记录见 `docs/algorithm/2026-09-17-secagg-quantization-optimization-survey.md`。
+> 双集群联调总览见 `docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1。
 
 ## 1. 问题概述
 
@@ -90,59 +99,92 @@ mem = residual * memory_decay
 | ② 用聚合后 max 估下轮 scale | `new_scale = agg_max / Q_max * 0.9 ≤ old_scale * 0.9` → 每轮缩 10% | 当轮 client 上报 amax → server 取 max_k → 无滞后、无收缩 |
 | ③ 量化误差不进 residual | 选中 block 直接置 0 | `update_block_memory_with_quant_residual`：写 residual * memory_decay |
 
-## 3. 完整流程
+## 3. 完整流程（以当前默认路径为准）
 
-### 3.1 每轮执行流程
+### 3.1 每轮执行流程 — Hadamard 默认路径（`secagg_hadamard: true`）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Round N                                                          │
+│ Round N（当前默认：Hadamard + Issue #1 + raw bytes）              │
 │                                                                  │
 │  Client 端 (每个 client):                                        │
-│  1. 训练 30 步 → delta = full_state - global_state (fp32)        │
-│  2. extract_window_slices(to_send, windows) → fp32 delta_slices  │
-│  3. window_amax_payload(delta_slices) → {window_id: max|delta|}  │
-│  4. key-announce: POST pk_hex + window_amax                      │
-│  5. 等 server 收齐所有 client 的 amax → 下发 window_scales        │
+│  1. 训练 30 步 → delta = full_state - global_state（保持 FP32）  │
+│  2. to_send = delta + block_memory + quant_residual（FP32）      │
+│  3. 在旋转域估 global_amax（所有 window 共用；只报 1 个标量）     │
+│  4. key-announce: POST pk_hex + global_amax                      │
+│  5. peer-keys: 收齐后拿 public_keys + 统一 scale                 │
+│     + secagg_session_id（必须写回本地 plan，禁止空 session）     │
 │  6. 逐 window:                                                   │
-│     a. scale_b = plan.get_window_scale(window_id)               │
-│     b. q_k = quantize_to_zq_with_feedback(delta_slice, scale_b) │
-│        → q_k, residual, stats{clip_frac, zero_frac}             │
-│     c. z_k = q_k + pairwise_mask + self_mask (mod q)            │
-│     d. 上传 z_k (int16 packed, 2B/元素)                          │
-│  7. update_block_memory_with_quant_residual(to_send, residual)  │
-│     → 选中 block 写 residual * memory_decay，未选中保留原值      │
-│  8. 提交 self_master                                             │
+│     a. pad 到 2 的幂（含 LayerNorm 等非 p2 长度）                 │
+│     b. 符号翻转 D → FWHT → 用全局 scale 做 INT16 随机舍入        │
+│     c. z_k = q_k + pairwise_mask + self_mask (mod q)             │
+│     d. MinIO put raw bytes；HTTP 只 POST z_key（不再 hex JSON）   │
+│  7. Memory 拆分更新:                                             │
+│     - 选中: quant_residual = x - D(Q(x))（decay=1.0）            │
+│             block_memory 置 0                                    │
+│     - 未选中: block_memory = (delta+block_memory)*0.9            │
+│  8. 提交 self_master（server 后台 finalize，HTTP 先回 200）      │
 │  9. 等聚合完成 → 下载 agg_delta → apply                          │
 │                                                                  │
 │  Server 端:                                                      │
-│  1. key-announce: 收集所有 client 的 pk + window_amax            │
-│  2. 收齐后 _finalize_window_scales:                              │
-│     scale_b = max_k(window_amax[k][b]) / Q_max * 1.05           │
-│     → 写入 coord.window_scales + plan.window_scales              │
-│  3. peer-keys 响应: 下发 public_keys + window_scales             │
-│  4. 收集所有 client 的 z_k + self_master                         │
-│  5. 聚合: sum_z = Σ z_k (mod q)                                  │
-│  6. 移除 self_mask: sum_q = sum_z - Σ B_k (mod q)               │
-│  7. 逐 window 反量化:                                            │
-│     delta_b = dequantize_from_zq(sum_q, scale_b) / N            │
-│  8. 写 per-block agg_block_key + global_delta_key               │
+│  1. key-announce: 收集 pk + global_amax                          │
+│  2. scale = max_k(global_amax) / Q_max * 1.05（全局一份）        │
+│  3. peer-keys: 下发 public_keys + scale + session                │
+│  4. 按 z_key 从 MinIO 读 raw → unpack_zq                         │
+│  5. sum_z = Σ z_k (mod q)；去掉 Σ self_mask → sum_q              │
+│  6. 反量化 → 逆 FWHT → 去 pad → FedAvg                           │
+│  7. 写 global_delta / per-block（异步 finalize）                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 关键参数
+数据路径摘要：
+
+```
+FP16 模型参数
+  → FP32 delta（不 round 回 FP16）          # Issue #1
+  → FP32 (block_memory + quant_residual)
+  → pad-p2 → D → FWHT                       # Hadamard
+  → INT16 + stochastic rounding（全局 scale）
+  → pairwise + self mask (mod q)
+  → MinIO raw bytes + z_key 通知
+  → Server unmask → 反量化 → 逆 FWHT → FedAvg
+```
+
+### 3.1.1 历史流程 — per-window 当轮 amax（`secagg_hadamard: false`）
+
+曾用于把 eval 从发散拉回可下降（`202609162025`，R20=1.328）。Hadamard 默认开启后一般不再走这条路径；保留作对照与隐私退路说明。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Round N（旧：per-window 当轮 amax）                               │
+│                                                                  │
+│  Client:                                                         │
+│  1–2. 同左（训练 + extract windows）                             │
+│  3. window_amax_payload → {window_id: max|delta|}（~269 float）  │
+│  4. key-announce: POST pk + window_amax                          │
+│  5. peer-keys: 下发 per-window window_scales                     │
+│  6. 逐 window: scale_b 量化 → mask → 上传（早期为 hex）          │
+│  7. residual 写入 memory（早期曾 residual×0.9，现已拆分）         │
+│                                                                  │
+│  Server:                                                         │
+│  scale_b = max_k(window_amax[k][b]) / Q_max * 1.05               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 关键参数（当前默认）
 
 | 参数 | 值 | 说明 |
 |---|---|---|
 | 模数位宽 | 16 (int16) | q = 2^16 = 65536 |
-| Q_max | 16383 | 量化值上界 (q/4 - 1, 留 overflow 空间) |
-| scale 模式 | per-window 当轮 amax | `secagg_scale: 0.0` = per-window；>0 = 固定全局 |
-| SCALE_COVERAGE | 1.05 | amax 映射到 0.95*Q_max，不 clip |
-| ROUND1_PUBLIC_SCALE | 2^-20 | fallback（client 未报 amax 时） |
-| 随机舍入 | 开启 | stochastic rounding, E[quantize(x)] = x |
-| memory_decay | 0.9 | error-feedback 衰减系数 |
-| 传输量 | 2B/元素 | int16 packed，与 fp16 一致 |
-| 额外开销 | ~1KB/轮 | 269 个 float（per-window amax） |
+| Q_max | 16383 | 量化值上界 (q/4 - 1) |
+| scale 模式 | **全局 scale（Hadamard）** | `secagg_hadamard: true`；只收 `global_amax` |
+| 非 Hadamard 退路 | per-window 当轮 amax | `secagg_hadamard: false`；`secagg_scale: 0.0` |
+| SCALE_COVERAGE | 1.05 | amax 映射到 0.95*Q_max，减少 clip |
+| 随机舍入 | 开启 | stochastic rounding，E[quantize(x)] = x |
+| `memory_decay` | 0.9 | 仅未选中 block 的 block-mask residual |
+| `quant_residual_decay` | **1.0** | 量化残差不衰减（Issue #1） |
+| 传输 | MinIO raw bytes | ~2B/元素；控制面 `z_key` |
+| amax 开销 | **1 float/client/轮** | Hadamard；旧路径为 ~269 float |
 
 ### 3.3 安全模型
 
@@ -150,52 +192,46 @@ mem = residual * memory_decay
 - **self mask**: client 生成 self_master, 提交给 server → server 知道 B_k, 但不知道 R_kl → 无法分离 q_k
 - **2-client 无掉线**: pairwise mask 自动抵消, self mask 由 server 移除
 - **掉线处理**: survivors < q_min → abort
-- **amax 泄露分析**: 每轮泄露 269 个 float（每 window 的 L∞），不是更新方向/内容。2-client 实验可接受。如需更强隐私，可改为「公开聚合 max」回退路径（`update_public_block_scales`，headroom=3.0），但精度会降低。
+- **session 同步**: peer-keys 必须把 `secagg_session_id` 写回 client；空 session 会导致 self-mask 与 server 不一致（Hadamard 下尤其危险）
+- **amax 泄露**:
+  - **当前（Hadamard）**: 每轮只泄露 1 个 `global_amax`（旋转域 L∞），**不再**泄露 per-window L∞
+  - **旧（per-window）**: 每轮泄露 ~269 个 float；2-client 实验可接受。更强隐私可退到「公开聚合 max」路径，但精度会降
 
 ### 3.4 隐私泄露分析
 
-当前方案在 SecAgg 安全聚合之上，为了实现 per-window scale 对齐，引入了额外的信息泄露。以下逐项列出 server 能看到的所有 client 信息，按泄露程度排序。
+当前方案在 SecAgg 安全聚合之上，为对齐量化 scale，仍有少量额外泄露。以下按**当前默认（Hadamard）**列出；括号注明旧路径差异。
 
 #### 3.4.1 泄露清单
 
 | # | 泄露内容 | 泄露给谁 | 每轮数据量 | 泄露程度 | 引入原因 |
 |---|---|---|---|---|---|
-| 1 | **per-window max\|delta\|（L∞）** | server | 269 个 float ≈ 1KB | **中** | **本方案新增**（当轮 amax 对齐 scale） |
-| 2 | **masked window z_k** | server | 269 × 524288 × 2B ≈ 135 MiB | 低（已被 mask 保护） | SecAgg 协议本身 |
+| 1 | **global_amax（旋转域 L∞）** | server | **1 个 float**（旧路径：269 个 per-window L∞） | **低–中** | scale 对齐；Hadamard 已大幅削减 |
+| 2 | **masked window z_k** | server | ~115–140 MiB raw | 低（已被 mask 保护） | SecAgg 协议本身 |
 | 3 | **self_master（32 bytes）** | server | 32B × 2 client | 低（只能算 B_k，无法分离 q_k） | SecAgg 协议本身 |
 | 4 | **X25519 公钥** | server + 其他 client | 32B × 2 | 无（公钥设计上公开） | SecAgg 协议本身 |
 | 5 | **train_loss / eval_loss** | server | 2 个 float × 2 client | **中** | upload-complete body 里携带 |
 | 6 | **num_examples** | server | 1 个 int × 2 client | 低 | upload-complete body |
 | 7 | **per-round timing** | server | ~15 个 float × 2 client | 低 | upload-complete body |
 | 8 | **block_energies** | server | 每 block 一个 float | 低 | upload-complete body |
-| 9 | **per-window z_k 的 POST 时序** | server | 269 个时间戳 | 低（侧面信息） | 逐 window 上传 |
+| 9 | **per-window z_k 的 POST 时序** | server | ~269 个时间戳 | 低（侧面信息） | 逐 window 上传 |
 
-#### 3.4.2 关键泄露 #1：per-window L∞（本方案引入）
+#### 3.4.2 关键泄露 #1：amax（scale 对齐引入）
 
-**泄露什么**：每个 window（269 个，约对应模型的每个 512K block）的 `max|delta|`，即该 block 内权重更新的最大绝对值。
+**Hadamard 当前路径泄露什么**：整轮所有 window 在旋转域上的一个全局 `max|y|`。server 能看到本轮更新「总体幅度」和 client 间谁更大，但**看不到哪个 block 更新大**。
 
-**server 能推断出什么**：
-- 哪些 block 本轮更新大（如 embedding、lm_head），哪些更新小（如 LayerNorm）
-- 每轮各 block 更新幅度的变化趋势（训练前期 vs 后期）
-- 两个 client 的 amax 差异（server 看到 `window_amax[client_0][b]` 和 `window_amax[client_1][b]`，取 max_k 时知道谁更大）
+**旧 per-window 路径额外泄露**：每个 window 的 `max|delta|` → 可推断 embedding / lm_head vs LayerNorm 等块的相对活跃度（见历史分析）。Hadamard 默认开启后这条路径默认关闭。
 
-**server 无法推断出什么**：
-- delta 的方向（正/负）
-- delta 的具体值（只知道 max，不知道其他 524287 个元素）
-- 哪个位置更新最大（L∞ 只给出标量，不给位置）
+**server 仍无法推断**：delta 方向、具体坐标值、argmax 位置；masked `z_k` 不可反推单 client `q_k`。
 
-**风险评级**：中。在 2-client 实验场景可接受。如果扩展到更多 client 或对抗性更强的 server，需要重新评估。
+**风险评级**：Hadamard 下为低–中；旧 per-window 为中。2-client 实验可接受。
 
-**替代方案（不泄露 L∞）**：使用「公开聚合 max」回退路径（`update_public_block_scales`，headroom=3.0），server 只从聚合后的 agg_delta 估下一轮 scale，不读单 client 的 amax。但代价是：
-- 有一轮滞后（用上一轮 agg_max 估下一轮 scale）
-- 聚合后 max 系统性偏小（FedAvg 除以 N + 大值不在同一坐标），需要 headroom=3.0 补偿
-- 精度不如当轮 amax（已在本次实验中验证：公开聚合版导致 R2 eval 上升）
+**更强隐私退路**：`update_public_block_scales`（公开聚合 max，headroom=3.0）——不读单 client amax，但有一轮滞后且精度较差（曾导致 R2 eval 上升）。
 
 #### 3.4.3 关键泄露 #5：train_loss / eval_loss
 
 **泄露什么**：每个 client 每轮的 train_loss 和 eval_loss（标量）。
 
-**这不是 SecAgg 引入的**——fp16 基线路径也泄露同样的信息（在 `upload-complete` body 里）。但需要注意：train_loss + per-window amax 组合后，server 能更准确地推断训练状态（例如 loss 高 + 某 block amax 大 → 该 block 可能是瓶颈）。
+**这不是 SecAgg 引入的**——fp16 基线路径也泄露同样的信息（在 `upload-complete` body 里）。但需要注意：train_loss + amax 组合后，server 能更准确地推断训练状态。
 
 **如果需要消除**：把 train_loss / eval_loss 从 SecAgg 路径的 POST body 中移除，改用单独的加密通道上报，或在聚合完成后才上报（server 无法关联到单 client 的 z_k）。但这不是 SecAgg 量化方案的问题，是整个 pipeline 的设计选择。
 

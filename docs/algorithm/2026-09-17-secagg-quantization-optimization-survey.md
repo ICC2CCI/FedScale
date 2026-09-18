@@ -1,10 +1,13 @@
 # SecAgg 量化优化：文献调研与技术方案
 
-> 日期：2026-09-17
-> 状态：**代码已落地 + 5 轮验证通过**（Issue #1 + 向量化 Hadamard + 全局 scale 去 L∞ + raw bytes）。R5 eval=1.364，优于旧 SecAgg（1.432）且略优于 fp16 R5（1.377）。20 轮对照进行中。
+> 日期：2026-09-17（落地）/ 2026-09-18（20 轮对照完成）
+> 状态：**Phase 3b 完成**。Issue #1 + 向量化 Hadamard + 全局 `global_amax` + MinIO raw bytes + session 同步 / 异步 finalize 已落地并验证。
+> - 5 轮：`results/202609171717`，R5 eval=**1.364**
+> - 20 轮：`results/202609171809`，R20 eval=**0.985**（对照 fp16 `20260914-final-clean` R20=**0.987**；旧 per-window SecAgg `202609162025` R20=**1.328**）
 > 关联：
 > - [ICC2CCI/FedScale#1](https://github.com/ICC2CCI/FedScale/issues/1)
 > - `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`
+> - 联调总流程：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1
 
 ## 0. 实现对照（相对 opencode 半成品）
 
@@ -21,13 +24,13 @@
 
 ## 1. 问题回顾
 
-当前 SecAgg 方案（per-window 当轮 amax + error-feedback + stochastic rounding）解决了 eval loss 发散问题（1.50→2.36 变为 1.50→1.33），但与 fp16 基线（R20 eval=0.987）仍有三个差距：
+早期 SecAgg（错误 scale）从 R2 起 eval 发散（1.50→2.36）。per-window 当轮 amax + error-feedback + stochastic rounding 先把曲线拉回可下降（`202609162025`，R20=1.328），但相对 fp16 基线（R20≈0.987）仍有三类差距：
 
-1. **eval loss 更大**（差 35%）：int16 均匀量化对 window 内动态范围大的 delta，小值精度差；叠加实现层额外 FP16 rounding 与 residual×0.9
-2. **时间更长**（慢 50%）：hex 编码导致传输量翻倍 + 逐 window 串行上传
-3. **仍有泄露**：per-window L∞（269 个标量/轮）泄露给 server
+1. **eval loss 更大**：int16 均匀量化 + 实现层多余 FP16 rounding / residual×0.9
+2. **时间更长**：hex 编码导致传输翻倍 + 逐 window 串行
+3. **仍有泄露**：per-window L∞（269 个标量/轮）
 
-**不能把剩余收敛差距直接归因于 INT16 位宽。** 应先去掉实现层额外误差（Issue #1），再加上 Hadamard 压低动态范围，再和 fp16 基线对照。
+**当前状态（Hadamard + Issue #1 + raw bytes，`202609171809`）**：R20 eval=**0.985** ≈ fp16 **0.987**；amax 降为 1 个 `global_amax`；上传走 MinIO raw bytes。原先「不能把剩余差距直接归因于 INT16」的判断已被 20 轮对照支持。
 
 ### 1.1 Issue #1：量化前多余的精度损失
 
@@ -249,7 +252,7 @@ Phase 1b: Issue #1         ✅ FP32 delta / 独立 residual decay / rel_L2·cosi
 Phase 2: Raw Bytes 上传    ✅ MinIO z_key；hex 兼容保留
 Phase 2b: 生产修复         ✅ session 同步；self-master 后台 finalize
 Phase 3a: 5 轮验证         ✅ 202609171717，R5 eval=1.364
-Phase 3b: 20 轮对照        ⏳ 进行中
+Phase 3b: 20 轮对照        ✅ 202609171809，R20 eval=0.985 ≈ fp16 0.987
 Phase 4（后备）            未做：EF21 / Kashin / int24
 ```
 
@@ -312,6 +315,55 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 1. **空 session**：client 本地 `SecAggPlan` 的 `secagg_session_id` 为空，pairwise mask 仍能互消，但 server 用 hashed session 重生 self-mask，噪声经 Hadamard 全局 scale 放大后 LayerNorm 等非 p2 window 被 clip。必须从 peer-keys 同步 session，空 session 拒绝 mask。
 2. **非 2 的幂 window**：LayerNorm 896 等原先跳过旋转，却和 p2 window 共用全局 scale。必须 pad 到下一个 2 的幂再 FWHT。
 3. **self-master 超时**：最后一名 client 的 HTTP 里同步 unmask+写 MinIO ≈31s，超过 30s timeout。改为先回 200，后台 finalize。
+
+### 3.7 20 轮对照（2026-09-17/18, `results/202609171809`）
+
+配置：`configs/s3r12v3-fsdp-secagg-verify.yaml`（Hadamard + Issue #1 + raw bytes，`quant_residual_decay=1.0`）。端口 8081。
+
+| 轮次 | train | eval（SecAgg Hadamard） | eval（旧 SecAgg `162025`） | eval（fp16 `final-clean`） |
+|---|---|---|---|---|
+| R1 | 2.041 | **1.498** | 1.498 | 1.498 |
+| R5 | 1.420 | **1.364** | 1.432 | 1.377 |
+| R10 | 1.117 | **1.091** | 1.396 | 1.093 |
+| R15 | 1.031 | **1.038** | 1.415 | 1.019 |
+| R20 | 0.944 | **0.985** | 1.328 | **0.987** |
+
+结论：当前 SecAgg 路径在 20 轮上已与非 SecAgg fp16 基线基本对齐（R20 差约 0.002），相对旧 per-window SecAgg（R20=1.328）提升明显。剩余差距不宜再主要归因于 INT16 位宽。
+
+**时间说明（勿与 SecAgg 本身混淆）**：
+
+| 阶段 | pipe2 / 旧 SecAgg（~9/16 前） | `171809`（观测开着时） | 说明 |
+|---|---|---|---|
+| `train_local_s` | ~38s | ~300s | 训练循环默认开了 `torch.profiler` + 每步 `nvidia-smi`，**与 SecAgg 无关** |
+| `encode_delta_s` | ~6s（fp16）/ ~50–60s（旧 SecAgg hex） | ~55–60s | Hadamard + INT16 pack；仍有优化空间 |
+| `upload_minio_s` | ~16s（fp16） | ~43s | raw bytes ~115–140 MiB/client |
+| 墙钟 / `round_total_s` | ~90s | ~420s | 主要由 train 观测膨胀主导 |
+
+自 2026-09-18 起，`--detailed-train-metrics` **默认关闭**；正式对照应看到 `train_local_s` 回到 ~38s 量级。需要 dashboard 细粒度指标时再显式打开。
+
+### 3.8 当前每轮端到端流程（Hadamard 默认路径）
+
+```
+【Client ×2，并行】
+  1. 拉 plan / 准备全局权重 / FSDP load / 本地训练 30 step / 在线 eval
+  2. FP32 delta（不 round 回 FP16）+ block_memory + quant_residual
+  3. key-announce：POST pk + **global_amax**（Hadamard 旋转域 1 个标量）
+  4. peer-keys：收齐后拿 public_keys + **统一 scale** + **secagg_session_id**
+  5. 逐 window：
+       pad→2^p → 符号翻转 D → FWHT → INT16 随机舍入 → pairwise+self mask
+       MinIO put raw bytes；控制面只 POST z_key
+  6. 选中 block：quant_residual = x-D(Q(x))（decay=1.0）
+     未选中：block_memory *= 0.9
+  7. 提交 self_master → 等聚合 done → 拉 global_delta 应用
+
+【Server】
+  1. 收齐 pk + global_amax → scale = max_k(amax)/Q_max*1.05（全局一份）
+  2. peer-keys 下发 keys + scale + session
+  3. 按 z_key 从 MinIO 读 raw → unpack → Σz (mod q) → 去 self-mask
+  4. 反量化 → 逆 FWHT / 去 pad → FedAvg → 写 global_delta（后台 finalize）
+```
+
+隐私：Hadamard 路径 **不再上报 per-window L∞**（269 个标量），只泄露 1 个 `global_amax`；masked `z_k` 仍由 SecAgg 保护。详见精度文档 §3.4。
 
 ## 4. 参考文献
 

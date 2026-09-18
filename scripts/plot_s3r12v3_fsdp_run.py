@@ -93,7 +93,15 @@ def plot_run(run_dir: Path) -> None:
     # - download_global_MiB：训练前拉取（cache 时为 0）
     # - post_delta_MiB：聚合后拉取的 global_delta（稳态主要下行）
     # - 两端行为应对称；勿把 global_delta（服务器写出大小）误当成某一端独有下载
+    # - SecAgg 路径不写 timing_s.transfer，改从 clients[].upload_blocks_MiB 回退汇总
     up_total = _transfer(log, "upload_blocks_MiB_total")
+    up0 = _client_series(log, "0", "upload_blocks_MiB")
+    up1 = _client_series(log, "1", "upload_blocks_MiB")
+    if not any(v is not None and v > 0 for v in up_total):
+        up_total = [
+            ((a or 0.0) + (b or 0.0)) if (a is not None or b is not None) else None
+            for a, b in zip(up0, up1)
+        ]
     g_full = _transfer(log, "global_state_MiB")
     g_delta = _transfer(log, "global_delta_MiB")
     d0 = _client_series(log, "0", "download_global_MiB")
@@ -101,24 +109,36 @@ def plot_run(run_dir: Path) -> None:
     p0 = _client_series(log, "0", "post_delta_MiB")
     p1 = _client_series(log, "1", "post_delta_MiB")
     # 本轮实际下行 = 训练前下载 + 聚合后 delta
-    recv0 = [
-        (a or 0.0) + (b or 0.0) if (a is not None or b is not None) else None
-        for a, b in zip(d0, p0)
-    ]
-    recv1 = [
-        (a or 0.0) + (b or 0.0) if (a is not None or b is not None) else None
-        for a, b in zip(d1, p1)
-    ]
+    # SecAgg/pipeline：旧日志常漏记 post_delta_MiB（bytes 在 upload 路径内产生却未上报）。
+    # 若已发生 post-apply（pipeline_post_apply_s>0）且 post_delta_MiB=0，
+    # 用同轮 upload_blocks_MiB 近似下行（两端拉取同一份聚合 block，体量同量级）。
+    post_s0 = _client_series(log, "0", "pipeline_post_apply_s")
+    post_s1 = _client_series(log, "1", "pipeline_post_apply_s")
+
+    def _recv(pre, post, post_s, up) -> List[Optional[float]]:
+        out: List[Optional[float]] = []
+        for a, b, s, u in zip(pre, post, post_s, up):
+            if a is None and b is None and s is None and u is None:
+                out.append(None)
+                continue
+            post_mib = b or 0.0
+            if post_mib <= 0.0 and (s or 0.0) > 0.0 and (u or 0.0) > 0.0:
+                post_mib = float(u)
+            out.append((a or 0.0) + post_mib)
+        return out
+
+    recv0 = _recv(d0, p0, post_s0, up0)
+    recv1 = _recv(d1, p1, post_s1, up1)
 
     fig, ax = plt.subplots(figsize=(9, 4.8), dpi=140)
     ax.plot(rounds, up_total, "o-", label="upload total (2 clients)")
     if any(v is not None for v in g_delta):
         ax.plot(rounds, g_delta, "s-", label="global_delta (server write)")
     ax.plot(rounds, g_full, "^--", alpha=0.45, label="global_state full (server write)")
-    if any(v is not None for v in recv0):
-        ax.plot(rounds, recv0, "x-", label="ICC1 recv (=pre-dl + post_delta)")
-    if any(v is not None for v in recv1):
-        ax.plot(rounds, recv1, "+-", label="ICC2 recv (=pre-dl + post_delta)")
+    if any(v is not None and v > 0 for v in recv0):
+        ax.plot(rounds, recv0, "x-", label="ICC1 recv (pre-dl + post_delta; est. if missing)")
+    if any(v is not None and v > 0 for v in recv1):
+        ax.plot(rounds, recv1, "+-", label="ICC2 recv (pre-dl + post_delta; est. if missing)")
     ax.set_xlabel("Federated round")
     ax.set_ylabel("MiB")
     ax.set_title(f"{run_dir.name} — transfer")
@@ -130,14 +150,24 @@ def plot_run(run_dir: Path) -> None:
     plt.close(fig)
 
     # --- time breakdown (from client 0 if present) ---
+    # SecAgg 额外有 DH / self_master；round_wall 在 SecAgg 路径常缺失，用 round_total_s 兜底
     keys = [
         ("download_global_s", "download"),
         ("broadcast_load_s", "load"),
         ("train_local_s", "train"),
+        ("eval_local_s", "eval"),
         ("encode_delta_s", "encode"),
+        ("secagg_dh_s", "secagg_dh"),
         ("upload_minio_s", "upload"),
+        ("secagg_self_master_s", "self_master"),
         ("wait_aggregate_s", "wait_agg"),
         ("post_delta_s", "post_delta"),
+    ]
+    wall = [
+        float((r.get("timing_s") or {}).get("round_wall_s")
+              or (((r.get("timing_s") or {}).get("clients") or {}).get("0") or {}).get("round_total_s")
+              or np.nan)
+        for r in log
     ]
     stacks = {lab: [] for _, lab in keys}
     for r in log:
@@ -152,7 +182,10 @@ def plot_run(run_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=140)
     bottom = np.zeros(len(rounds))
-    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#6d597a", "#355070"]
+    colors = [
+        "#264653", "#2a9d8f", "#e9c46a", "#b8b8ff", "#f4a261",
+        "#457b9d", "#e76f51", "#a8dadc", "#6d597a", "#355070",
+    ]
     for (k, lab), color in zip(keys, colors):
         vals = np.array(stacks[lab])
         ax.bar(rounds, vals, bottom=bottom, label=lab, color=color, width=0.7)

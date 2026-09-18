@@ -2,8 +2,9 @@
 
 此处只放 **尚未结项** 的计划。做完后把对应文件移到 [`../completed/`](../completed/)，并在文首把状态改为 `completed`。
 
-当前：
+当前：**无进行中计划**（`2026-09-11-dual-cluster-to-production` 已归档到 [`../completed/`](../completed/)）。
 
-| 计划 | 说明 |
-|---|---|
-| [2026-09-11-dual-cluster-to-production.md](2026-09-11-dual-cluster-to-production.md) | 配置参数化与真实联邦差距（CFG / IO / SYNC / RES / SEC 等，均为 todo） |
+新实验 / SecAgg 对照以这些为准：
+
+- [当前双集群联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
+- [SecAgg 量化优化调研](../../algorithm/2026-09-17-secagg-quantization-optimization-survey.md)
