@@ -493,7 +493,8 @@ bash scripts/start_s3r12v3_fsdp_run.sh
 # 正式对照保持 --detailed-train-metrics 关闭（默认关）
 ```
 
-参考正式跑次：`results/202609180941/`（SecAgg Hadamard，R20 eval=0.985）。
+参考精度对照：`results/202609180941/`（SecAgg Hadamard，R20 eval=0.985）。
+时间优化 5 轮：`results/202609181151/`（R5 eval=1.364，与 941 逐轮一致）。
 
 ### 11.2 历史单机消融
 
@@ -511,7 +512,8 @@ python scripts/run_s3r12v3_ratio.py --ratio 0.10
 | 路径 | 参考目录 | R20 eval |
 |---|---|---|
 | 非 SecAgg fp16 | `results/20260914-final-clean` | ≈0.987 |
-| SecAgg Hadamard（正式） | `results/202609180941` | **0.985** |
+| SecAgg Hadamard（精度对照） | `results/202609180941` | **0.985** |
+| SecAgg 时间优化 5 轮 | `results/202609181151` | R5=1.364（与 941 逐轮一致） |
 | 旧 SecAgg per-window | `results/202609162025` | 1.328 |
 
 ### 12.2 历史单机 ratio 消融（20 轮）

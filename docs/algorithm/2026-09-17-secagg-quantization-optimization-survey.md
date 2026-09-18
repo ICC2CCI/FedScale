@@ -1,15 +1,17 @@
 # SecAgg 量化优化：文献调研与技术方案
 
-> 日期：2026-09-17（落地）/ 2026-09-18（20 轮对照 + profiler 关闭复跑）
-> 状态：**完成并复跑确认**。Issue #1 + Hadamard + `global_amax` + raw bytes + session / 异步 finalize。
+> 日期：2026-09-17（落地）/ 2026-09-18（20 轮对照 + profiler 关闭复跑 + 时间优化）
+> 状态：**完成并复跑确认**。Issue #1 + Hadamard + `global_amax` + 单 blob + session / 异步 finalize。
 > - 5 轮：`results/202609171717`，R5 eval=**1.364**
 > - 20 轮（观测曾开着）：`results/202609171809`，R20 eval=**0.985**（train≈300s，被 profiler 污染）
-> - **20 轮（正式，观测关）**：`results/202609180941`，R20 eval=**0.985**，`train≈38s`，整轮≈148s
+> - **20 轮（精度对照，观测关）**：`results/202609180941`，R20 eval=**0.985**，`train≈38s`，整轮≈148s
+> - **时间优化 5 轮**：`results/202609181151`，R5 eval=**1.364**（与 941 逐轮一致），整轮≈110–134s，`wait_agg≈10s`
 > - 对照：fp16 `20260914-final-clean` R20=**0.987**；旧 per-window SecAgg `202609162025` R20=**1.328**
 > 关联：
 > - [ICC2CCI/FedScale#1](https://github.com/ICC2CCI/FedScale/issues/1)
 > - `docs/algorithm/2026-09-15-secagg-quantization-precision-issue.md`
 > - 联调总流程：`docs/algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md` §3.1
+> - 时间切片：`docs/exec-plans/active/2026-09-18-secagg-time-efficiency.md`
 
 ## 0. 实现对照（相对 opencode 半成品）
 
@@ -32,7 +34,7 @@
 2. **时间更长**：hex 编码导致传输翻倍 + 逐 window 串行
 3. **仍有泄露**：per-window L∞（269 个标量/轮）
 
-**当前状态（Hadamard + Issue #1 + raw bytes，正式 `202609180941`）**：R20 eval=**0.985** ≈ fp16 **0.987**；amax 降为 1 个 `global_amax`；上传走 MinIO raw bytes；`train≈38s` / 整轮≈148s。原先「不能把剩余差距直接归因于 INT16」的判断已被 20 轮对照支持。
+**当前状态（Hadamard + Issue #1 + 单 blob，精度对照 `202609180941` / 时间 5 轮 `202609181151`）**：R20 eval=**0.985** ≈ fp16 **0.987**；amax 降为 1 个 `global_amax`；上传一个 SAW1 blob；`train≈38s` / 优化后整轮≈110–134s（5 轮）。原先「不能把剩余差距直接归因于 INT16」的判断已被 20 轮对照支持。
 
 ### 1.1 Issue #1：量化前多余的精度损失
 
@@ -255,7 +257,8 @@ Phase 2: Raw Bytes 上传    ✅ MinIO z_key；hex 兼容保留
 Phase 2b: 生产修复         ✅ session 同步；self-master 后台 finalize
 Phase 3a: 5 轮验证         ✅ 202609171717，R5 eval=1.364
 Phase 3b: 20 轮对照        ✅ 202609171809 / **202609180941**，R20 eval=0.985 ≈ fp16 0.987
-Phase 4（后备）            未做：EF21 / Kashin / int24
+Phase 3c: 时间优化          ✅ 单 blob + 并行 unmask + 异步写盘；5 轮 `202609181151` 对齐 eval
+Phase 4（后备）            未做：EF21 / Kashin / int24 / 更快 PRG（见时间效率计划 PERF-7/8/10）
 ```
 
 关键文件：
@@ -266,8 +269,9 @@ Phase 4（后备）            未做：EF21 / Kashin / int24
 | `experiments/shared/state_dict_utils.py` | `sub_state/add_state(keep_fp32=)`；SCALE-3 去掉 FP16 往返 |
 | `experiments/shared/block_selection.py` | `quant_decay=1.0`；`update_block_memory_from_states` + `merge_quant_residual_memory` |
 | `experiments/shared/secagg_client.py` | `extract_window_to_send_fp32`；Hadamard amax |
-| `experiments/run_s3r12v3_fsdp.py` | SecAgg 主路径走 FP32 + raw bytes；peer-keys 同步 session；self-master timeout=180s |
-| `experiments/server/aggregation_server.py` | `z_key` 读 MinIO raw bytes；后台 finalize |
+| `experiments/run_s3r12v3_fsdp.py` | SecAgg 主路径走 FP32 + 单 blob；peer-keys 同步 session；self-master timeout=180s |
+| `experiments/server/aggregation_server.py` | blob 登记；后台 finalize；delta 写完即 done |
+| `experiments/shared/secagg_blob.py` | SAW1 打包/解包 |
 | `experiments/server/secagg_coordinator.py` | pad-to-p2 逆变换；session 写入 key-announce / peer-keys |
 | `configs/s3r12v3-fsdp-secagg-verify.yaml` | `quant_residual_decay: 1.0`，`secagg_hadamard: true` |
 
@@ -341,7 +345,7 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 | `upload_minio_s` | ~16s（fp16） | ~43s | raw bytes ~115–140 MiB/client |
 | 墙钟 / `round_total_s` | ~90s | ~420s | 主要由 train 观测膨胀主导 |
 
-自 2026-09-18 起，`--detailed-train-metrics` **默认关闭**。正式对照见 **`results/202609180941`**：`train_local_s≈38s`，`round_total_s≈148s`，`post_delta_MiB` 已正确记账（约 115–140 MiB）。
+自 2026-09-18 起，`--detailed-train-metrics` **默认关闭**。精度对照见 **`results/202609180941`**：`train_local_s≈38s`，`round_total_s≈148s`（当时仍是逐窗 PUT + 同步写全量）。时间优化见 **`results/202609181151`**（§3.7c）。
 
 ### 3.7b 正式复跑（观测关闭，`results/202609180941`）
 
@@ -354,7 +358,18 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 | R10 | 1.091 | 38 | — |
 | R20 | **0.985** | 38 | 148 |
 
-结论：eval 与 `171809` 一致；时间回到「train≈38s + SecAgg encode/upload」量级，整轮仍慢于无 SecAgg 的 ~90s（慢在 encode≈50s、upload≈44s，而非训练）。
+结论：eval 与 `171809` 一致；时间回到「train≈38s + SecAgg encode/upload」量级。该跑次的 encode/upload 仍含逐窗 PUT 与同步全量写盘，**不要**当成当前实现的墙钟。
+
+### 3.7c 时间优化 5 轮（`results/202609181151`）
+
+同一 yaml，实现改为：单 blob、amax FWHT 复用、server 并行 unmask、`global_delta` 写完即 `done`。Eval 与 `202609180941` R1–R5 **逐轮相同**。
+
+| 轮次 | eval | encode_s | upload_s | wait_agg | round_total_s |
+|---|---|---|---|---|---|
+| R1 | 1.498 | ~16 | ~9 | ~10 | 134 |
+| R5 | **1.364** | ~14 | ~8 | ~10 | 114 |
+
+相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：扣掉每轮 eval ~10s 后，SecAgg 税约 +15–20s，主要在 encode（Hadamard+mask），上传已经更快。细节见 [时间效率计划](../exec-plans/active/2026-09-18-secagg-time-efficiency.md) §5。
 
 ### 3.8 当前每轮端到端流程（Hadamard 默认路径）
 
@@ -364,9 +379,8 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
   2. FP32 delta（不 round 回 FP16）+ block_memory + quant_residual
   3. key-announce：POST pk + **global_amax**（Hadamard 旋转域 1 个标量）
   4. peer-keys：收齐后拿 public_keys + **统一 scale** + **secagg_session_id**
-  5. 逐 window：
-       pad→2^p → 符号翻转 D → FWHT → INT16 随机舍入 → pairwise+self mask
-       MinIO put raw bytes；控制面只 POST z_key
+  5. 逐 window：pad→2^p → 符号翻转 D → FWHT → INT16 随机舍入 → pairwise+self mask
+     打成一个 SAW1 blob PUT；控制面只 POST blob z_key
   6. 选中 block：quant_residual = x-D(Q(x))（decay=1.0）
      未选中：block_memory *= 0.9
   7. 提交 self_master → 等聚合 done → 拉 global_delta 应用
@@ -374,8 +388,8 @@ Hadamard + 全局 scale + Issue #1 + raw bytes。端口 8081。
 【Server】
   1. 收齐 pk + global_amax → scale = max_k(amax)/Q_max*1.05（全局一份）
   2. peer-keys 下发 keys + scale + session
-  3. 按 z_key 从 MinIO 读 raw → unpack → Σz (mod q) → 去 self-mask
-  4. 反量化 → 逆 FWHT / 去 pad → FedAvg → 写 global_delta（后台 finalize）
+  3. finalize 时拉 2 个 blob → unpack → 按窗并行 Σz / 去 self-mask
+  4. 反量化 → 逆 FWHT / 去 pad → FedAvg → 写 global_delta 后 done（全量 state 异步）
 ```
 
 隐私：Hadamard 路径 **不再上报 per-window L∞**（269 个标量），只泄露 1 个 `global_amax`；masked `z_k` 仍由 SecAgg 保护。详见精度文档 §3.4。

@@ -32,7 +32,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [SecAgg 时间效率](active/2026-09-18-secagg-time-efficiency.md) | 通用优化（少 RTT / 合并 blob / 复用 FWHT）；保 Hadamard 与传输量 |
+| [SecAgg 时间效率](active/2026-09-18-secagg-time-efficiency.md) | P0/P1 已落地（blob / 并行 unmask / 异步写盘）；5 轮 `202609181151` |
 
 ## completed
 

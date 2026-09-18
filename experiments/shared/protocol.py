@@ -43,8 +43,13 @@ def upload_block_key(round_idx: int, client_id: int, block_idx: int) -> str:
 
 
 def upload_secagg_window_key(round_idx: int, client_id: int, window_id: int) -> str:
-    """SecAgg：单个 masked window 的 raw bytes key（不走 hex/JSON）。"""
+    """SecAgg：单个 masked window 的 raw bytes key（兼容旧客户端）。"""
     return f"uploads/round-{round_idx}/client-{client_id}/secagg-window-{window_id}.bin"
+
+
+def upload_secagg_blob_key(round_idx: int, client_id: int) -> str:
+    """SecAgg：本轮该 client 全部 masked window 打成一个 blob。"""
+    return f"uploads/round-{round_idx}/client-{client_id}/secagg-windows.bin"
 
 
 def agg_block_key(round_idx: int, block_idx: int) -> str:

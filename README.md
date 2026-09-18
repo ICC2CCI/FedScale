@@ -60,7 +60,8 @@ fedscale-icc-server/
 |---|---|---|---|
 | 非 SecAgg fp16 | `20260914-final-clean` | ≈0.987 | 明文 block 上传 |
 | 旧 SecAgg（per-window amax） | `202609162025` | 1.328 | 已收敛但仍落后 |
-| **SecAgg Hadamard（当前）** | `202609171809` / **`202609180941`** | **0.985** | 对齐 fp16；`train≈38s`，整轮≈148s |
+| **SecAgg Hadamard（精度对照）** | **`202609180941`** | **0.985** | 对齐 fp16；`train≈38s` |
+| SecAgg 时间优化 5 轮 | **`202609181151`** | R5=1.364 | 与 941 逐轮一致；整轮≈110–134s |
 
 带宽：S3R12v3 只传选中 blocks（验证配置约 10%）；相对全量上传可大幅节省。算法消融历史见 `docs/experiment-records/`。
 

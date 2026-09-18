@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -98,6 +101,9 @@ class SecAggCoordinator:
         # 状态
         self.public_keys: Dict[int, bytes] = {}      # client_id → pk_raw (32 bytes)
         self.masked_windows: Dict[int, Dict[int, torch.Tensor]] = {}  # window_id → {client_id → z_kw}
+        # finalize 前只登记对象键，HTTP 通知路径不拉 MinIO
+        self.masked_window_refs: Dict[int, Dict[int, Dict[str, Any]]] = {}  # wid → cid → {z_key, vector_len}
+        self.masked_blobs: Dict[int, Dict[str, Any]] = {}  # client_id → {z_key, window_ids}
         self.self_masters: Dict[int, bytes] = {}      # client_id → self_master (32 bytes)
         self.survivors: Optional[List[int]] = None    # 冻结后的幸存者集合
         # window_id → {client_id → amax}，非 Hadamard 路径：收齐后取 max_k 算 per-window scale
@@ -313,20 +319,97 @@ class SecAggCoordinator:
         window_id: int,
         z_kw: torch.Tensor,
     ) -> Dict[str, Any]:
-        """client 提交一个 masked window (z_kw)。"""
+        """client 提交一个 masked window (z_kw) 的内存张量。"""
         with self.lock:
             window_map = self.masked_windows.setdefault(window_id, {})
             window_map[client_id] = z_kw
             n_received = len(window_map)
-            logger.info(
-                "SecAgg: masked window %s from client %s (%s/%s)",
-                window_id, client_id, n_received, len(self.client_ids),
-            )
             all_received = n_received >= len(self.client_ids)
 
         if all_received:
             return {"status": "ready", "window_id": window_id}
         return {"status": "waiting", "received": n_received}
+
+    def register_masked_window_key(
+        self,
+        client_id: int,
+        window_id: int,
+        z_key: str,
+        vector_len: int,
+    ) -> Dict[str, Any]:
+        """只登记 MinIO key，finalize 时再 GET。"""
+        with self.lock:
+            cmap = self.masked_window_refs.setdefault(int(window_id), {})
+            cmap[int(client_id)] = {"z_key": str(z_key), "vector_len": int(vector_len)}
+            n_received = len(cmap)
+            all_received = n_received >= len(self.client_ids)
+        return {
+            "status": "ready" if all_received else "waiting",
+            "window_id": int(window_id),
+            "received": n_received,
+        }
+
+    def register_masked_blob(
+        self,
+        client_id: int,
+        z_key: str,
+        window_ids: List[int],
+    ) -> None:
+        """本轮该 client 全部 window 打在一个 blob 里。"""
+        ids = [int(w) for w in window_ids]
+        with self.lock:
+            self.masked_blobs[int(client_id)] = {
+                "z_key": str(z_key),
+                "window_ids": ids,
+                "window_id_set": set(ids),
+            }
+        logger.info(
+            "SecAgg: masked blob from client %s key=%s n_windows=%s",
+            client_id, z_key, len(ids),
+        )
+
+    def _client_has_all_windows_locked(self, cid: int) -> bool:
+        blob = self.masked_blobs.get(cid)
+        if blob is not None:
+            id_set = blob.get("window_id_set") or set(blob.get("window_ids") or [])
+            return all(w.window_id in id_set for w in self.windows)
+        for w in self.windows:
+            wid = w.window_id
+            if cid in self.masked_windows.get(wid, {}):
+                continue
+            if cid in self.masked_window_refs.get(wid, {}):
+                continue
+            return False
+        return True
+
+    def materialize_masked_windows(self, load_bytes) -> None:
+        """从 MinIO（或测试 fake）把登记的 z 载入 masked_windows。load_bytes(key)->bytes。"""
+        from shared.fixed_point import unpack_zq
+        from shared.secagg_blob import unpack_masked_windows_blob
+
+        bits = int(self.secagg_plan.modulus_bits)
+        with self.lock:
+            blobs = {cid: dict(info) for cid, info in self.masked_blobs.items()}
+            refs = {
+                wid: {cid: dict(meta) for cid, meta in cmap.items()}
+                for wid, cmap in self.masked_window_refs.items()
+            }
+
+        for cid, info in blobs.items():
+            data = load_bytes(info["z_key"])
+            for wid, vlen, payload in unpack_masked_windows_blob(data):
+                z_kw = unpack_zq(payload, int(vlen), bits)
+                self.submit_masked_window(int(cid), int(wid), z_kw)
+
+        for wid, cmap in refs.items():
+            for cid, meta in cmap.items():
+                with self.lock:
+                    already = cid in self.masked_windows.get(wid, {})
+                if already:
+                    continue
+                data = load_bytes(meta["z_key"])
+                z_kw = unpack_zq(data, int(meta["vector_len"]), bits)
+                self.submit_masked_window(int(cid), int(wid), z_kw)
 
     # ----------------------------------------------------------------------- #
     # Phase 4: 收集 self_master + 聚合 unmask
@@ -360,10 +443,7 @@ class SecAggCoordinator:
             # 检查哪些 client 提交了所有 window
             survivors = []
             for cid in self.client_ids:
-                has_all_windows = all(
-                    cid in self.masked_windows.get(w.window_id, {})
-                    for w in self.windows
-                )
+                has_all_windows = self._client_has_all_windows_locked(cid)
                 has_self_master = cid in self.self_masters
                 if has_all_windows and has_self_master:
                     survivors.append(cid)
@@ -374,12 +454,83 @@ class SecAggCoordinator:
             )
             return list(self.survivors)
 
+    @staticmethod
+    def _unmask_worker_count(n_windows: int) -> int:
+        """并行 unmask worker 数：默认 min(8, CPU)，可用 SECAGG_UNMASK_WORKERS 覆盖。
+
+        按 window 并行，不按模型/层名写死。
+        """
+        raw = (os.environ.get("SECAGG_UNMASK_WORKERS") or "").strip()
+        if raw:
+            n = max(1, int(raw))
+        else:
+            n = min(8, os.cpu_count() or 4)
+        return max(1, min(n, int(n_windows) or 1))
+
+    def _unmask_one_window(
+        self,
+        window: WindowDescriptor,
+        survivors: List[int],
+        n_survivors: int,
+        q: int,
+        hadamard: bool,
+        self_masters: Dict[int, bytes],
+        z_list: List[torch.Tensor],
+    ) -> Tuple[str, int, int, torch.Tensor, float, float]:
+        """单窗：sum_z → 去 self_mask → dequant → iHadamard。线程安全（无共享可变状态）。"""
+        wid = window.window_id
+        orig_len = int(window.vector_length)
+        work_len = hadamard_work_length(orig_len, hadamard)
+
+        if len(z_list) < self.secagg_plan.q_min:
+            raise RuntimeError(
+                f"SecAgg: window {wid} has only {len(z_list)} masked values"
+            )
+        for z in z_list:
+            if int(z.numel()) != work_len:
+                raise RuntimeError(
+                    f"SecAgg: window {wid} z_len={int(z.numel())} != work_len={work_len}"
+                )
+
+        sum_z = aggregate_zq(z_list, q)
+        sum_B = torch.zeros(work_len, dtype=torch.int64)
+        for cid in survivors:
+            sm = self_masters.get(cid)
+            if sm is None:
+                continue
+            B_k = compute_self_mask(
+                self_master=sm,
+                session_id=self.session_id,
+                attempt_id=self.secagg_plan.attempt_id,
+                client_id=cid,
+                window_id=wid,
+                window_layout_hash=window.window_layout_hash,
+                vector_len=work_len,
+                q=q,
+            )
+            sum_B = (sum_B + B_k) % q
+
+        sum_q = unmask_aggregate(sum_z, sum_B, q)
+        scale = self.secagg_plan.get_window_scale(wid)
+        delta_slice = dequantize_from_zq(sum_q, scale, q)
+        work_amax = float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0
+
+        if hadamard and work_len > 0:
+            seed = self.secagg_plan.hadamard_seed + wid
+            signs = generate_rademacher_signs(work_len, seed)
+            delta_slice = inverse_hadamard_transform(delta_slice, signs)
+        delta_slice = delta_slice.reshape(-1)[:orig_len].contiguous()
+        delta_slice = delta_slice / float(n_survivors)
+        orig_amax = float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0
+        return window.key_name, int(window.start), int(window.end), delta_slice, work_amax, orig_amax
+
     def aggregate_and_unmask(self) -> Dict[str, List[Tuple[int, int, torch.Tensor]]]:
         """聚合所有 window：sum_z → 移除 self_mask → dequant → agg_delta。
 
         返回: {key_name: [(start, end, delta_slice), ...]}（与 block_delta 格式一致）
 
         如果 |U*| < q_min，抛出 RuntimeError。
+        Window 互相独立，默认按 CPU 并行（SHAKE + iHadamard 释放 GIL）。
         """
         if self.survivors is None:
             self.freeze_survivors()
@@ -392,78 +543,62 @@ class SecAggCoordinator:
         q = self.secagg_plan.modulus_q
         n_survivors = len(self.survivors)
         hadamard = bool(self.secagg_plan.hadamard_enabled)
+        survivors = list(self.survivors)
+
+        with self.lock:
+            self_masters = dict(self.self_masters)
+            jobs: List[Tuple[WindowDescriptor, List[torch.Tensor]]] = []
+            for window in self.windows:
+                window_map = self.masked_windows.get(window.window_id, {})
+                z_list = [window_map[cid] for cid in survivors if cid in window_map]
+                jobs.append((window, z_list))
+
+        workers = self._unmask_worker_count(len(jobs))
+        results: List[Optional[Tuple[str, int, int, torch.Tensor, float, float]]] = [
+            None
+        ] * len(jobs)
+        t0 = time.monotonic()
+        prev_threads = torch.get_num_threads()
+        try:
+            # 并行时把 BLAS 收到 1，避免 8 worker × 全核 OpenMP 过订阅
+            if workers > 1:
+                torch.set_num_threads(1)
+                with ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="secagg-unmask",
+                ) as ex:
+                    futs = {
+                        ex.submit(
+                            self._unmask_one_window,
+                            window,
+                            survivors,
+                            n_survivors,
+                            q,
+                            hadamard,
+                            self_masters,
+                            z_list,
+                        ): i
+                        for i, (window, z_list) in enumerate(jobs)
+                    }
+                    for fut in as_completed(futs):
+                        results[futs[fut]] = fut.result()
+            else:
+                for i, (window, z_list) in enumerate(jobs):
+                    results[i] = self._unmask_one_window(
+                        window, survivors, n_survivors, q, hadamard,
+                        self_masters, z_list,
+                    )
+        finally:
+            torch.set_num_threads(prev_threads)
+
         orig_amaxs: List[float] = []
         work_amaxs: List[float] = []
-
-        # 按 window 聚合
         agg_delta: Dict[str, List[Tuple[int, int, torch.Tensor]]] = {}
-        for window in self.windows:
-            wid = window.window_id
-            orig_len = int(window.vector_length)
-            work_len = hadamard_work_length(orig_len, hadamard)
-
-            # 1. 收集所有 survivor 的 z_kw
-            z_list = []
-            with self.lock:
-                window_map = self.masked_windows.get(wid, {})
-                for cid in self.survivors:
-                    if cid in window_map:
-                        z_list.append(window_map[cid])
-
-            if len(z_list) < self.secagg_plan.q_min:
-                raise RuntimeError(
-                    f"SecAgg: window {wid} has only {len(z_list)} masked values"
-                )
-            for z in z_list:
-                if int(z.numel()) != work_len:
-                    raise RuntimeError(
-                        f"SecAgg: window {wid} z_len={int(z.numel())} != work_len={work_len}"
-                    )
-
-            # 2. 在 Z_q 中求和
-            sum_z = aggregate_zq(z_list, q)
-
-            # 3. 生成并求和 self_mask（必须与 client 相同 session / 相同 work_len）
-            sum_B = torch.zeros(work_len, dtype=torch.int64)
-            with self.lock:
-                for cid in self.survivors:
-                    sm = self.self_masters.get(cid)
-                    if sm is None:
-                        continue
-                    B_k = compute_self_mask(
-                        self_master=sm,
-                        session_id=self.session_id,
-                        attempt_id=self.secagg_plan.attempt_id,
-                        client_id=cid,
-                        window_id=wid,
-                        window_layout_hash=window.window_layout_hash,
-                        vector_len=work_len,
-                        q=q,
-                    )
-                    sum_B = (sum_B + B_k) % q
-
-            # 4. 移除 self_mask
-            sum_q = unmask_aggregate(sum_z, sum_B, q)
-
-            # 5. dequant → delta（Hadamard 下为全局 scale；否则 per-window）
-            scale = self.secagg_plan.get_window_scale(wid)
-            delta_slice = dequantize_from_zq(sum_q, scale, q)
-            work_amaxs.append(float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0)
-
-            # 5b. 逆 Hadamard（工作长度已 pad 到 2 的幂），再裁回原始 window
-            if hadamard and work_len > 0:
-                seed = self.secagg_plan.hadamard_seed + wid
-                signs = generate_rademacher_signs(work_len, seed)
-                delta_slice = inverse_hadamard_transform(delta_slice, signs)
-            delta_slice = delta_slice.reshape(-1)[:orig_len].contiguous()
-
-            # 6. 加权平均（等权：delta / N）
-            delta_slice = delta_slice / float(n_survivors)
-            orig_amaxs.append(float(delta_slice.abs().max().item()) if delta_slice.numel() else 0.0)
-
-            agg_delta.setdefault(window.key_name, []).append(
-                (window.start, window.end, delta_slice)
-            )
+        for item in results:
+            assert item is not None
+            key_name, start, end, delta_slice, work_amax, orig_amax = item
+            work_amaxs.append(work_amax)
+            orig_amaxs.append(orig_amax)
+            agg_delta.setdefault(key_name, []).append((start, end, delta_slice))
 
         orig_max = max(orig_amaxs) if orig_amaxs else 0.0
         work_max = max(work_amaxs) if work_amaxs else 0.0
@@ -471,8 +606,8 @@ class SecAggCoordinator:
         clip_bound = float(self.secagg_plan.q_max) * scale_ref if scale_ref > 0 else 0.0
         logger.info(
             "SecAgg: aggregation complete windows=%s survivors=%s hadamard=%s "
-            "work_amax=%e orig_amax=%e clip_bound=%e session=%s",
-            len(self.windows), n_survivors, hadamard,
+            "workers=%s unmask_s=%.2f work_amax=%e orig_amax=%e clip_bound=%e session=%s",
+            len(self.windows), n_survivors, hadamard, workers, time.monotonic() - t0,
             work_max, orig_max, clip_bound, self.session_id[:16],
         )
         if clip_bound > 0 and orig_max > 0.05 and orig_max > 0.25 * clip_bound:

@@ -87,28 +87,29 @@ def pad_to_length(x: torch.Tensor, length: int) -> torch.Tensor:
 def fwht(x: torch.Tensor) -> torch.Tensor:
     """Fast Walsh-Hadamard Transform，长度必须是 2 的幂。
 
-    向量化实现：只有 log2(n) 次张量运算。旧版 Python 双层循环在 n=524288
-    时会跑数十秒/窗口，不能用于训练路径。
+    向量化实现：只有 log2(n) 次张量运算。双缓冲，全程只分配两块 n 长向量。
 
     H @ x 的快速实现。Hadamard 矩阵 H 满足 H @ H^T = n @ I，因此 H^(-1) = H / n。
-    本函数返回 H @ x（不除 n），逆变换用 fwht(y) / n。
+    本函数返回 H @ x（不除 n），逆变换用 fwht(y) / n。不原地改写输入。
     """
     n = int(x.numel())
     if not is_power_of_two(n):
         raise ValueError(f"FWHT requires power-of-2 length, got {n}")
-    result = x.to(dtype=torch.float32).reshape(n).contiguous().clone()
+    src = x.to(dtype=torch.float32).reshape(n).contiguous().clone()
+    if n <= 1:
+        return src
+    dst = torch.empty_like(src)
     h = 1
     while h < n:
-        y = result.view(-1, 2, h)
-        a = y[:, 0, :]
-        b = y[:, 1, :]
-        new = torch.empty_like(result)
-        new_view = new.view(-1, 2, h)
-        new_view[:, 0, :] = a + b
-        new_view[:, 1, :] = a - b
-        result = new
+        s = src.view(-1, 2, h)
+        d = dst.view(-1, 2, h)
+        a = s[:, 0, :]
+        b = s[:, 1, :]
+        d[:, 0, :] = a + b
+        d[:, 1, :] = a - b
+        src, dst = dst, src
         h *= 2
-    return result
+    return src
 
 
 def hadamard_transform(

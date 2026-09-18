@@ -87,7 +87,6 @@ from shared.protocol import (  # noqa: E402
     selected_from_jsonable,
     upload_block_key,
     upload_blocks_key,
-    upload_secagg_window_key,
 )
 from shared.run_config import apply_to_args, load_run_config  # noqa: E402
 from shared.state_dict_utils import (  # noqa: E402
@@ -1440,19 +1439,21 @@ def main() -> None:
             from shared.secagg_client import (
                 SecAggClient,
                 extract_window_to_send_fp32,
-                global_amax_from_slices,
+                prepare_window_quant_cache,
                 window_amax_payload,
             )
             from shared.fixed_point import pack_zq, compute_q_max
-            from shared.protocol import SecAggPlan, build_window_descriptors
+            from shared.protocol import SecAggPlan, build_window_descriptors, upload_secagg_blob_key
+            from shared.secagg_blob import pack_masked_windows_blob
 
-            t_enc0 = time.monotonic()
+            t_extract0 = time.monotonic()
             assert transfer_dtype is not None
             windows = build_window_descriptors(plan.block_list)
             # 量化前全程 FP32：x = delta + block_memory + quant_residual
             delta_slices = extract_window_to_send_fp32(
                 full_state, global_state, mem_box[0], quant_mem_box[0] or {}, windows,
             )
+            t_extract = time.monotonic() - t_extract0
 
             _slice_max = max((float(v.abs().max().item()) for v in delta_slices.values()), default=0.0)
             _fs_max = max(float(v.abs().max().item()) for v in full_state.values() if hasattr(v, "abs"))
@@ -1488,16 +1489,19 @@ def main() -> None:
             secagg_client = SecAggClient(args.client_id, secagg_plan, windows)
 
             # Phase 1: 提交公钥。Hadamard 只报一个 global_amax，避免 per-window L∞ 泄露。
-            t_dh0 = time.monotonic()
+            t_amax0 = time.monotonic()
+            quant_cache: Dict[int, Any] = {}
             announce_body = {"pk_hex": secagg_client.get_public_key_hex()}
             if hadamard:
-                g_amax = global_amax_from_slices(delta_slices, windows, secagg_plan)
+                g_amax, quant_cache = prepare_window_quant_cache(delta_slices, windows, secagg_plan)
                 announce_body["global_amax"] = g_amax
                 logger.info("SecAgg: Hadamard global_amax=%e (no per-window L∞)", g_amax)
             else:
                 announce_body["window_amax"] = window_amax_payload(
                     delta_slices, windows=windows, plan=secagg_plan,
                 )
+            t_amax = time.monotonic() - t_amax0
+            t_dh0 = time.monotonic()
             resp = requests.post(
                 f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/key-announce",
                 json=announce_body,
@@ -1544,10 +1548,10 @@ def main() -> None:
                 (secagg_client.plan.secagg_session_id or "")[:16],
             )
 
-            # Phase 3: 逐 window 量化 → mask → 上传 z_k；同时收集量化 residual
-            logger.info("SecAgg: uploading %s masked windows", len(windows))
-            t_up0 = time.monotonic()
-            total_upload_bytes = 0
+            # Phase 3: 量化 + mask → 一个 blob PUT → 一次 HTTP 通知
+            logger.info("SecAgg: encoding %s masked windows into one blob", len(windows))
+            t_comp0 = time.monotonic()
+            blob_parts = []
             quant_residual = {}
             clip_fracs = []
             zero_fracs = []
@@ -1561,9 +1565,13 @@ def main() -> None:
                 delta_slice = delta_slices.get(wid)
                 if delta_slice is None:
                     delta_slice = torch.zeros(window.vector_length, dtype=torch.float32)
-
+                cached = quant_cache.get(wid)
+                extra = {}
+                if cached is not None:
+                    extra["quant_input"] = cached[0]
+                    extra["signs"] = cached[1]
                 z_k, residual, stats = secagg_client.mask_window(
-                    window, delta_slice, return_feedback=True,
+                    window, delta_slice, return_feedback=True, **extra,
                 )
                 z_len = int(z_k.numel())
                 quant_residual.setdefault(window.key_name, []).append(
@@ -1577,32 +1585,39 @@ def main() -> None:
                 sqnr = float(stats.get("sqnr_db", 0.0))
                 if sqnr == sqnr and abs(sqnr) != float("inf"):
                     sqnr_vals.append(sqnr)
-
                 z_bytes = pack_zq(z_k, modulus_bits)
+                blob_parts.append((wid, z_len, z_bytes))
                 del z_k
-                z_key = upload_secagg_window_key(round_idx, args.client_id, wid)
-                minio.put_bytes(z_key, z_bytes)
-                total_upload_bytes += len(z_bytes)
-                del z_bytes
 
-                _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
-                _el = None
-                if eval_loss_val is not None:
-                    _el = float(eval_loss_val) if eval_loss_val == eval_loss_val and abs(eval_loss_val) != float('inf') else None
-                body = {
-                    "z_key": z_key,
-                    "vector_len": z_len,
-                    "num_examples": int(num_examples),
-                    "train_loss": _tl,
-                    "block_energies": [],
-                }
-                if _el is not None:
-                    body["eval_loss"] = _el
-                resp = requests.post(
-                    f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/masked-window/{wid}",
-                    json=body, timeout=120, headers=auth_headers, verify=_REQUESTS_VERIFY,
-                )
-                resp.raise_for_status()
+            blob = pack_masked_windows_blob(blob_parts)
+            t_compute = time.monotonic() - t_comp0
+
+            t_put0 = time.monotonic()
+            total_upload_bytes = len(blob)
+            z_key = upload_secagg_blob_key(round_idx, args.client_id)
+            minio.put_bytes(z_key, blob)
+            del blob
+            t_put = time.monotonic() - t_put0
+
+            t_notify0 = time.monotonic()
+            _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
+            _el = None
+            if eval_loss_val is not None:
+                _el = float(eval_loss_val) if eval_loss_val == eval_loss_val and abs(eval_loss_val) != float('inf') else None
+            body = {
+                "z_key": z_key,
+                "window_ids": [p[0] for p in blob_parts],
+                "num_examples": int(num_examples),
+                "train_loss": _tl,
+            }
+            if _el is not None:
+                body["eval_loss"] = _el
+            resp = requests.post(
+                f"{server}/api/round/{round_idx}/client/{args.client_id}/secagg/masked-blob",
+                json=body, timeout=120, headers=auth_headers, verify=_REQUESTS_VERIFY,
+            )
+            resp.raise_for_status()
+            t_notify = time.monotonic() - t_notify0
 
             mem_box[0] = update_block_memory_from_states(
                 full_state, global_state, mem_box[0], selected, args.memory_decay,
@@ -1610,8 +1625,8 @@ def main() -> None:
             quant_mem_box[0] = merge_quant_residual_memory(
                 quant_mem_box[0] or {}, selected, quant_residual, quant_decay,
             )
-            t_encode = time.monotonic() - t_enc0
-            t_upload = time.monotonic() - t_up0
+            t_encode = t_extract + t_amax + t_compute
+            t_upload = t_put + t_notify
             n_clip_windows = sum(1 for c in clip_fracs if c > 0.0)
             mean_clip = (sum(clip_fracs) / len(clip_fracs)) if clip_fracs else 0.0
             max_clip = max(clip_fracs) if clip_fracs else 0.0
@@ -1620,9 +1635,9 @@ def main() -> None:
             mean_cos = (sum(cosine_vals) / len(cosine_vals)) if cosine_vals else 1.0
             mean_sqnr = (sum(sqnr_vals) / len(sqnr_vals)) if sqnr_vals else 0.0
             logger.info(
-                "SecAgg: uploaded all z_k in %.2fs (%.1f MiB raw) clip_windows=%s/%s mean_clip=%.4g max_clip=%.4g mean_zero=%.4g "
+                "SecAgg: blob put+notify %.2fs compute %.2fs (%.1f MiB raw) clip_windows=%s/%s mean_clip=%.4g max_clip=%.4g mean_zero=%.4g "
                 "rel_l2=%.4g cosine=%.6f sqnr=%.2fdB scale_min=%e scale_max=%e hadamard=%s quant_decay=%.3f",
-                t_upload, total_upload_bytes / (1024 * 1024),
+                t_upload, t_compute, total_upload_bytes / (1024 * 1024),
                 n_clip_windows, len(windows), mean_clip, max_clip, mean_zero,
                 mean_rel_l2, mean_cos, mean_sqnr,
                 min(scale_vals) if scale_vals else 0.0,
@@ -1661,21 +1676,30 @@ def main() -> None:
                 time.sleep(args.poll_interval)
             t_wait = time.monotonic() - t_wait0
 
-            # 下载聚合 delta 并 apply
+            # 下载聚合 delta 并 apply（一份 global_delta，不再按 window GET）
             t_post0 = time.monotonic()
-            applied_blocks = set()
             post_bytes = 0
-            for binfo in plan.block_list:
-                gidx = int(binfo[0])
-                agg_key = agg_block_key(round_idx, gidx)
-                if minio.exists(agg_key):
-                    payload, nbytes = minio.get_torch_with_size(agg_key, map_location="cpu")
-                    add_block_delta(local_global, payload["block_delta"])
-                    applied_blocks.add(gidx)
-                    post_bytes += nbytes
+            applied_blocks = set()
+            try:
+                payload, nbytes = minio.get_torch_with_size(
+                    global_delta_key(round_idx), map_location="cpu",
+                )
+                add_block_delta(local_global, payload["block_delta"])
+                post_bytes = nbytes
+                applied_blocks.add(-1)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SecAgg: global_delta missing (%s), fallback per-block", exc)
+                for binfo in plan.block_list:
+                    gidx = int(binfo[0])
+                    agg_key = agg_block_key(round_idx, gidx)
+                    if minio.exists(agg_key):
+                        payload, nbytes = minio.get_torch_with_size(agg_key, map_location="cpu")
+                        add_block_delta(local_global, payload["block_delta"])
+                        applied_blocks.add(gidx)
+                        post_bytes += nbytes
             local_version = round_idx
             t_post = time.monotonic() - t_post0
-            logger.info("SecAgg: applied %s aggregated blocks in %.2fs", len(applied_blocks), t_post)
+            logger.info("SecAgg: applied aggregated delta in %.2fs (%s keys)", t_post, len(applied_blocks))
 
             mode_code = {"cache": 0.0, "delta": 1.0, "full": 2.0, "local_base": 3.0}.get(download_mode, 2.0)
             timings = {
@@ -1686,7 +1710,12 @@ def main() -> None:
                 "train_local_s": round(t_train, 3),
                 "eval_local_s": round(t_eval, 3),
                 "encode_delta_s": round(t_encode, 3),
+                "secagg_extract_s": round(t_extract, 3),
+                "secagg_amax_s": round(t_amax, 3),
+                "secagg_compute_s": round(t_compute, 3),
                 "secagg_dh_s": round(t_dh, 3),
+                "secagg_put_s": round(t_put, 3),
+                "secagg_notify_s": round(t_notify, 3),
                 "upload_minio_s": round(t_upload, 3),
                 "upload_blocks_MiB": round(total_upload_bytes / (1024 * 1024), 3),
                 "secagg_self_master_s": round(t_sm, 3),

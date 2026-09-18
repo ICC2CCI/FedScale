@@ -16,7 +16,7 @@
 |---|---|
 | [当前双集群联调流程](algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) | **首选**：ICC1/ICC2/Server 操作与传数（含 SecAgg §3.1） |
 | [SecAgg 量化精度问题](algorithm/2026-09-15-secagg-quantization-precision-issue.md) | 完整 SecAgg 流程、amax 隐私；问题已解决 |
-| [SecAgg 量化优化调研](algorithm/2026-09-17-secagg-quantization-optimization-survey.md) | Hadamard / Issue #1；正式 20 轮 `202609180941` R20=0.985 |
+| [SecAgg 量化优化调研](algorithm/2026-09-17-secagg-quantization-optimization-survey.md) | Hadamard / Issue #1；精度对照 `202609180941` R20=0.985；时间优化 5 轮 `202609181151` |
 | [S3R12v3 算法](algorithm/2026-09-04-s3r12v3-block-uniform.md) | block 级均匀分片算法详细设计 |
 | [复现参数](reference/federated-training-reproduction-params.md) | 完整复现参数表 |
 | [已完成：双集群 FSDP 联调](exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) | 测试床落地结项 |

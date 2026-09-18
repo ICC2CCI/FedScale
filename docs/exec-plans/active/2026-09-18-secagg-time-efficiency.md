@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-18
+- **更新**：2026-09-18（P0/P1 已落地；5 轮对照 `202609181151`；20 轮算法验证进行中）
 - **原则**：流程对任意 HF `state_dict` + FSDP 通用；**禁止**按某个模型（含 Qwen2.5-0.5B）写死层名、窗数、并发度。0.5B 只作回归载体。
 - **约束**：
   1. 保住当前量化路径的效果：Hadamard + INT16 + Issue #1（FP32 delta、quant residual 不衰减）
@@ -12,7 +12,7 @@
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md) §3.1
   - [SecAgg 精度 / 默认路径](../../algorithm/2026-09-15-secagg-quantization-precision-issue.md)
   - [量化调研](../../algorithm/2026-09-17-secagg-quantization-optimization-survey.md)
-  - 基线跑次：无 SecAgg `results/20260914-final-clean`；SecAgg 正式 `results/202609180941`（R20 eval=0.985，整轮≈148s vs 无 SecAgg≈90s）
+  - 基线跑次：无 SecAgg `results/20260914-final-clean`（稳态整轮≈88s，eval 每 5 轮）；SecAgg 精度对照 `results/202609180941`（R20 eval=0.985，整轮≈148s）；时间优化 5 轮 `results/202609181151`（R5 eval=1.364 与 941 逐轮一致，整轮≈110–134s）
 
 ## 0. 怎么读
 
@@ -42,19 +42,22 @@
 
 | ID | 优先级 | 状态 | 任务 | 依赖 |
 |---|---|---|---|---|
-| PERF-0 | P0 | todo | 拆开 encode / upload / DH 计时，避免墙钟重复记账 | — |
-| PERF-1 | P0 | todo | `masked-window` 通知不再同步 `get_bytes` | — |
-| PERF-2 | P0 | todo | N 个 window 打成 1 个（或少数）blob，字节不变 | PERF-1 |
-| PERF-3 | P0 | todo | amax 那次 FWHT 结果复用，去掉第二次正向旋转 | — |
-| PERF-4 | P1 | todo | encode 与上传流水线重叠（多对象时） | PERF-1 |
-| PERF-5 | P1 | todo | MinIO 连接池常驻；禁止每个 PUT 新建线程池 | — |
-| PERF-6 | P1 | todo | FWHT 就地 / 复用 buffer | PERF-3 |
+| PERF-0 | P0 | **done** | 拆开 encode / upload / DH 计时，避免墙钟重复记账 | — |
+| PERF-1 | P0 | **done** | `masked-window` / blob 通知不再同步 `get_bytes` | — |
+| PERF-2 | P0 | **done** | N 个 window 打成 1 个 blob，字节不变（仅加极小目录头） | PERF-1 |
+| PERF-3 | P0 | **done** | amax 那次 FWHT 结果复用，去掉第二次正向旋转 | — |
+| PERF-4 | P1 | cancelled | 默认已是单 blob（先算完再一次 PUT）；多对象流水线不再作为默认 | PERF-1 |
+| PERF-5 | P1 | **done** | MinIO 进程级线程池；假死仍 rebuild | — |
+| PERF-6 | P1 | **done** | FWHT 双缓冲，每级不再 `empty_like` | PERF-3 |
 | PERF-7 | P2 | todo | Mask PRG：SHAKE-256 → 同 seed 的 AES-CTR/ChaCha | — |
 | PERF-8 | P2 | todo | GPU FWHT（同一矩阵，可选） | PERF-3 |
-| PERF-9 | P2 | todo | server 按窗流式 unmask + 少写全量；client 少次 GET delta | PERF-1 |
+| PERF-9 | P2 | **done** | client 一次拉 `global_delta`；server 不再写 N 个 `agg_block` | PERF-1 |
 | PERF-10 | P3 | todo | DH 公钥与训练重叠；amax 仍在 delta 之后 | — |
+| PERF-11 | P1 | **done** | server finalize：按窗并行 unmask/iHadamard；`global_delta` 写完即标记 `done`；全量 `global_state` 异步 PUT | PERF-9 |
 
-建议落地顺序：**PERF-0 → PERF-1 → PERF-2 → PERF-3**，其余按需。
+建议落地顺序：**PERF-0 → PERF-1 → PERF-2 → PERF-3**（已合入代码），其余按需。
+
+**已合入（2026-09-18）**：单 blob 上传 + 通知不拉对象 + 复用 FWHT + 拆分计时 + MinIO 常驻线程池 + FWHT 双缓冲 + 一份 `global_delta` 回写 + server 并行 unmask + 全量 state 异步写盘。单元测试 `experiments/tests/test_secagg.py` 已过。**5 轮对照 `202609181151` 已过**（见 §5）；20 轮用于确认 R20≈0.985。
 
 0.5B 上墙钟只是标尺；**同一套改动必须在 window 数变多时仍然成立**（用更大 `coverage` 或假 window 压测，不必真上 7B 才能合入）。
 
@@ -156,6 +159,11 @@ finalize 按窗（或按 blob 内切片）unmask → iHadamard → 写出，不�
 
 与已归档 SCALE-1（server 不整模常驻）同方向；本计划只要求 SecAgg 路径不再按 N 同步放大。
 
+**续（PERF-11）**：`pipeline_wait_agg` 里剩下的大头是串行 unmask/iHadamard + 全量 `global_state` PUT。client 只依赖 `global_delta` 与 `block-status.done`，因此：
+
+- unmask 按 window 并行（`SECAGG_UNMASK_WORKERS`，默认 `min(8, CPU)`，不写死窗数）
+- 写完 `global_delta` 立刻 `done`；全量 state 在后台 PUT（与下一轮 in-memory apply 互斥）
+
 ---
 
 ### PERF-10 DH 与训练重叠（P3）
@@ -178,4 +186,20 @@ finalize 按窗（或按 blob 内切片）unmask → iHadamard → 写出，不�
 
 ## 4. 预期（0.5B 标尺，非目标函数）
 
-在 **PERF-1+2+3** 之后，对照 `202609180941`：整轮从 ~148s 向 ~110–120s 靠近；无 SecAgg ~90s 不是必须打平（定点化+mask+FWHT 消不掉）。验收以 eval + 字节 + 「N 增大时墙钟主要跟带宽/计算走、不跟 RTT×N 走」为准。
+P0/P1 之后，对照 `202609180941`：整轮从 ~148s 落到 ~110–120s（5 轮实测 R2–R5≈110–115s）。无 SecAgg 稳态 ~88s（且往往跳过每轮 eval）**不是必须打平**：扣掉「每轮 eval ~10s」后，SecAgg 税大约 +15–20s，主要是 Hadamard+INT16+mask 计算。验收以 eval + 字节 + 「N 增大时墙钟主要跟带宽/计算走、不跟 RTT×N 走」为准。
+
+## 5. 5 轮对照（`202609181151`）
+
+同一 yaml `configs/s3r12v3-fsdp-secagg-verify.yaml`，端口 8081。Eval 与 `202609180941` **R1–R5 逐轮相同**（R5=1.363804）。`upload_blocks_MiB` 不变（R1=139.4）。
+
+| 轮 | eval | wait_agg（1151 / 优化前 1137 / 正式 941） | 整轮 1151 | server wait_s |
+|---|---|---|---|---|
+| R1 | 1.498 | **10.1s** / 27.8s / 16.1s | 134s | 7.6s（mat 1.2 + unmask 4.3 + put_delta 2.0） |
+| R2 | 1.427 | **11.6s** / 28.6s / 16.1s | 115s | 7.4s |
+| R3 | 1.398 | **11.9s** / 31.9s / 18.1s | 113s | 7.5s |
+| R4 | 1.394 | **9.6s** / — / 18.1s | 110s | 6.3s |
+| R5 | 1.364 | **10.1s** / — / 14.2s | 114s | 6.6s |
+
+Server 临界路径：`materialize ~1s + 8-worker unmask ~4s + put_delta ~2s`。全量 `global_state` ~942 MiB 仍约 15s，但在 `done` 之后异步写，不再进 `pipeline_wait_agg`。
+
+相对无 SecAgg `20260914-final-clean`（R2 无 eval ≈88s）：现在 R2 有 eval ≈115s。扣掉 eval 后剩余税主要是 encode ~15s vs fp16 ~7s；**上传反而更快**（单 blob ~9s vs 多 block ~16s）。再往下是 PERF-7/8/10（更快 PRG / GPU FWHT / DH 重叠），只剩几秒级，不是协议排队。

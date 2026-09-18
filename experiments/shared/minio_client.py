@@ -53,6 +53,7 @@ class MinIOClient:
         self.read_timeout_s = float(read_timeout_s)
         self.client = None  # set by _rebuild_client
         self._http = None
+        self._op_pool: Optional[ThreadPoolExecutor] = None
         self._rebuild_client()
         if not self.client.bucket_exists(bucket):
             self.client.make_bucket(bucket)
@@ -102,7 +103,7 @@ class MinIOClient:
         http_client = urllib3.PoolManager(
             timeout=urllib3.Timeout(connect=10.0, read=float(self.read_timeout_s)),
             retries=False,
-            maxsize=2,
+            maxsize=8,
             socket_options=socket_options,
         )
         self._http = http_client
@@ -122,28 +123,35 @@ class MinIOClient:
             self.attempt_timeout_s,
         )
 
+    def _ensure_op_pool(self) -> ThreadPoolExecutor:
+        if self._op_pool is None:
+            self._op_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="minio-op")
+        return self._op_pool
+
+    def _drop_op_pool(self) -> None:
+        pool = self._op_pool
+        self._op_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def _run_attempt(self, fn, timeout_s: float):
         """跑一次 MinIO 操作；超时后立刻 clear 连接池，不 join 卡住的工作线程。"""
-        pool = ThreadPoolExecutor(max_workers=1)
+        pool = self._ensure_op_pool()
         fut = pool.submit(fn)
         try:
-            result = fut.result(timeout=timeout_s)
+            return fut.result(timeout=timeout_s)
         except FuturesTimeout as exc:
-            # 关键：立刻掐断旧 socket，否则 shutdown(wait=True) 会再等到 read_timeout
             hung_http = self._http
             try:
                 self._rebuild_client()
             except Exception as rebuild_exc:  # noqa: BLE001
                 logger.warning("rebuild after hard timeout failed: %s", rebuild_exc)
                 self._clear_http(hung_http)
-            pool.shutdown(wait=False, cancel_futures=True)
+            self._drop_op_pool()
             raise TimeoutError(f"MinIO op exceeded hard timeout {timeout_s:.0f}s") from exc
         except Exception:
-            pool.shutdown(wait=False, cancel_futures=True)
+            self._drop_op_pool()
             raise
-        else:
-            pool.shutdown(wait=True)
-            return result
 
     def _retry(self, op_name: str, fn, attempt_timeout_s: Optional[float] = None):
         last: Optional[Exception] = None
@@ -223,8 +231,19 @@ class MinIOClient:
     def object_size(self, key: str) -> int:
         return int(self.client.stat_object(self.bucket, key).size)
 
-    def put_torch(self, key: str, obj: Any) -> int:
-        """上传 torch 对象，返回字节数。"""
+    def put_torch(self, key: str, obj: Any, *, via_memory: bool = False) -> int:
+        """上传 torch 对象，返回字节数。
+
+        via_memory=True：序列化到内存再 PUT，避免临界路径上的临时文件写盘
+        （适合 global_delta 这类百兆级对象）。全量 global_state 仍走 tempfile，
+        以免 7B 级 state 再复制一份到 RAM。
+        """
+        if via_memory:
+            buf = io.BytesIO()
+            torch.save(obj, buf)
+            data = buf.getvalue()
+            self.put_bytes(key, data)
+            return int(len(data))
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
             path = tmp.name
         try:

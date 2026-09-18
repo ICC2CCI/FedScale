@@ -241,6 +241,8 @@ class AggregationServer:
         self.round_meta: Dict[int, Dict[str, Any]] = {}
         self._aggregating = False
         self._secagg_finalizing: set = set()  # round_idx 正在后台 finalize，避免重复聚合
+        # 保护 in-memory global_state：apply delta 与异步 put_torch 互斥
+        self._global_io_lock = threading.Lock()
         # 流式 per-block pipeline：round_idx -> {block_idx -> set(client_ids)} 已上传的 block
         self.round_block_uploads: Dict[int, Dict[int, set]] = {}
         # round_idx -> {block_idx -> agg_block_delta} 已聚合的 block 结果
@@ -600,9 +602,10 @@ class AggregationServer:
         block_energies: Optional[List[float]] = None,
         z_key: str = "",
     ) -> Dict[str, Any]:
-        """B-7a: SecAgg pipeline — client 上传一个 masked window (z_k)。
+        """B-7a: SecAgg pipeline — client 通知一个 masked window 已上传。
 
-        优先从 MinIO raw bytes（z_key）读取；兼容旧的 JSON hex（z_hex）。
+        z_key：只登记对象键，finalize 再 GET（PERF-1）。
+        z_hex：兼容旧客户端，仍在 handler 里解码。
         """
         if client_id < 0 or client_id >= self.num_clients:
             raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
@@ -613,14 +616,15 @@ class AggregationServer:
         if coord is None:
             raise HTTPException(400, "SecAgg not enabled")
 
-        from shared.fixed_point import unpack_zq
         if z_key:
-            z_data = self.minio.get_bytes(z_key)
+            coord.register_masked_window_key(client_id, block_idx, z_key, vector_len)
         elif z_hex:
+            from shared.fixed_point import unpack_zq
             z_data = bytes.fromhex(z_hex)
+            z_kw = unpack_zq(z_data, vector_len, self.secagg_modulus_bits)
+            coord.submit_masked_window(client_id, block_idx, z_kw)
         else:
             raise HTTPException(400, "missing z_key or z_hex")
-        z_kw = unpack_zq(z_data, vector_len, self.secagg_modulus_bits)
 
         # 记录 client metadata
         with self.lock:
@@ -637,9 +641,6 @@ class AggregationServer:
             }
             self._ingest_energies(block_energies or [])
             all_uploaded = len(uploaded_clients) >= self.effective_min_clients
-
-        # 存入 coordinator
-        coord.submit_masked_window(client_id, block_idx, z_kw)
 
         if not all_uploaded:
             logger.info(
@@ -659,6 +660,56 @@ class AggregationServer:
         return {
             "aggregated": False,
             "waiting_self_masters": True,
+            "all_windows_uploaded": all_windows_uploaded,
+        }
+
+    def secagg_blob_uploaded(
+        self,
+        round_idx: int,
+        client_id: int,
+        z_key: str,
+        window_ids: List[int],
+        num_examples: int = 1,
+        train_loss: float = 0.0,
+        eval_loss: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """整轮 masked windows 一个 blob：只登记 z_key，不在 HTTP 里 GET。"""
+        if client_id < 0 or client_id >= self.num_clients:
+            raise HTTPException(400, f"client_id must be in [0, {self.num_clients})")
+        if round_idx < 1 or round_idx > self.num_rounds:
+            raise HTTPException(404, f"round {round_idx} out of range")
+        if not z_key:
+            raise HTTPException(400, "missing z_key")
+
+        coord = self._get_or_create_secagg_coordinator(round_idx)
+        if coord is None:
+            raise HTTPException(400, "SecAgg not enabled")
+
+        ids = [int(w) for w in window_ids]
+        coord.register_masked_blob(client_id, z_key, ids)
+
+        plan = self._ensure_plan(round_idx)
+        n_windows = plan.n_selected_blocks
+        with self.lock:
+            if round_idx < self.current_round:
+                raise HTTPException(409, f"round {round_idx} already finished")
+            block_uploads = self.round_block_uploads.setdefault(round_idx, {})
+            for wid in ids:
+                block_uploads.setdefault(wid, set()).add(client_id)
+            client_meta = self.round_client_meta.setdefault(round_idx, {})
+            client_meta[client_id] = {
+                "num_examples": num_examples,
+                "train_loss": train_loss,
+                "eval_loss": eval_loss,
+            }
+            all_windows_uploaded = len(block_uploads) >= n_windows
+
+        logger.info(
+            "SecAgg blob round %s client %s n_windows=%s all_registered=%s",
+            round_idx, client_id, len(ids), all_windows_uploaded,
+        )
+        return {
+            "aggregated": False,
             "all_windows_uploaded": all_windows_uploaded,
         }
 
@@ -710,14 +761,38 @@ class AggregationServer:
                 self._aggregating = False
             raise
 
+    def _async_put_full_global(self, round_idx: int) -> None:
+        """全量 global_state 不挡 client 等聚合；与下一轮 apply 用同一把锁。"""
+        t0 = time.monotonic()
+        try:
+            with self._global_io_lock:
+                nbytes = self.minio.put_torch(
+                    global_state_key(round_idx), self.global_state,
+                )
+            logger.info(
+                "SecAgg: async full global_state round=%s MiB=%.1f in %.1fs",
+                round_idx, nbytes / (1024 * 1024), time.monotonic() - t0,
+            )
+        except Exception:
+            logger.exception(
+                "SecAgg: async full global_state failed round=%s", round_idx,
+            )
+
     def _secagg_run_finalize(
         self, round_idx: int, coord: Any, plan: Any, n_windows: int,
     ) -> bool:
         """已抢到 finalize 名额后的实际聚合与落盘。"""
-        logger.info("SecAgg: finalizing round %s (all z_k + self_masters received)", round_idx)
+        logger.info(
+            "SecAgg: finalizing round %s windows=%s (all z_k + self_masters received)",
+            round_idx, n_windows,
+        )
+        t0 = time.monotonic()
         try:
+            coord.materialize_masked_windows(self.minio.get_bytes)
+            t_mat = time.monotonic()
             coord.freeze_survivors()
             agg_delta = coord.aggregate_and_unmask()
+            t_unmask = time.monotonic()
         except RuntimeError as e:
             logger.error("SecAgg aggregation failed: %s", e)
             with self.lock:
@@ -731,43 +806,7 @@ class AggregationServer:
                 self._secagg_finalizing.discard(round_idx)
             return True
 
-        # 写每个 block 的 agg_block_key（让 client 可以逐 block 下载）
-        for window_id in range(n_windows):
-            # 找到该 window 的 key_name, start, end
-            block_info = None
-            for b in plan.block_list:
-                if int(b[0]) == window_id:
-                    block_info = b
-                    break
-            if block_info is None:
-                continue
-            _, key_name, start, end = block_info
-            # 从 agg_delta 中取出该 block 的 slice
-            block_slice = None
-            for kn, blocks in agg_delta.items():
-                if kn == key_name:
-                    for s, e, slice_data in blocks:
-                        if s == start and e == end:
-                            block_slice = (s, e, slice_data)
-                            break
-            if block_slice is None:
-                logger.warning("SecAgg: block %s not found in agg_delta", window_id)
-                continue
-            s, e, slice_data = block_slice
-            # 转成 fp16 用于 client 下载
-            slice_fp16 = slice_data.to(dtype=self.transfer_dtype)
-            agg_payload = {
-                "round": int(round_idx),
-                "block_idx": int(window_id),
-                "block_delta": {key_name: [(s, e, slice_fp16)]},
-            }
-            self.minio.put_torch(agg_block_key(round_idx, window_id), agg_payload)
-            with self.lock:
-                self.round_block_agg.setdefault(round_idx, {})[window_id] = {
-                    key_name: [(s, e, slice_fp16)]
-                }
-
-        # 写完整 delta + 推进 round
+        # 只写一份 global_delta（client 一次 GET）；不再按 window 落 N 个 agg_block。
         with self.lock:
             client_meta = dict(self.round_client_meta.get(round_idx, {}))
             participated = sorted(client_meta.keys())
@@ -782,7 +821,7 @@ class AggregationServer:
                 (s, e, sd.to(dtype=self.transfer_dtype)) for s, e, sd in blocks
             ]
 
-        # 写 delta payload
+        # 写 delta payload（内存序列化，避免临界路径 tempfile）
         delta_payload = {
             "round": int(round_idx),
             "from_round": int(round_idx - 1),
@@ -792,18 +831,17 @@ class AggregationServer:
             "selected_elems": int(plan.selected_elems),
             "secagg": True,
         }
-        delta_bytes = self.minio.put_torch(global_delta_key(round_idx), delta_payload)
+        delta_bytes = self.minio.put_torch(
+            global_delta_key(round_idx), delta_payload, via_memory=True,
+        )
+        t_delta = time.monotonic()
 
-        # 写全量 global_state（如果需要）
-        # SecAgg 模式下，server 不一定有 global_state（SCALE-1）
-        # 但 delta 已经写好，client 会自己 apply
+        # 内存里先 apply；全量写盘放到后台，client 只等 global_delta + done
         wrote_full_global = self._should_write_full_global(round_idx)
-        global_bytes = 0
         if wrote_full_global and self.global_state is not None:
-            # apply delta to global_state
             from shared.block_selection import add_block_delta
-            add_block_delta(self.global_state, agg_delta_fp16)
-            global_bytes = self.minio.put_torch(global_state_key(round_idx), self.global_state)
+            with self._global_io_lock:
+                add_block_delta(self.global_state, agg_delta_fp16)
 
         # 构建结果
         avg_train = sum(losses) / max(len(losses), 1)
@@ -847,9 +885,20 @@ class AggregationServer:
             self._aggregating = False
             self._secagg_finalizing.discard(round_idx)
 
+        if wrote_full_global and self.global_state is not None:
+            threading.Thread(
+                target=self._async_put_full_global,
+                args=(round_idx,),
+                name=f"secagg-put-global-{round_idx}",
+                daemon=True,
+            ).start()
+
         logger.info(
-            "SecAgg: round %s complete, avg_train=%.4f delta_MiB=%.1f",
+            "SecAgg: round %s complete, avg_train=%.4f delta_MiB=%.1f "
+            "materialize=%.1fs unmask=%.1fs put_delta=%.1fs wait_s=%.1fs async_full=%s",
             round_idx, avg_train, delta_bytes / (1024 * 1024),
+            t_mat - t0, t_unmask - t_mat, t_delta - t_unmask, t_delta - t0,
+            wrote_full_global,
         )
         return True
 
@@ -928,14 +977,23 @@ class AggregationServer:
         threading.Thread(target=self._aggregate_round, args=(round_idx,), daemon=True).start()
 
     def check_block_agg_done(self, round_idx: int) -> Dict[str, Any]:
-        """流式：client 检查本轮所有 block 是否都已聚合完成。"""
+        """client 轮询本轮聚合是否完成。
+
+        非 SecAgg 流式路径看 per-block `round_block_agg`；
+        SecAgg 只写一份 global_delta，以 round_results.done 为准。
+        """
         with self.lock:
             plan = self.round_plans.get(round_idx)
-            if plan is None:
-                return {"done": False, "n_done": 0, "n_total": 0}
+            n_total = int(plan.n_selected_blocks) if plan is not None else 0
+            result = self.round_results.get(round_idx) or {}
+            if result.get("done"):
+                return {"done": True, "n_done": n_total, "n_total": n_total}
             n_done = len(self.round_block_agg.get(round_idx, {}))
-            return {"done": n_done >= plan.n_selected_blocks,
-                    "n_done": n_done, "n_total": plan.n_selected_blocks}
+            return {
+                "done": bool(n_total and n_done >= n_total),
+                "n_done": n_done,
+                "n_total": n_total,
+            }
 
     def get_result(self, round_idx: int) -> Dict[str, Any]:
         with self.lock:
@@ -1603,6 +1661,23 @@ def build_app(server: AggregationServer) -> FastAPI:
             z_key=z_key,
         )
         # 全部 window 齐了才后台 finalize；不要每个 block 都开线程
+        if result.get("all_windows_uploaded"):
+            server.secagg_schedule_finalize(round_idx)
+        return result
+
+    @app.post("/api/round/{round_idx}/client/{client_id}/secagg/masked-blob")
+    def secagg_submit_masked_blob(
+        round_idx: int, client_id: int,
+        body: dict, _: None = Depends(_auth),
+    ) -> Dict[str, Any]:
+        result = server.secagg_blob_uploaded(
+            round_idx, client_id,
+            z_key=str(body.get("z_key") or ""),
+            window_ids=list(body.get("window_ids") or []),
+            num_examples=int(body.get("num_examples", 1)),
+            train_loss=float(body.get("train_loss", 0.0)),
+            eval_loss=(float(body["eval_loss"]) if body.get("eval_loss") is not None else None),
+        )
         if result.get("all_windows_uploaded"):
             server.secagg_schedule_finalize(round_idx)
         return result

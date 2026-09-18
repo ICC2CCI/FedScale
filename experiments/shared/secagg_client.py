@@ -101,6 +101,8 @@ class SecAggClient:
         window: WindowDescriptor,
         delta_slice: torch.Tensor,
         return_feedback: bool = False,
+        quant_input: Optional[torch.Tensor] = None,
+        signs: Optional[torch.Tensor] = None,
     ):
         """对单个 window 的 delta 做量化 + mask，返回 z_k (Z_q 整数向量)。
 
@@ -108,8 +110,8 @@ class SecAggClient:
 
         return_feedback=True 时返回 (z_k, residual, stats)，residual 用于 memory error-feedback。
 
-        如果 plan.hadamard_enabled=True，先 pad 到 2 的幂再旋转 y = FWHT(D*x)。
-        residual 逆变换后裁回原始长度。
+        如果传入 quant_input（及可选 signs），跳过正向 Hadamard——amax 阶段已算过。
+        residual 仍逆变换后裁回原始长度。
         """
         if not self.plan.secagg_session_id:
             raise RuntimeError(
@@ -123,13 +125,19 @@ class SecAggClient:
 
         orig = delta_slice.to(dtype=torch.float32).reshape(-1)
         orig_len = int(orig.numel())
-        work_len = hadamard_work_length(orig_len, self.plan.hadamard_enabled)
-        quant_input = pad_to_length(orig, work_len) if work_len != orig_len else orig.contiguous()
-        signs = None
-        if self.plan.hadamard_enabled and work_len > 0:
-            seed = self.plan.hadamard_seed + window.window_id
-            signs = generate_rademacher_signs(work_len, seed)
-            quant_input = hadamard_transform(quant_input, signs)
+        if quant_input is not None:
+            quant_input = quant_input.to(dtype=torch.float32).reshape(-1).contiguous()
+            work_len = int(quant_input.numel())
+            if signs is not None:
+                signs = signs.to(dtype=torch.float32).reshape(-1)
+        else:
+            work_len = hadamard_work_length(orig_len, self.plan.hadamard_enabled)
+            quant_input = pad_to_length(orig, work_len) if work_len != orig_len else orig.contiguous()
+            signs = None
+            if self.plan.hadamard_enabled and work_len > 0:
+                seed = self.plan.hadamard_seed + window.window_id
+                signs = generate_rademacher_signs(work_len, seed)
+                quant_input = hadamard_transform(quant_input, signs)
 
         # 1. 定点量化（per-window / global scale）
         if return_feedback:
@@ -326,6 +334,28 @@ def window_amax_payload(
     return out
 
 
+def prepare_window_quant_cache(
+    slices: Dict[int, torch.Tensor],
+    windows: List[WindowDescriptor],
+    plan: SecAggPlan,
+) -> Tuple[float, Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]]:
+    """对每个 window 做一次（可选）Hadamard，返回 global_amax 与可复用的 (y, signs)。
+
+    量化必须等 server 下发 scale 之后；正向旋转与 amax 不依赖 scale，只做一遍。
+    """
+    cache: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    amax = 0.0
+    for window in windows:
+        tensor = slices.get(window.window_id)
+        if tensor is None:
+            tensor = torch.zeros(window.vector_length, dtype=torch.float32)
+        quant_input, window_amax, signs = window_quant_input_and_amax(tensor, window, plan)
+        cache[window.window_id] = (quant_input, signs)
+        if window_amax > amax:
+            amax = window_amax
+    return float(amax), cache
+
+
 def global_amax_from_slices(
     slices: Dict[int, torch.Tensor],
     windows: List[WindowDescriptor],
@@ -335,12 +365,5 @@ def global_amax_from_slices(
 
     只上报这一个标量，不暴露哪个 window 更大。
     """
-    amax = 0.0
-    for window in windows:
-        tensor = slices.get(window.window_id)
-        if tensor is None:
-            continue
-        _quant_input, window_amax, _signs = window_quant_input_and_amax(tensor, window, plan)
-        if window_amax > amax:
-            amax = window_amax
+    amax, _cache = prepare_window_quant_cache(slices, windows, plan)
     return float(amax)

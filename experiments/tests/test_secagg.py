@@ -61,7 +61,9 @@ from shared.secagg_client import (
     SecAggClient,
     extract_window_to_send_fp32,
     global_amax_from_slices,
+    prepare_window_quant_cache,
     window_amax_payload,
+    window_quant_input_and_amax,
 )
 from server.secagg_coordinator import SecAggCoordinator
 from shared.block_selection import (
@@ -805,6 +807,51 @@ def test_session_desync_breaks_aggregation():
     assert err > 0.05, f"desynced session should leak self-mask, err={err}"
 
 
+def test_masked_windows_blob_roundtrip():
+    from shared.secagg_blob import pack_masked_windows_blob, unpack_masked_windows_blob
+
+    z = torch.tensor([1, 2, 65535], dtype=torch.int64)
+    packed = pack_zq(z, DEFAULT_MODULUS_BITS)
+    blob = pack_masked_windows_blob([(12, 3, packed), (0, 3, packed)])
+    parts = unpack_masked_windows_blob(blob)
+    assert [p[0] for p in parts] == [12, 0]
+    assert torch.equal(unpack_zq(parts[0][2], 3, DEFAULT_MODULUS_BITS), z)
+    # header is metadata only; payload bytes unchanged
+    assert len(parts[0][2]) == len(packed)
+
+
+def test_prepare_quant_cache_matches_second_fwht():
+    windows = build_window_descriptors([[0, "w", 0, 64]])
+    plan = _fresh_client_plan(hadamard=True)
+    x = torch.randn(64)
+    slices = {0: x}
+    amax, cache = prepare_window_quant_cache(slices, windows, plan)
+    y2, a2, _s2 = window_quant_input_and_amax(x, windows[0], plan)
+    assert abs(amax - a2) < 1e-6
+    assert torch.allclose(cache[0][0], y2, atol=1e-6, rtol=1e-6)
+
+
+def test_register_blob_materialize():
+    from shared.secagg_blob import pack_masked_windows_blob
+
+    windows = build_window_descriptors([[0, "layer.0.weight", 0, 8]])
+    server_plan = SecAggPlan(
+        modulus_q=DEFAULT_Q, q_max=DEFAULT_Q_MAX, quantization_scale=DEFAULT_SCALE,
+        modulus_bits=DEFAULT_MODULUS_BITS,
+    )
+    coord = SecAggCoordinator(
+        round_idx=1, successful_round_index=0,
+        client_ids=[0], windows=windows,
+        layout_hash="t", mask_hash="t", secagg_plan=server_plan,
+    )
+    z = torch.arange(8, dtype=torch.int64)
+    blob = pack_masked_windows_blob([(0, 8, pack_zq(z, DEFAULT_MODULUS_BITS))])
+    store = {"blob-0": blob}
+    coord.register_masked_blob(0, "blob-0", [0])
+    coord.materialize_masked_windows(store.__getitem__)
+    assert torch.equal(coord.masked_windows[0][0], z)
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_precision()
     test_quantize_clip()
@@ -847,4 +894,7 @@ if __name__ == "__main__":
     test_peer_keys_includes_session()
     test_e2e_hadamard_padded_non_power_of_two()
     test_session_desync_breaks_aggregation()
+    test_masked_windows_blob_roundtrip()
+    test_prepare_quant_cache_matches_second_fwht()
+    test_register_blob_materialize()
     print("All Phase B tests passed!")

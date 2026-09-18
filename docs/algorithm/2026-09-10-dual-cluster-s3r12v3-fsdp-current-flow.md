@@ -1,15 +1,16 @@
 # 双集群 S3R12v3 + FSDP 当前联调流程说明
 
-- **日期**：2026-09-10（初稿）/ 2026-09-18（SecAgg 路径 + 正式复跑）
+- **日期**：2026-09-10（初稿）/ 2026-09-18（SecAgg 路径 + 正式复跑 + 时间优化）
 - **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO；可选 Windowed SecAgg）
 - **参考跑次**：
   - 非 SecAgg（fp16 blocks）：`results/20260911-10pct-pipe2/`、`results/20260914-final-clean/`（R20 eval≈0.95–0.99）
   - SecAgg Hadamard（观测曾开着）：`results/202609171809/`（R20=**0.985**，train 被 profiler 拉到 ~300s）
-  - **SecAgg Hadamard（正式）**：`results/202609180941/`（R20=**0.985**，`train≈38s`，整轮≈148s）
+  - **SecAgg Hadamard（精度对照）**：`results/202609180941/`（R20=**0.985**，`train≈38s`，整轮≈148s）
+  - **SecAgg 时间优化 5 轮**：`results/202609181151/`（R5 eval=**1.364** 与 941 逐轮一致；`wait_agg≈10s`，整轮≈110–134s）
 - **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`
 - **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg：`configs/s3r12v3-fsdp-secagg-verify.yaml` + 常用 `AGGREGATION_PORT_OVERRIDE=8081`）
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md)（`active/` 当前为空）。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md)；时间切片见 [active：SecAgg 时间效率](../exec-plans/active/2026-09-18-secagg-time-efficiency.md)。
 
 ---
 
@@ -68,15 +69,15 @@
   ④ 本地训练若干 step
   ⑤ 在线 eval（可选）→ 得到 eval_loss
   ⑥ 算更新：delta + memory → 只编码 plan 选中的 blocks（验证配置常约 **10%**，`coverage_h=10`）
-  ⑦ 上传到 MinIO：非 SecAgg 为 `blocks.pt`；SecAgg 为 masked INT16 raw（`z_key`）
+  ⑦ 上传到 MinIO：非 SecAgg 为 `blocks.pt`；SecAgg 为 **一个** masked INT16 blob（`SAW1`，内含全部 window）
   ⑧ HTTP 通知 Server：我传完了（附带 train/eval loss、分段耗时）
 
 【Server】
   ⑨ 收齐 2 个 client 后：从 MinIO 拉两端上传
   ⑩ FedAvg（SecAgg 则先 unmask / 反量化 / 可选 iHadamard）应用到 global_state
   ⑪ 写出：
-        global_delta/round-N/blocks.pt   ← 本轮增量（客户端下一轮主要靠它）
-        global_state/round-N/state.pt    ← 全量备份/兜底（可按配置降频）
+        global_delta/round-N/blocks.pt   ← 本轮增量（客户端下一轮主要靠它；写完即 `done`）
+        global_state/round-N/state.pt    ← 全量备份/兜底（可按配置降频；SecAgg 路径异步写，不挡 client）
   ⑫ 标记本轮 done；记入 round_log.json
 
 【两端各自】
@@ -113,13 +114,13 @@ SecAgg 逐步细节见 §3.1；对应时间图 `figures/time_breakdown.png`（�
   ⑥b key-announce：上报 X25519 公钥 + **global_amax**（1 个标量）
   ⑥c peer-keys：拿到对端公钥、**统一 scale**、**secagg_session_id**（必须同步）
   ⑦ 逐 window：pad→2^p → Hadamard → INT16 随机舍入 → pairwise+self mask
-       → MinIO 写 raw bytes；HTTP 只通知 z_key（不再 hex 塞 JSON）
+       → 打成 **一个** MinIO blob；HTTP 只通知 blob `z_key`（不再逐窗 PUT，也不再 hex 塞 JSON）
   ⑧ 提交 self_master；拆分更新 quant_residual（decay=1.0）/ block_memory（0.9）
 
 【Server】
-  ⑨ 收齐 amax → 定全局 scale；收齐 z_key + self_master
-  ⑩ 后台 finalize：Σz → 去 self-mask → 反量化 → 逆 Hadamard → FedAvg
-  ⑪ 写 global_delta（+ 按需全量）；标记 done
+  ⑨ 收齐 amax → 定全局 scale；收齐 blob + self_master（notify 不拉对象）
+  ⑩ 后台 finalize：拉 2 个 blob → 按窗并行 Σz / 去 self-mask / 反量化 / 逆 Hadamard → FedAvg
+  ⑪ 写 `global_delta` 后立刻 `done`；全量 `global_state` 异步 PUT
 
 【两端各自】
   ⑫–⑮ 同 §3（等 done → apply delta → 下一轮）
@@ -129,11 +130,11 @@ SecAgg 逐步细节见 §3.1；对应时间图 `figures/time_breakdown.png`（�
 
 | 项 | 非 SecAgg（§3） | SecAgg Hadamard（§3.1） |
 |----|-----------------|-------------------------|
-| 上传对象 | `blocks.pt`（选中 block，fp16） | 每 window 一份 masked INT16 raw + `z_key` |
+| 上传对象 | `blocks.pt`（选中 block，fp16） | **一个** masked INT16 blob（窗内仍按 INT16；目录头可忽略） |
 | Server 可见 | 各 client 明文 block delta | 仅 masked `z_k` + 1 个 `global_amax` |
 | 额外控制面 | 无 | key-announce / peer-keys / self-master |
-| 收敛（20 轮） | R20≈0.95–0.99 | R20=**0.985**（`202609171809`） |
-| 典型额外耗时 | — | encode（Hadamard+量化）+ DH；train 本身不应变慢 |
+| 收敛（20 轮） | R20≈0.95–0.99 | R20=**0.985**（`202609180941`）；时间优化 5 轮 eval 对齐（`202609181151`） |
+| 典型额外耗时 | — | encode（Hadamard+量化+mask ≈15s）相对 fp16 encode≈7s；上传单 blob 反而更快（≈9s vs ≈16s）；`wait_agg≈10s` |
 
 **训练变慢排查**：若 `train_local_s` 从 ~38s 变成 ~300s，检查客户端是否误开了 `--detailed-train-metrics`（`torch.profiler` / 每步 `nvidia-smi`）。该开关 **默认关**，与 SecAgg 无关。
 
@@ -226,11 +227,11 @@ ICC1                         Server                         ICC2
  │  cache/load/train/eval      │      cache/load/train/eval  │
  │  encode                     │              encode         │
  │                             │                             │
- │── PUT blocks → MinIO ───────┼─────── PUT blocks → MinIO ──│
+ │── PUT 上传对象 → MinIO ─────┼─────── PUT 上传对象 → MinIO ─│
  │── upload-complete ─────────►│◄──────── upload-complete ───│
  │                             │                             │
  │  （wait_agg：轮询 result）   │  拉两端 → FedAvg            │
- │                             │  写 global_delta + state    │
+ │                             │  写 global_delta；state 可异步│
  │◄──── result done ───────────┤────────── result done ─────►│
  │                             │                             │
  │── GET global_delta → apply ─┼── GET global_delta → apply ─│
@@ -241,8 +242,9 @@ ICC1                         Server                         ICC2
 注意：
 
 - ICC1 / ICC2 **互不直连**，只跟 Server + MinIO 说话。
-- 先传完的一端会在 `wait_agg` 里多等一会儿（等另一端 + 等 Server 写盘）。
+- 先传完的一端会在 `wait_agg` 里多等一会儿（等另一端 + 等 Server 写出 `global_delta`）。
 - `wait_agg` **不包含**本端自己的 upload（upload 已经在前面做完）。
+- SecAgg 路径下全量 `global_state` 在 `done` 之后后台写，**不再进入** `wait_agg`。
 
 ---
 
@@ -252,7 +254,7 @@ ICC1                         Server                         ICC2
 |------|------|
 | download 几乎为 0 | 增量 cache 生效，正常 |
 | train 占比最大 | 算力主体，正常 |
-| wait_agg 约 20s | 多数时间在等 Server 写 `global_delta`+全量 `global_state`，不是本端在算 |
+| wait_agg 约 10s（SecAgg 优化后） | 等对端 + Server 并行 unmask + 写 `global_delta`；全量 state 已不挡 client。旧路径曾把全量写盘算进 wait（约 20–28s） |
 | 虚线 round_wall 高于堆叠条 | 堆叠条只画了 client0 部分阶段；整轮还含对端进度差与 Server 聚合写盘 |
 | 偶发 upload 变很长 | 跨机 MinIO 连接假死；现已硬超时+重建连接，失败后应在约 1 分钟内重试成功，而不应再卡十几分钟 |
 
@@ -275,7 +277,7 @@ ICC1                         Server                         ICC2
 | 鉴权 | 关 | yaml `security.auth_token`（非空启用 Bearer，SEC-0） |
 | SecAgg | 验证配置默认开 | `configs/s3r12v3-fsdp-secagg-verify.yaml`：`secagg_enabled` + `secagg_hadamard` + `quant_residual_decay=1.0` |
 | 训练细粒度观测 | **默认关** | `--detailed-train-metrics`；正式对照勿开 |
-| 结果目录示例 | `results/202609171809/`（SecAgg）/ `results/20260914-final-clean/`（fp16） | 含 `run.yaml` + `run_meta.json` |
+| 结果目录示例 | `results/202609180941/`（SecAgg 精度）/ `results/202609181151/`（时间 5 轮）/ `results/20260914-final-clean/`（fp16） | 含 `run.yaml` + `run_meta.json` |
 | 画图 | `python scripts/plot_s3r12v3_fsdp_run.py results/<id>` | — |
 | 实时监控 | `bash scripts/check_rerun_status.sh --watch`（OPS-1） | — |
 
