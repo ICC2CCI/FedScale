@@ -1,0 +1,291 @@
+FedScale Windowed Secure Aggregation
+可操作实现规范 v2（自研实现，不依赖 Flower）
+Public Block Mask + Pairwise Mask + Self Mask + Dropout Recovery + Windowed Secure Sum
+---TABLE---
+定位：本规范是在《FedScale 公共 Block Mask 选择策略：分层随机排列 + 无放回轮转》之上增加的密码学安全聚合层。Public Block Mask 决定“传哪些 canonical blocks”；SecAgg Random Mask 决定“如何隐藏这些已选 block 的单 ICC 数值”。二者必须严格分层。
+---ENDTABLE---
+---TABLE---
+实现原则：FedScale 当前实现不依赖 Flower。安全聚合层直接服务于 canonical-block/window streaming：Public Block Mask 先确定统一坐标，FedScale 对每个 window 完成唯一一次量化，然后由自研 Windowed SecAgg 在整数域中执行安全求和。DH、HKDF、PRG、阈值秘密分享均使用成熟密码学库/标准原语；本文不把这些密码学原语本身作为论文创新。
+---ENDTABLE---
+目录
+1. 目标、边界与安全模型
+2. 与 Public Block Mask 的组合关系
+3. 术语、状态与协议对象
+4. 端到端数据路径与坐标一致性
+5. SecAgg Session、Attempt 与临时密钥
+6. Pairwise Mask 的生成与符号约定
+7. Self Mask 与掉线恢复
+8. Window 域分离与 PRG 展开
+9. 整数量化、模数与回绕安全
+10. Windowed SecAgg 状态机
+11. 失败、重试、重启与原子提交
+12. RoundPlan / SecAggPlan 字段
+13. FedScale Windowed SecAgg 自研实现
+14. 服务端与 ICC 伪代码
+15. 安全不变量与禁止行为
+16. 测试、故障注入与验收
+17. 分阶段实施路线
+附录 A. 推荐配置
+附录 B. 审计日志字段
+附录 C. 参考资料
+1. 目标、边界与安全模型
+本规范定义 FedScale v1 在公共 block selection 之后，对已选择 canonical block 更新执行 aggregate-only secure aggregation 的可操作设计。目标是使聚合 Server 最终仅获得 cohort 的聚合整数向量/反量化聚合更新，而不能读取任一 ICC 的单独明文更新。
+1.1 v1 安全目标
+单 ICC 更新保密：Server 不得到任一 ICC 的未掩码 q_{k,w}。
+掉线鲁棒：在达到重构阈值与 q_min 的前提下，可完成聚合；低于阈值则整轮 abort。
+重放/跨域隔离：不同 Round、Cohort、Block/Window、Attempt 的随机掩码不复用。
+坐标一致：同一 SecAgg session 中所有 ICC 使用完全相同的 selected block 顺序、window layout、量化尺度与模数。
+失败安全：任何无法证明状态一致或掩码未复用的恢复路径都应新建 attempt，而不是继续旧密码学状态。
+1.2 威胁模型与非目标
+与 FedScale v1 总体威胁模型保持一致：Server 主要按 honest-but-curious（按协议执行但试图推断单中心更新）建模，ICC 为已认证且按协议执行的参与方；网络窃听/篡改由 TLS/mTLS、身份认证和签名控制面防护。v1 不把主动投毒、任意 Byzantine ICC、恶意量化值、侧信道与流量分析列为 SecAgg 层已解决问题。
+---TABLE---
+重要：SecAgg 解决“谁能看到单 ICC 更新”的机密性问题，不等价于 Differential Privacy，也不自动阻止恶意 ICC 上传投毒更新。
+---ENDTABLE---
+2. 与 Public Block Mask 的组合关系
+FedScale 中存在两个名字都叫 mask、但职责完全不同的机制。实现、日志和论文中必须显式区分：
+---TABLE---
+机制 | 输入/输出 | 主要目的 | 失败重试语义
+Public Block Mask | 输入：epoch_seed/slot/layout；输出：M_r | 选择本轮上传哪些 canonical blocks；避免 private sparse-index 泄露并保证覆盖 | 同一 successful_round_index 重试时必须保持相同
+SecAgg Cryptographic Mask | 输入：临时 DH/self secrets + domain context；输出：随机向量 | 隐藏已选 block 的单 ICC 数值，使 Server 仅见聚合和 | attempt_id 变化后必须全部重生，严禁复用
+---ENDTABLE---
+组合后的主路径为：
+FSDP local training  → ICC-level clipping / local residual  → Public Block Mask M_r  → distributed DP noise (if enabled)  → deterministic quantization  → q_{k,w} ∈ Z_q^m  → SecAgg pairwise mask + self mask  → z_{k,w}  → Server aggregate + unmask  → Σ_k q_{k,w}  → dequantize + global update
+---TABLE---
+关键联动：如果一次 SecAgg 尝试失败：Public Block Mask 不变；新的 attempt_id 触发新的 ephemeral keypair、self seed、pairwise seeds 和 mask vectors。
+---ENDTABLE---
+3. 术语、状态与协议对象
+---TABLE---
+对象 | 含义
+Cohort Q_r | 本轮共同参与 SecAgg 的 ICC 集合；集合和成员顺序在 attempt 建立后冻结。
+successful_round_index | 只在整轮聚合、全局更新和 manifest commit 成功后递增。
+secagg_session_id | 绑定 job、round、cohort、model/layout/mask 的逻辑安全聚合会话标识。
+attempt_id | 同一个 public-mask round 下的密码学尝试序号；任何重新开始 SecAgg 都递增。
+window_id | selected block stream 中的确定性窗口序号。
+window_layout_hash | 该 window 的 block fragments、坐标偏移、长度与顺序的 hash。
+q_mod | SecAgg 模数；本文公式写作 q。
+q_{k,w} | ICC k 对 window w 的量化整数向量（未加密码学 mask）。
+R_{kl,w} | ICC k,l 共享的 pairwise mask vector。
+B_{k,w} | ICC k 的 self mask vector。
+z_{k,w} | ICC k 发送给 Server 的 masked integer vector。
+---ENDTABLE---
+4. 端到端数据路径与坐标一致性
+4.1 Selected block 的规范顺序
+Public Block Mask 产生 selected block_id 集合后，服务端必须按 canonical global offset（或协议冻结的唯一排序规则）形成 selected_blocks_ordered。ICC 必须独立重算，并验证 mask_hash 一致后才进入 SecAgg。
+4.2 Window 化
+按固定目标大小 W 将 selected blocks 顺序切为 windows。window 边界必须由公开确定性规则生成，不能由各 ICC 的本地 buffer 状态决定。每个 window 记录 fragments：
+window_idordered_fragment_list = [(block_id, global_offset, fragment_offset, length), ...]vector_lengthwindow_layout_hash = H(CanonicalEncode(ordered_fragment_list, vector_length))
+同一 attempt 中所有 ICC 的 window_count、每个 window 的 vector_length 与 window_layout_hash 必须完全一致。任何不一致均 abort。
+4.3 参与者一致性
+v2 建议整轮使用一个最终 survivor set U*：只把在 deadline 前完成所有必需 masked windows 的 ICC 计为本轮参与者；未完成者作为 dropped participant 处理。Server 只有在 |U*| ≥ q_min 且满足 SecAgg 重构阈值时才允许 commit。这样避免不同 block/window 使用不同 participant set 导致模型语义不一致。
+5. SecAgg Session、Attempt 与临时密钥
+5.1 Session 标识
+secagg_session_id = H(CanonicalEncode(  "FedScale-SecAgg-v2", job_id, round_id, successful_round_index,  base_model_version, cohort_hash, layout_hash, mask_hash))
+session_id 描述“这一次要聚合什么”；attempt_id 描述“这一次密码学尝试”。同一个 session 可因掉线/超时而产生 attempt 0、1、2…，但每个 attempt 的密钥材料必须全新。
+5.2 临时 DH 密钥
+参考构造中，每个 ICC k 在每个 attempt 生成临时密钥对 (sk_k, pk_k)，对 peer l：
+sₖₗ = DH(skₖ, pkₗ) = DH(skₗ, pkₖ)
+v2 使用经过标准库实现的 X25519 + HKDF-SHA256。每个 attempt 都生成全新的临时 X25519 keypair；公钥公告必须绑定经认证的 ICC 身份、secagg_session_id、attempt_id 与 cohort_hash，并纳入签名/认证 transcript。
+5.3 Attempt 生命周期
+---TABLE---
+事件 | 处理
+初次开始 SecAgg | attempt_id=0，生成全新临时 keypair/self seed。
+setup/share-keys 后超时或进程崩溃 | 旧 attempt 标记 ABORTED；attempt_id++；重新生成全部密钥和 mask。
+masked vector 已发送但 unmask 失败 | 不得重发相同 cryptographic mask；attempt_id++。Public Block Mask 仍保持不变。
+仅应用层网络瞬时重传同一消息 | 可重传同一已生成 ciphertext/message，但必须依赖消息 id 去重；不得把“重传”误当成新 attempt。
+---ENDTABLE---
+6. Pairwise Mask 的生成与符号约定
+6.1 域分离
+对 ICC k、l 的共享秘密，不直接作为 PRG key；先通过 HKDF 派生当前 window 专用 seed。为了让双方得到同一 seed，peer 身份按 canonical ICC id 排序。
+pair_info = CanonicalEncode(  "FedScale-SecAgg-PairMask-v2",  job_id, secagg_session_id, attempt_id,  cohort_hash, mask_hash,  min(icc_k, icc_l), max(icc_k, icc_l),  window_id, window_layout_hash)pair_seed_{kl,w} = HKDF-SHA256(ikm=s_{kl}, info=pair_info)
+如果实现要求对 block 进一步域分离，可将 ordered block/fragments hash 已包含在 window_layout_hash 中；不建议既传 block_id 又传含 block 的 hash 造成两套坐标定义。
+6.2 PRG 展开
+Rₖₗ,w = PRG(pair_seedₖₗ,w, m_w)  mod q
+v2 参考实现使用 ChaCha20 伪随机流。若 q=2^32，可直接按 little/big-endian 协议规范读取 32-bit words 作为 Z_q 元素；若 q 不是 2 的幂，应使用 rejection sampling，而不是简单“随机大整数 % q”造成偏差。
+6.3 加减号规则
+以 canonical ICC id 排序决定符号：编号小的一方加，编号大的一方减。对 all-to-all 参考形式：
+zₖ,w = qₖ,w + Bₖ,w + Σₗ>ₖ Rₖₗ,w − Σₗ<ₖ Rₗₖ,w   (mod q)
+因此只要 k、l 都进入同一 aggregate，R_{kl,w} 在求和中一加一减自动抵消。v2 baseline 使用 cohort 内 all-to-all pairwise masking；后续若为大 cohort 改为稀疏 peer graph，必须重新分析掉线恢复与隐私阈值，不能只改邻居数量。
+7. Self Mask 与掉线恢复
+7.1 为什么 Pairwise Mask 不够
+如果某 ICC 在密钥交换后、masked vector 上传前掉线，它的 peer 仍可能在自己的 z 中加入与该 ICC 的 pairwise mask；这部分 mask 将失去对消项。另一方面，如果 ICC 已上传 masked vector 但在 unmask 阶段掉线，还需要移除它的 self mask。因此协议需要 self mask 和阈值秘密分享。
+7.2 Self seed 与 window self mask
+self_master_k ← fresh random secret per attemptself_info = CanonicalEncode(  "FedScale-SecAgg-SelfMask-v2", job_id, secagg_session_id,  attempt_id, icc_k, window_id, window_layout_hash)self_seed_{k,w} = HKDF-SHA256(self_master_k, info=self_info)B_{k,w} = PRG(self_seed_{k,w}, m_w) mod q
+7.3 秘密份额
+在发送任何 masked window 之前，每个 ICC 对两类恢复秘密分别执行阈值分享：① pairwise-mask recovery secret（v2 baseline 可为本 attempt 的临时 X25519 私钥或等价可重建秘密）；② self_master_k。每份 share 都绑定 secret_type、owner_icc、session_id、attempt_id 和 recipient_icc，并通过已认证加密信道发送给指定 peer；Server 只负责转发密文与在冻结 U* 后收集被授权释放的 shares，不能在普通业务层看到原始 share 内容。
+7.3.1 Share 生成与分发
+对每类 secret S，ICC k 生成 t_rec-of-n 的阈值 shares {share_{k→l}}。v2 baseline 中 n 为 cohort 中其余已认证 peers；share payload 至少包含 protocol_version、secret_type、owner_icc、recipient_icc、secagg_session_id、attempt_id、share_index 与 share_bytes。share 在 peer-to-peer 已认证加密通道中发送，或由 Server 仅作为不可读 relay 转发。
+7.3.2 Survivor 冻结与 Share Release
+Server 在 deadline 后根据“是否完成全部必需 masked windows”冻结 U* 并发布带签名的 survivor transcript。ICC 仅针对该 transcript 释放协议允许的 recovery shares：对于不在 U* 且曾进入 key/share 阶段的 ICC，释放其 pairwise recovery secret 的 shares；对于在 U* 但无法完成 unmask 的 ICC，释放其 self_master shares。
+7.3.3 禁止双重重构
+对任一 k∈U*，Server 不得同时获得足以恢复其 pairwise-mask 根秘密和 self_master_k 的 shares。实现中应把 secret_type 纳入 share envelope 和 release policy，并在 coordinator 端做状态机断言；违反该不变量必须立即 abort。
+7.4 Dropout 分类与恢复动作
+---TABLE---
+客户端状态 | 是否计入 U* | Server/协议需要恢复什么 | 目的
+完成全部 masked windows + 正常 unmask | 是 | 正常提供/协助移除 self mask | 获得其贡献但不泄露单独向量
+完成全部 masked windows，但 unmask 前掉线 | 是（若协议阈值允许） | 从 shares 重构其 self-mask secret | 从 aggregate 中移除其 self mask
+key/share 阶段参加，但未完成全部 masked windows | 否 | 恢复其 pairwise-mask 私钥/等价秘密 | 移除 survivors 与该 dropped client 的未配对 pairwise masks
+setup 前即未参加 | 否 | 无 | 不进入该 attempt
+---ENDTABLE---
+---TABLE---
+安全约束：Server 只能在冻结 survivor set U* 后，按照客户端状态重构协议所必需的一类恢复秘密。对 dropped-before-upload 客户端仅允许恢复 pairwise-mask 恢复秘密；对 uploaded-but-unavailable 客户端仅允许恢复 self-mask secret。不得对同一已纳入 aggregate 的 ICC 同时获得足以解开其 pairwise masks 与 self mask 的全部秘密材料。
+---ENDTABLE---
+8. Window 域分离与 PRG 展开
+同一个 attempt 内可复用一次 key setup，但不能复用同一个随机 mask vector。每个 window 必须用不同 HKDF info 派生独立 seed。
+---TABLE---
+域字段 | 必须性 | 理由
+protocol/version | 必须 | 避免不同协议/版本复用同一 seed。
+job_id + session_id | 必须 | 隔离不同任务与轮次语义。
+attempt_id | 必须 | 失败重试时强制 fresh cryptographic masks。
+cohort_hash | 必须 | 参与者集合变化即不同域。
+mask_hash | 必须 | 绑定 public block selection。
+window_id + window_layout_hash | 必须 | 绑定坐标/长度，防止同 seed 用于不同向量。
+peer pair (for pair mask) | 必须 | 不同 peer pair 独立。
+icc_id (for self mask) | 必须 | 不同客户端 self stream 独立。
+---ENDTABLE---
+8.1 不允许的 seed/mask 复用
+同一 pair_seed 被两个 window 复用。
+同一 attempt 的 self_master 被复制到新的 attempt。
+失败后为了“保持可重放”而复用上一次 z_{k,w} 的随机 mask，但 payload 已变化。
+不同 cohort 仅靠相同 round number 复用 domain。
+只用 block_id、不绑定 window length/fragment layout，导致坐标变化后 seed 仍相同。
+9. 整数量化、模数与回绕安全
+9.1 SecAgg payload 必须是统一整数语义
+在同一 cohort/attempt 中，所有 ICC 必须使用相同的 clip/DP/quantization policy、scale、整数范围、vector length 和 modulus。FedScale 自定义路径中，定义量化后每个元素 a 满足 |a| ≤ Q_max，并编码到 Z_q。
+9.2 数据和不能发生不可解释的模回绕
+随机 masks 在 Z_q 中回绕是协议本身的一部分；但 masks 抵消/移除后，真实数据整数和若跨过有符号解码边界，就会产生歧义。等权聚合的保守条件可写为：
+N_max · Q_max < q / 2
+若做公开权重 a_k 的加权和，则应验证 Σ_k |a_k|·Q_max < q/2，或采用协议实现已验证的量化/权重编码范围。每轮计划阶段必须执行 overflow budget check。
+9.3 FedScale 整数编码边界
+FedScale 在 SecAgg 入口前完成唯一一次 deterministic quantization。SecAgg 层接收 q_{k,w} ∈ Z_q^{m_w}，只负责 mask、上传、聚合与 unmask，不再进行 clipping、量化或坐标变换。RoundPlan 必须同时冻结 scale、signed integer range、modulus q 与 window vector length。
+---TABLE---
+FedScale v2 采用单一量化边界：selected update window 只在 SecAgg 入口前量化一次得到 q_{k,w}。安全聚合层只处理 Z_q 中的整数向量，不再次 clipping、量化或改变坐标顺序。
+---ENDTABLE---
+10. Windowed SecAgg 状态机
+参考状态机以一个 RoundPlan / public block mask 为上层语义，以 attempt 为密码学隔离边界：
+PREPARE  ↓ verify RoundPlan / mask_hash / window planSETUP  ↓ generate ephemeral keys + public-key exchangeSHARE_KEYS  ↓ threshold-share dropout recovery secretsCOLLECT_MASKED_WINDOWS  ↓ send z_{k,0} ... z_{k,W-1}FREEZE_SURVIVORS  ↓ U* = clients completing all required windowsUNMASK  ↓ recover/remove required masksVERIFY_AGGREGATE  ↓ vector length / modular decode / manifest checksCOMMIT_GLOBAL_UPDATE  ↓ persist checkpoint + model_manifestSUCCESS
+10.1 Window 执行策略
+---TABLE---
+策略 | 优点 | 代价/风险 | v2建议
+每个 window 独立重新 setup | 逻辑最简单，适合最早期单元测试 | 重复 DH/key-share setup，WAN/CPU 开销大；不适合正式大模型路径 | 仅作为 correctness baseline
+一个 attempt 一次 setup，window 级独立派生 masks | 与 block streaming 对齐；setup 可摊销；每个 window 随机流独立 | 需要显式维护 survivor、recovery 和 window transcript 状态 | v2 正式实现
+将全部 selected windows 一次拼接 | 协议状态简单 | 破坏 streaming 峰值内存优势，且失败粒度粗 | 仅用于小模型调试
+---ENDTABLE---
+v2 正式路径采用“每个 attempt setup 一次、window 级独立派生”。同一 attempt 可复用 X25519 shared secret 与 self_master 作为上层根秘密，但每个 window 必须通过包含 window_id 与 window_layout_hash 的 HKDF info 派生独立 pair/self seed。attempt 变化时根秘密也必须全部刷新。
+11. 失败、重试、重启与原子提交
+11.1 Public-mask 状态与 SecAgg 状态分离
+same successful_round_index retry:  mask_epoch / slot / selected_blocks / mask_hash  → SAME  secagg attempt_id                               → +1  ephemeral DH keys / self_master / pair seeds   → FRESH  masked vectors z                               → FRESH
+11.2 失败处理
+---TABLE---
+故障 | 动作
+cohort public key / signature / session mismatch | 立即 abort，不产生 masked payload。
+window_layout_hash 或 vector length mismatch | abort attempt；修复上层计划后新 attempt。
+部分 ICC 没有完成所有 windows | 将其统一视为 dropped，不纳入 U*；按协议恢复未配对 pairwise masks。
+|U*| < q_min 或低于重构阈值 | 整轮 abort；不更新模型；successful_round_index 不增加。
+Server/ICC crash 且无法证明旧 attempt 是否已经发送/使用 mask | 旧 attempt 废弃；attempt_id++，全新密钥和 masks。
+commit 过程中 crash | 依赖事务/manifest 判断是否 committed；只有 committed 才推进 successful_round_index。
+---ENDTABLE---
+11.3 原子提交
+Server 必须在所有 windows 聚合验证通过后一次性应用并提交全局更新。不要在 window 0 聚合后立即永久修改模型、然后 window 7 失败；推荐先写 staging checkpoint，最终通过事务/manifest 原子发布。
+12. RoundPlan / SecAggPlan 字段
+建议在现有 RoundPlan 的 block mask 字段之外增加 SecAggPlan。所有字段纳入签名。
+---TABLE---
+字段 | 示例/类型 | 说明
+secagg_protocol_id | "fedscale-window-secagg-v2" | 协议实现与版本。
+secagg_session_id | 32-byte hash | 绑定本轮模型/cohort/layout/mask。
+attempt_id | uint32 | 重试递增；参与 seed 域分离。
+cohort_hash | 32-byte hash | 有序 participant ids 的 canonical hash。
+mask_hash | 32-byte hash | 来自 Public Block Mask 规范。
+window_plan_hash | 32-byte hash | 所有 window descriptors 的 hash。
+q_min | uint32 | 本轮最小成功参与者数。
+share_fanout | all peers（v2 baseline） | 恢复 share 的接收者集合；小规模 ICC 默认 all-to-all。
+reconstruction_threshold | uint32 t_rec | 恢复秘密所需最少 shares；必须与 q_min/掉线预算联合配置。
+quantization_policy | scale / signed range | FedScale 唯一一次量化配置，cohort 内完全一致。
+modulus_range | 2^n 推荐 | 安全整数域。
+deadline | timestamp/duration | 冻结 survivor set 的时限。
+plan_signature | signature | Server/control-plane 对完整计划签名。
+---ENDTABLE---
+13. FedScale Windowed SecAgg 自研实现
+FedScale v2 不依赖 Flower。安全聚合被实现为独立的 Windowed SecAgg 子系统，由控制面下发 SecAggPlan，ICC 侧执行密钥协商、恢复秘密分享、window 量化与掩码生成，Server 侧只收集 masked windows、冻结 survivor set、执行协议允许的恢复与聚合解码。
+13.1 组件边界
+控制面负责 RoundPlan/SecAggPlan、身份、deadline 与 transcript；Block Streaming 层负责确定 selected_blocks/window_plan；Quantizer 产生 q_{k,w}；SecAggClient 只对整数 window 生成/管理 masks；SecAggCoordinator 只组织协议状态并输出聚合整数和，不暴露单 ICC 未掩码向量。
+13.2 Attempt 级协议阶段
+一个 attempt 固定执行：PREPARE → KEY_ANNOUNCE → SHARE_RECOVERY_SECRETS → COLLECT_MASKED_WINDOWS → FREEZE_SURVIVORS → REQUEST_RECOVERY_SHARES → UNMASK_AGGREGATES → VERIFY → ATOMIC_COMMIT。任一阶段状态不确定且可能已使用随机掩码时，旧 attempt 直接废弃并递增 attempt_id。
+13.3 Windowed Secure-Sum 接口
+为保持 FSDP-aware block streaming 的内存优势，正式实现暴露以下整数安全求和接口：
+begin_attempt(SecAggPlan)announce_ephemeral_key()distribute_recovery_shares()for window in WindowPlan:    mask_and_upload(window_id, q_k_w)freeze_survivors()release_authorized_recovery_shares()unmask_all_aggregate_windows()verify_and_atomic_commit_or_abort()
+该接口使 SecAgg 与 canonical-block streaming 共用同一个 window plan：setup 成本在一个 attempt 内摊销，而随机 mask 仍按 window 域分离。论文应把这一点表述为面向大模型 streaming 的系统集成机制，而不是新的密码学协议。
+14. 服务端与 ICC 伪代码
+14.1 ICC 侧
+ICC_SecAggRound(RoundPlan, local_delta):    verify_signed_plan(RoundPlan)    selected_blocks = recompute_public_block_mask(RoundPlan)    assert H(selected_blocks) == RoundPlan.mask_hash    windows = build_deterministic_windows(selected_blocks)    assert H(windows) == RoundPlan.window_plan_hash    ctx = secagg.begin_attempt(RoundPlan.secagg_session_id, attempt_id)    ctx.generate_fresh_ephemeral_keys_and_self_secret()    ctx.share_dropout_recovery_secrets()    for w in windows:        x = stream_selected_update_window(local_delta, w)        x = add_local_residual_and_dp_if_enabled(x)        q_kw = quantize_once(x, RoundPlan.quantization_policy)        z_kw = ctx.mask_window(q_kw, w.window_id, w.window_layout_hash)        send_masked_window(w.window_id, z_kw)    participate_in_unmask(ctx)    zeroize_attempt_secrets(ctx)
+14.2 Server 侧
+Server_SecAggAttempt(RoundPlan):    verify_round_state_and_attempt_id()    run_setup_and_share_keys()    collect_all_required_masked_windows_until_deadline()    U_star = clients_that_completed_all_required_windows()    if |U_star| < q_min or reconstruction_threshold_not_met:        abort_attempt_without_advancing_successful_round()        return RETRY_WITH_FRESH_ATTEMPT    for w in windows:        aggregate_masked_vectors_from(U_star, w)        recover_only_protocol_required_secrets_for_dropouts()        sum_q_w = unmask_aggregate(w)        verify_decode_bounds(sum_q_w)        stage_aggregate_window(sum_q_w)    build_staging_global_checkpoint()    atomic_commit_checkpoint_and_model_manifest()    successful_round_index += 1    return SUCCESS
+15. 安全不变量与禁止行为
+15.1 必须始终成立
+同一 attempt 的同一 window，双方对同一 pair 派生完全相同的 R_{kl,w}。
+不同 attempt/window/cohort/mask_hash 的 pair/self masks 具有域分离。
+所有 ICC 的量化、modulus、坐标顺序和 vector length 完全一致。
+只有 aggregate 结果进入全局模型更新；FedScale Server 业务层不暴露单 ICC 未掩码更新。
+低于 q_min / reconstruction threshold 时 abort，不降级成明文聚合。
+Secrets、shares、raw PRG seeds、mask vectors 不进入普通日志、manifest 或 tracing。
+15.2 禁止行为
+为了节省 setup 开销，在不同 attempt 中复用 ephemeral DH key、self seed 或 pairwise mask。
+同一 window seed 在不同 vector length/coordinate layout 上重复使用。
+Server 在看到任一单 ICC 的本轮 update 后改变 public block mask。
+参与者集合变化后继续沿用原 cohort_hash/session seed。
+掉线后直接要求客户端把未掩码 q_{k,w} 发给 Server 补救。
+把任何 secret share、pair/self seed、临时私钥或 raw mask vector 打印到 debug 日志。
+用 Python random 等非密码学 RNG 生成 cryptographic masks。
+16. 测试、故障注入与验收
+16.1 密码学/确定性单元测试
+---TABLE---
+测试 | 通过标准
+DH 对称性 | k,l 对同一 attempt 得到相同 shared secret。
+KDF 域分离 | 仅改变 attempt/window/cohort/mask_hash 任一字段，派生 seed 即变化。
+Pairwise cancellation | 无 dropout 时 Σ pairwise masks = 0 mod q。
+Self mask removal | 聚合后移除 self masks 得到精确整数和。
+Mask freshness | 同一 public block mask 的 retry 中，z_{k,w} 与上次不同（payload 相同亦应因新 masks 不同）。
+Overflow guard | 构造超过 q/2 边界的配置时计划阶段拒绝。
+---ENDTABLE---
+16.2 Dropout 故障注入
+1.  ICC 在 share-keys 后、任何 masked vector 前掉线。
+2.  ICC 完成部分 windows 后掉线：最终 U* 排除该 ICC，并能正确去除 survivors 与其未配对 pairwise masks。
+3.  ICC 完成全部 masked windows，但 unmask 前掉线：通过 shares 移除其 self mask。
+4.  掉线数超过 reconstruction threshold：必须 abort。
+5.  Server 在 unmask 前重启且 attempt 状态不确定：必须新 attempt，不复用旧 masks。
+16.3 与 Public Block Mask 的联合验收
+同一 successful_round_index 的失败重试：mask_hash 相同，但 attempt_id 和 masked payload hash 不同。
+连续一个 Mask Epoch 后 public block coverage 保持原有“无放回覆盖”性质。
+任一 ICC 的本地训练数据变化不会改变 public mask；会改变 q_{k,w}，但 Server 仍只见 masked vector 与最终 aggregate。
+所有 windows 聚合成功后才 commit 模型，任一 window 失败都不产生部分 global update。
+16.4 性能指标
+至少记录 setup latency、share-keys bytes/latency、mask generation CPU time、masked payload bytes、per-window aggregate/unmask latency、dropout recovery overhead、round end-to-end latency、peak CPU/GPU memory，以及 SecAgg 占整轮时间比例。
+17. 分阶段实施路线
+1.  Phase A：3 个 ICC + 小整数向量，实现 X25519/HKDF/PRG pairwise masks，验证无 dropout 时精确抵消。
+2.  Phase B：加入 self mask，验证 Server 在无 recovery secret 时无法直接得到单 ICC q_{k,w}。
+3.  Phase C：加入阈值秘密分享与两类 dropout recovery，完成 dropped-before-upload 与 uploaded-before-unmask 两类故障注入。
+4.  Phase D：加入 attempt_id、fresh ephemeral keys/self_master 与严格 fresh-mask 重试语义；完成 crash/timeout 注入。
+5.  Phase E：接入 Public Block Mask 与确定性 window_plan，验证所有 ICC 的 mask_hash/window_layout_hash 一致。
+6.  Phase F：接入真实 block-streamed delta、唯一一次 quantization、modulus/overflow guard。
+7.  Phase G：将所有 windows 统一到一个 survivor set U*，实现 recovery、staging checkpoint 与 all-windows atomic commit。
+8.  Phase H：最后接入 distributed DP，重新验证 quantization/modulus/noise 范围、RDP accounting 与端到端性能。
+附录 A. 推荐配置
+---TABLE---
+配置项 | v2 推荐 | 说明
+secagg_backend | fedscale-window-secagg-v2 | 当前正式实现，不依赖 Flower。
+q_min | ≥2，实验按 cohort 大小配置 | 实际安全阈值需结合协议/威胁模型。
+attempt policy | 失败即 attempt_id++ | 新 attempt 全新密码学状态。
+modulus_range | 优先 2^32 或协议支持的 2^n | 同时满足 overflow budget。
+PRG | ChaCha20 / mature CSPRNG | 不要用普通 RNG。
+KDF | HKDF-SHA256 | 严格 canonical info encoding。
+window_size | 从 16–128 MB 做 sweep | 在 SecAgg CPU/内存/WAN 开销中实验选型。
+commit policy | all-windows atomic | 避免 block 参与者/版本不一致。
+---ENDTABLE---
+附录 B. 审计日志字段
+可记录：job_id、round_id、successful_round_index、mask_epoch、slot、mask_hash、secagg_session_id、attempt_id、cohort_hash、window_plan_hash、window_count、q_min、reconstruction_threshold、quantization config、modulus_range、survivor_count、dropped_count、aggregate hash、commit manifest hash、各阶段 latency。
+禁止记录：ephemeral private keys、DH shared secrets、self_master/self_seed、pair_seed、secret shares、raw mask vectors、单 ICC 未掩码 q_{k,w}。
+附录 C. 参考资料
+说明：Flower SecAgg+ 可作为实验对照或工程参考，但不是 FedScale v2 的运行时依赖。
+[1] Bonawitz et al., Practical Secure Aggregation for Privacy-Preserving Machine Learning, CCS 2017 / IACR ePrint 2017/281. 链接
+[2] Shamir, How to Share a Secret, Communications of the ACM, 1979.（阈值秘密分享基础）
+[3] RFC 7748, Elliptic Curves for Security.（X25519）
+[4] RFC 5869, HMAC-based Extract-and-Expand Key Derivation Function (HKDF); RFC 8439, ChaCha20 and Poly1305 for IETF Protocols.

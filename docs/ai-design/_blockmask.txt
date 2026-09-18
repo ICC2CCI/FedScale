@@ -1,0 +1,281 @@
+FedScale 公共 Block Mask 选择策略
+可操作实现规范
+分层随机排列 + 无放回轮转（Hierarchical Random Permutation + Without-Replacement Rotation）
+---TABLE---
+项目 | 内容
+文档版本 | v1.0
+适用系统 | FedScale v1
+默认传输比例 ρ | 25%（按可轮转 block 数量定义）
+默认覆盖周期 H | 4 个成功轮次
+Mask Epoch | 每 H=4 个成功轮次构成一个 Mask Epoch
+状态 | Implementation Draft / 可直接进入编码与测试
+日期 | 2026-09-04
+---ENDTABLE---
+---TABLE---
+设计目标：在不依赖任一 ICC 私有更新的前提下，为同一 cohort 生成完全一致、可审计、可重放的公共 block mask；同时保证在一个 Mask Epoch 内每个可轮转 block 恰好被选择一次，避免长期饥饿。
+---ENDTABLE---
+目录
+1. 目的与适用范围
+2. 核心参数、术语与状态
+3. 算法不变量与前置条件
+4. Mask Epoch 与公开随机种子
+5. 分层随机排列
+6. 无放回轮转与 Mask 生成
+7. 小参数与特殊参数处理
+8. 失败轮次、重试与状态恢复
+9. RoundPlan 与审计字段
+10. 服务端与 ICC 实现伪代码
+11. 端到端示例
+12. 边界条件与工程决策
+13. 测试方案与验收标准
+14. 实现清单
+1. 目的与适用范围
+本规范定义 FedScale v1 中 public block mask 的确定性生成、轮转、失败恢复和审计流程。该 mask 作用于 canonical blocks，并由服务端写入 RoundPlan；同一安全聚合 cohort 中的所有 ICC 必须得到并验证完全相同的 mask。
+本规范只解决“本轮哪些 canonical blocks 进入跨 ICC 聚合”的选择问题，不改变 ICC 内部 FSDP 的本地训练范围。ICC 仍可对完整本地模型执行训练，然后仅导出 mask 选中的 block 更新。
+不使用任一 ICC 的私有明文更新作为本轮 mask 的输入。
+不使用语言运行时自带的非确定性随机数生成器。
+不允许服务端在看到本轮 ICC 更新后重新挑选 mask。
+mask 生成必须跨 ICC、跨进程、跨语言实现可复现。
+2. 核心参数、术语与状态
+---TABLE---
+符号/字段 | 默认值 | 含义
+ρ | 0.25 | 每个成功轮次期望选择的可轮转 block 比例。v1 按 block 数量定义。
+H | 4 | 覆盖周期；H 个成功轮次构成一个 Mask Epoch。
+successful_round_index | 0,1,2,... | 仅在全局聚合结果成功提交后递增。失败/中止轮次不递增。
+mask_epoch | ⌊successful_round_index / H⌋ | 当前 Mask Epoch 编号。
+slot | successful_round_index mod H | 当前成功轮次在 Mask Epoch 内的槽位。
+epoch_seed | 32 bytes | 当前 Mask Epoch 的公开随机种子，在 Epoch 开始时生成一次并冻结。
+layer_seed | 32 bytes | 由 epoch_seed 和 layer_id 确定性派生的层级子种子。
+genesis_seed | 任务创建时固定 | Mask 序列首次启动时的共同确认种子。
+epoch_anchor_manifest_hash | 32 bytes | 当前 Mask Epoch 开始前最后一个已提交模型 manifest 的 hash。
+always_on | 可选集合 | 每轮都传输、且不参加 H 轮轮转的小型特殊参数 block。
+---ENDTABLE---
+2.1 成功轮次的严格定义
+一个联邦轮只有在以下条件全部满足后，才计为一个 successful round，并消耗一个 slot：
+1.  安全聚合达到 q_min，并成功得到 cohort 聚合结果；
+2.  聚合结果通过反量化/解码并应用到服务端全局模型；
+3.  新的模型版本、manifest 和 manifest hash 已持久化；
+4.  服务端提交事务成功，且可在故障恢复后确定该轮已经 committed。
+---TABLE---
+关键规则：timeout、SecAgg abort、服务端提交失败或模型更新未持久化的轮次都不递增 successful_round_index，因此不会跳过尚未使用的 slot。
+---ENDTABLE---
+3. 算法不变量与前置条件
+实现必须始终保持以下不变量：
+Determinism：给定相同的 job_id、layout、mask_epoch 和 epoch seed，所有 ICC 生成完全相同的 layer permutation 与 block mask。
+Independence from current private updates：本轮 mask 在 ICC 本轮更新产生之前即可确定，不依赖本轮私有 update。
+Without replacement within an epoch：一个可轮转 block 在同一个 Mask Epoch 内只属于一个 slot。
+Bounded coverage：在布局不变且 H 个成功轮次完成的情况下，每个可轮转 block 在该 Epoch 内恰好被选择一次。
+Failure stability：失败轮次不改变 slot；重试同一 slot 时 mask 不变。
+Auditability：服务端和 ICC 均能根据持久化状态重新计算并验证历史 mask。
+3.1 “每层每轮都有 block”的前置条件
+若要求“每个 Transformer 层在每个 slot 都至少有一个可轮转 block”，则该层必须满足 n_l ≥ H。对于默认 H=4，每层至少需要 4 个可轮转 canonical blocks。
+n_l ≥ H = 4
+若某层 n_l < H，则“每轮至少一个 + H 轮无放回覆盖一次”在数学上无法同时成立。v1 应在 canonical layout 阶段把该层切分为至少 H 个近似等大小的可轮转 blocks；极小参数另按第 7 节处理。
+3.2 25% 的精确定义
+v1 中 ρ=25% 推荐解释为“每个 Mask Epoch 将每层 block 随机排列后分到 H=4 个 slot；每轮选择其中一个 slot”。当 n_l 能被 4 整除时，每层逐轮精确为 25%；否则每个 slot 的数量相差至多 1，单轮比例为近似 25%，但 4 个成功轮次后覆盖率严格为 100%。
+---TABLE---
+工程含义：如果 canonical block 字节大小不完全相等，则“25% block 数量”不等价于“25% 传输字节”。如论文要严格声明 25% WAN 字节预算，应优先使用近似等大小 canonical blocks，或在后续版本增加 byte-aware balancing；v1 不建议把两种口径混写。
+---ENDTABLE---
+4. Mask Epoch 与公开随机种子
+每 H=4 个 successful rounds 构成一个 Mask Epoch。当前 Epoch 和 slot 由 committed successful_round_index 唯一确定：
+mask_epoch = floor(successful_round_index / H)
+slot = successful_round_index mod H
+4.1 Epoch 种子生成
+推荐使用以下域分离形式生成公开随机种子：
+---TABLE---
+epoch_seed = SHA256(  "FedScale-BlockMask-v1"  || job_id  || layout_version  || mask_epoch  || epoch_anchor_manifest_hash)
+---ENDTABLE---
+第 0 个 Mask Epoch 使用任务创建阶段共同确认的 genesis_seed 作为 anchor 输入，或直接令 epoch_seed_0 = HKDF(genesis_seed, context)。
+4.2 必须冻结 Epoch Anchor
+---TABLE---
+必须实现：epoch_anchor_manifest_hash 不是“每个 slot 前最新的 manifest hash”，而是“当前 Mask Epoch 开始前的最后一个 committed manifest hash”。epoch_seed 在 Epoch 开始时只计算一次，随后 H 个 slot 全部复用。否则每轮重新使用最新 manifest 会得到不同排列，破坏无放回覆盖。
+---ENDTABLE---
+建议服务端在进入 slot=0 时执行：
+---TABLE---
+epoch_anchor_manifest_hash = last_committed_manifest_hashepoch_seed = derive_epoch_seed(...)persist(mask_epoch, epoch_anchor_manifest_hash, epoch_seed)
+---ENDTABLE---
+slot=1、2、3 只读取已持久化的 epoch_seed，不重新派生。
+4.3 确定性编码要求
+SHA-256 输入必须采用 canonical encoding，避免不同实现因字符串拼接歧义产生不同 seed。推荐：
+固定 UTF-8 域分隔字符串；
+job_id 使用 length-prefixed bytes；
+layout_version、mask_epoch 使用固定宽度 unsigned 64-bit big-endian；
+hash 字段使用固定 32-byte raw digest，而不是大小写不确定的十六进制字符串；
+序列化格式和测试向量写入协议版本。
+5. 分层随机排列
+对每个 Transformer 层 l，先取得该层所有可轮转 canonical blocks，并按 canonical block_id 升序形成确定性输入序列：
+---TABLE---
+layer_blocks[l] = sort_by_block_id([B_l0, B_l1, ..., B_l(n-1)])
+---ENDTABLE---
+层级种子由 HKDF-SHA256 从 epoch_seed 派生：
+---TABLE---
+layer_seed = HKDF-SHA256(  IKM  = epoch_seed,  salt = layout_hash,  info = "FedScale-LayerMask-v1" || layer_id)
+---ENDTABLE---
+随后使用 layer_seed 初始化确定性 ChaCha20 伪随机字节流，并执行 Fisher-Yates shuffle：
+---TABLE---
+permutation[l] = FisherYates(layer_blocks[l], PRG=ChaCha20(layer_seed))
+---ENDTABLE---
+5.1 Fisher-Yates 实现要求
+对 i = n_l-1 ... 1，生成 j ∈ [0, i]，交换 A[i] 与 A[j]。
+从 ChaCha20 字节流映射到 [0,i] 时使用 rejection sampling，避免简单 modulo 引入统计偏差。
+禁止调用 Python random、C++ std::random_device、Java SecureRandom 等未固定跨语言输出语义的接口直接生成 permutation。
+相同协议版本必须有固定测试向量：给定 epoch_seed、layer_id 和 block 列表，输出排列必须逐项一致。
+6. 无放回轮转与 Mask 生成
+对于第 l 层的 permutation，block B_j 在当前 slot 被选择，当且仅当其排列位置满足：
+M_t(B_j) = 1  iff  position_l(B_j) mod H = slot
+因此第 l 层当前 slot 的选择集合为：
+S_l(slot) = { permutation_l[p] | p mod H = slot }
+全局 public block mask 为所有层选择集合与 always_on 集合的并集：
+M_t = always_on ∪ (⋃_l S_l(slot))
+6.1 覆盖性质
+对任意可轮转 block，其 permutation position 对 H 取模只会得到唯一一个 slot。因此在一个 Mask Epoch 的 H 个 successful rounds 内：
+该 block 恰好被选择一次；
+不会在同一个 Epoch 被重复选择；
+不会永久饥饿；
+新的 Mask Epoch 重新生成随机排列，因此 block 所属 slot 可以改变。
+6.2 Server 端生成结果
+服务端最终生成有序 block_id 列表，而不是仅生成布尔位图。推荐按 canonical global offset 排序后再编码，以确保 SecAgg 输入向量顺序一致：
+---TABLE---
+selected_blocks = sort_by_global_offset(M_t)mask_hash = SHA256(canonical_encode(selected_blocks))
+---ENDTABLE---
+ICC 收到 RoundPlan 后独立重算 selected_blocks 和 mask_hash；任何不一致都必须拒绝进入该轮 SecAgg。
+7. 小参数与特殊参数处理
+LayerNorm、bias、门控标量以及其他极小参数不适合独立占用大量 block metadata。v1 处理顺序如下：
+1.  优先合并：将同一 Transformer 层内的小参数按 canonical 顺序合并为该层的一个普通 block，使其参与同样的 H 轮轮转。
+2.  无法合理合并时设为 always_on：该 block 每个 successful round 都进入 M_t，不参加 permutation 和 slot 轮转。
+always_on block 必须在 layout manifest 中显式标记，所有 ICC 的 layout_hash 必须包含该属性。
+8. 失败轮次、重试与状态恢复
+---TABLE---
+场景 | successful_round_index | slot | mask
+SecAgg 因参与者不足而 abort | 不变 | 不变 | 重试时保持相同
+deadline 到期但未 commit | 不变 | 不变 | 保持相同
+服务端已算出聚合但 manifest 持久化失败 | 不变 | 不变 | 恢复后重做提交或重试同 slot
+成功 commit | +1 | 推进到下一个 slot | 按新 slot 选择
+slot=3 成功 commit | +1 | 下一轮回到 slot=0 | 进入新 Mask Epoch，生成新 epoch_seed
+---ENDTABLE---
+8.1 重试规则
+同一个 successful_round_index 的任意协议重试必须复用相同的 mask_epoch、slot、epoch_seed 和 block mask。Round ID 可以变化，但 mask selection state 不应变化。
+---TABLE---
+注意：本规范只固定 mask；如果 DP 噪声、SecAgg ephemeral key 或 nonce 需要重试，应由各自协议定义是否重新采样，不能简单复用敏感随机量。
+---ENDTABLE---
+8.2 布局变化
+layout_version 或 layout_hash 变化会改变 layer_blocks，因此不能继续旧 Epoch。推荐规则：
+完成当前 committed 状态后终止旧 mask sequence；
+为新 layout 建立新的 mask_sequence_id，并从 slot=0 启动新的 Mask Epoch；
+新 epoch_seed 绑定新 layout_version/layout_hash；
+旧 residual 需要按新的 canonical layout 明确迁移或清零，不能静默错位。
+8.3 服务重启恢复
+至少持久化以下状态：
+---TABLE---
+successful_round_indexmask_epochslot (可由 index 推导)epoch_anchor_manifest_hashepoch_seedlayout_versionlayout_hashmask_policy_id
+---ENDTABLE---
+重启后先从最后一个 committed manifest 恢复 successful_round_index，再验证持久化 epoch_seed 与重算结果一致，然后继续当前 slot。
+9. RoundPlan 与审计字段
+为了让 ICC 可独立验证 mask，RoundPlan 建议增加/冻结以下字段：
+---TABLE---
+{  "mask_policy_id": "hierarchical-permute-rotate-v1",  "mask_ratio": 0.25,  "coverage_h": 4,  "successful_round_index": 37,  "mask_epoch": 9,  "slot": 1,  "epoch_seed": "<32-byte hex>",  "epoch_anchor_manifest_hash": "<32-byte hex>",  "layout_version": 12,  "layout_hash": "<32-byte hex>",  "block_mask": [ ... ordered block_ids ... ],  "mask_hash": "<32-byte hex>"}
+---ENDTABLE---
+RoundPlan 仍应整体签名。ICC 验证顺序推荐为：signature → model/layout version → epoch/slot consistency → seed derivation → local recomputation → block_mask/mask_hash equality。
+9.1 Manifest 审计记录
+每个成功轮次提交的 manifest 至少记录：
+round_id 与 successful_round_index；
+mask_epoch、slot、mask_policy_id；
+epoch_seed hash（可同时记录明文 seed）；
+layout_hash、mask_hash；
+selected block count 与 selected bytes；
+cohort id / participants；
+commit timestamp 与 parent manifest hash。
+10. 服务端与 ICC 实现伪代码
+10.1 Server：Mask 状态推进
+---TABLE---
+def build_public_mask(state, layout):    s = state.successful_round_index    H = state.coverage_h    epoch = s // H    slot = s % H    if state.active_mask_epoch != epoch:        anchor = state.last_committed_manifest_hash        epoch_seed = derive_epoch_seed(            job_id=state.job_id,            layout_version=layout.version,            mask_epoch=epoch,            epoch_anchor_manifest_hash=anchor,            genesis_seed=state.genesis_seed,        )        persist_epoch_state(epoch, anchor, epoch_seed)    else:        epoch_seed = load_persisted_epoch_seed(epoch)    selected = set(layout.always_on_blocks)    for layer in layout.transformer_layers:        blocks = sorted(layer.rotating_blocks, key=block_id)        layer_seed = derive_layer_seed(epoch_seed, layout.hash, layer.id)        perm = fisher_yates(blocks, chacha20_stream(layer_seed))        for pos, block in enumerate(perm):            if pos % H == slot:                selected.add(block)    ordered = sort_by_global_offset(selected)    return epoch, slot, epoch_seed, ordered, sha256(encode(ordered))
+---ENDTABLE---
+10.2 Server：成功提交
+---TABLE---
+def commit_successful_round(result, state):    new_manifest = persist_global_model_and_manifest(result)    atomic_commit(new_manifest)    # 只有 commit 成功后推进    state.last_committed_manifest_hash = new_manifest.hash    state.successful_round_index += 1    persist_state(state)
+---ENDTABLE---
+10.3 ICC：RoundPlan 验证
+---TABLE---
+def verify_round_plan(plan, local_layout, local_state):    verify_server_signature(plan)    assert plan.layout_hash == local_layout.hash    assert plan.coverage_h == 4    assert plan.mask_ratio == 0.25    expect_epoch = plan.successful_round_index // plan.coverage_h    expect_slot = plan.successful_round_index % plan.coverage_h    assert plan.mask_epoch == expect_epoch    assert plan.slot == expect_slot    expect_seed = derive_epoch_seed_from_anchor(plan)    assert expect_seed == plan.epoch_seed    expect_mask = recompute_mask(expect_seed, expect_slot, local_layout)    assert encode(expect_mask) == encode(plan.block_mask)    assert sha256(encode(expect_mask)) == plan.mask_hash    return ACCEPT
+---ENDTABLE---
+11. 端到端示例
+假设 H=4，每层恰好有 4 个可轮转 blocks。某个 Mask Epoch 的随机排列为：
+---TABLE---
+Layer 0: [B2,  B0, B3,  B1]Layer 1: [B5,  B7, B4,  B6]Layer 2: [B11, B8, B10, B9]
+---ENDTABLE---
+---TABLE---
+successful slot | Layer 0 | Layer 1 | Layer 2 | 本轮 mask（不含 always_on）
+0 | B2 | B5 | B11 | B2, B5, B11
+1 | B0 | B7 | B8 | B0, B7, B8
+2 | B3 | B4 | B10 | B3, B4, B10
+3 | B1 | B6 | B9 | B1, B6, B9
+---ENDTABLE---
+slot=3 成功提交后，successful_round_index 进入下一个 Epoch；服务端以新的 epoch_anchor_manifest_hash 生成新的 epoch_seed，各层重新 shuffle。
+11.1 非 4 的倍数示例
+若某层有 10 个 blocks，H=4，则 4 个 slot 的 block 数量可能为 3、3、2、2（具体由 position mod 4 确定）。因此单轮该层比例可能是 30% 或 20%，但一个 Mask Epoch 后 10 个 blocks 均被且仅被选择一次。
+如果全局各层 block 数较多且 block 大小近似一致，跨层汇总后的单轮比例会接近 25%。
+12. 边界条件与工程决策
+---TABLE---
+问题 | v1 决策
+某层 block 数 < H | 在 canonical layout 阶段进一步切分，使主要 Transformer 层 n_l ≥ H；极小参数按 small/always_on 规则处理。
+某层 block 数不是 H 的倍数 | 允许单轮近似 ρ；保证 Epoch 级 100% 无放回覆盖。
+block 大小不同 | ρ 按 block count 定义；记录 selected bytes，避免把 block 比例误写成字节比例。
+失败轮次 | 不消耗 slot；相同 successful_round_index 继续使用相同 mask。
+cohort 变化但 slot 未成功 | mask 保持不变；只要 layout/model base version 等协议约束允许该次重试。
+layout 改变 | 终止旧 mask sequence，新 layout 从新 Epoch/slot=0 开始。
+服务端是否可直接下发 block_mask | 可以，但 ICC 必须用 seed + layout 独立重算并校验，不能只信任服务端列表。
+是否把 residual 大小用于选 block | v1 不使用，因为 residual 是 ICC 私有状态，会破坏 cohort-wide public mask 的隐私边界。
+是否根据上一轮 global block norm 自适应 | 可作为独立 adaptive policy 做后续实验，不与本 v1 轮转策略混合实现。
+---ENDTABLE---
+13. 测试方案与验收标准
+13.1 单元测试
+---TABLE---
+测试项 | 输入 | 验收条件
+确定性 | 同 seed / layout / slot 重复 100 次 | mask 逐项完全一致
+跨 ICC 一致性 | 不同机器/进程实现 | mask_hash 一致
+Epoch 覆盖 | 固定 layout，连续 H 个 successful slots | 每个 rotating block 出现恰好 1 次
+失败不推进 | slot=2 人为 abort 3 次 | 3 次 mask 完全相同，成功后才进入 slot=3
+重新启动恢复 | slot=1 后 kill server | 恢复后继续正确 slot，epoch_seed 不变
+新 Epoch 随机化 | 连续多个 Epoch | 排列随 epoch_seed 改变；覆盖性质保持
+非整除层 | n_l=10,H=4 | 各 slot 数差 ≤1，Epoch 总覆盖=10
+small/always_on | 含小参数 block | 合并 block 正常轮转；always_on 每轮出现
+篡改检测 | 修改 RoundPlan 中一个 block_id | ICC mask_hash/recompute 校验失败并拒绝
+---ENDTABLE---
+13.2 跨语言测试向量
+协议仓库必须固化至少 3 组 test vectors，包含：job_id、layout_version、mask_epoch、anchor hash、epoch_seed、layer_id、输入 block_id 列表、最终 permutation、每个 slot 的 selected block_ids、mask_hash。Python/C++/Rust 等实现必须全部通过。
+13.3 系统级验收
+3–4 个 ICC 在同一 RoundPlan 下生成相同 mask_hash；
+任意一个 ICC 的本地训练数据或本地 delta 改变，不应改变本轮 mask；
+连续 4 个成功轮次后，每个 rotating block 在审计日志中出现恰好一次；
+插入失败轮次后，覆盖窗口按成功轮次而不是 wall-clock round 编号计算；
+SecAgg 输入维度、block 顺序、quantization scale 在 cohort 内完全一致；
+manifest 能追溯每个 global update 使用的 mask_epoch、slot 和 mask_hash。
+14. 实现清单
+建议按以下顺序落地：
+1.  在 canonical layout 中增加 layer_id、rotating/always_on 属性，并确保主要层 n_l ≥ H。
+2.  实现 canonical seed encoding、SHA-256 epoch seed 和 HKDF layer seed。
+3.  实现 ChaCha20 PRG + unbiased Fisher-Yates shuffle，并建立固定测试向量。
+4.  实现 successful_round_index / mask_epoch / slot 的持久化状态机。
+5.  实现 epoch anchor 冻结：slot=0 生成一次 seed，slot=1..H-1 复用。
+6.  实现 block_mask 的全局 offset 排序和 mask_hash。
+7.  扩展 RoundPlan，并在 ICC 端实现完全重算验证。
+8.  实现失败轮次不推进、重试同 mask、服务重启恢复。
+9.  加入 small block 合并与 always_on 处理。
+10.  完成单元、跨语言、故障注入和端到端 SecAgg 一致性测试。
+11.  实验阶段记录每轮 selected block ratio、selected bytes、coverage、residual norm 和 wall-clock latency。
+---TABLE---
+v1 冻结建议：论文与实现中可把本策略命名为 Hierarchical Public Permutation-and-Rotation Mask。它的核心主张不是“随机 mask 本身新颖”，而是为 canonical block streaming + secure aggregation 提供确定性、一致、无饥饿且可审计的公共 block 选择机制。
+---ENDTABLE---
+附录 A：建议配置项
+---TABLE---
+mask:  policy: hierarchical_permute_rotate_v1  ratio: 0.25  coverage_h: 4  seed_hash: sha256  kdf: hkdf_sha256  prg: chacha20  shuffle: fisher_yates  failure_consumes_slot: false  seed_anchor: mask_epoch_start_committed_manifest  small_parameter_policy: merge_then_always_on  mask_order: canonical_global_offset
+---ENDTABLE---
+附录 B：实现时不应出现的行为
+每个 ICC 使用自己的 random seed 选 block。
+服务端看到本轮单 ICC update 后再决定本轮 mask。
+同一个 Mask Epoch 的 slot=0/1/2/3 每轮重新使用最新 manifest 生成新 epoch_seed。
+失败轮次仍然 successful_round_index += 1。
+直接使用 Python random.shuffle 等未定义跨语言协议输出的 RNG。
+只验证服务端下发的 mask_hash，而不基于 seed 和 layout 独立重算 mask。
+把未选中 residual 的大小作为单 ICC 私有 block priority 上传给服务端。
+把“25% blocks”直接表述成“25% bytes”，但 block 大小并不一致。
