@@ -244,7 +244,7 @@ for i in $(seq 1 30); do
   fi
   sleep 1
 done
-curl -fsS "${SERVER_SCHEME}://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current"; echo
+curl -fsS --max-time 10 "${SERVER_SCHEME}://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current"; echo
 echo "aggregation_server pid=$(cat "${ROOT}/logs/aggregation_server.pid")"
 
 # --- clients (CFG-3: 从 nodes.yaml 循环拉起) ---

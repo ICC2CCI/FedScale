@@ -171,6 +171,8 @@ data/medical_meadow_medqa.json
 data/medical_medqa_*
 data/databricks-dolly-15k.jsonl
 data/dolly_15k*.json
+data/splits/dolly-iid/*_train.json
+data/splits/dolly-dirichlet-a0.5/*_train.json
 
 # Model weights
 /data/models/

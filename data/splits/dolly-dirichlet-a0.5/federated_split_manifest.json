@@ -1,0 +1,69 @@
+{
+  "split_method": "dirichlet",
+  "seed": 20260831,
+  "num_clients": 2,
+  "alpha": 0.5,
+  "label_field": "category",
+  "ratios": null,
+  "holdout_eval_ratio": 0.0,
+  "counts": {
+    "client0": {
+      "train": 6314,
+      "local_eval": 0,
+      "train_path": "data/splits/dolly-dirichlet-a0.5/client0_train.json",
+      "eval_path": null,
+      "category_hist": {
+        "brainstorming": 40,
+        "classification": 671,
+        "closed_qa": 1376,
+        "creative_writing": 539,
+        "general_qa": 2,
+        "information_extraction": 886,
+        "open_qa": 2155,
+        "summarization": 645
+      }
+    },
+    "client1": {
+      "train": 7196,
+      "local_eval": 0,
+      "train_path": "data/splits/dolly-dirichlet-a0.5/client1_train.json",
+      "eval_path": null,
+      "category_hist": {
+        "brainstorming": 1550,
+        "classification": 1269,
+        "closed_qa": 239,
+        "creative_writing": 94,
+        "general_qa": 1946,
+        "information_extraction": 470,
+        "open_qa": 1203,
+        "summarization": 425
+      }
+    }
+  },
+  "category_hist": {
+    "client0": {
+      "brainstorming": 40,
+      "classification": 671,
+      "closed_qa": 1376,
+      "creative_writing": 539,
+      "general_qa": 2,
+      "information_extraction": 886,
+      "open_qa": 2155,
+      "summarization": 645
+    },
+    "client1": {
+      "brainstorming": 1550,
+      "classification": 1269,
+      "closed_qa": 239,
+      "creative_writing": 94,
+      "general_qa": 1946,
+      "information_extraction": 470,
+      "open_qa": 1203,
+      "summarization": 425
+    }
+  },
+  "paths": {
+    "train": "data/dolly_15k_train.json",
+    "eval": "data/dolly_15k_eval.json"
+  }
+}

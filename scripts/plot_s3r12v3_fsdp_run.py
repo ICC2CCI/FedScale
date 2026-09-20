@@ -175,9 +175,10 @@ def plot_run(run_dir: Path) -> None:
         # wait/post may be only in final timing merge on server for client
         for k, lab in keys:
             v = ct.get(k)
-            if v is None and k in ("wait_aggregate_s", "post_delta_s"):
-                # sometimes only in round timing after client timing POST
-                v = ct.get(k)
+            if k == "wait_aggregate_s":
+                v = ct.get("pipeline_wait_agg_s") if ct.get("pipeline_wait_agg_s") is not None else v
+            if k == "post_delta_s":
+                v = ct.get("pipeline_post_apply_s") if ct.get("pipeline_post_apply_s") is not None else v
             stacks[lab].append(float(v) if v is not None else 0.0)
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=140)

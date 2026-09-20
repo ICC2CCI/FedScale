@@ -17,6 +17,7 @@ method:
   - uniform:   均匀切分（默认，等价当前 50/50）
   - fixed:     --ratios 0.7,0.3 不等分
   - dirichlet: 按 label/来源做 Dirichlet 非 IID（alpha 越小越 non-IID）
+  Dolly 请加 --label-field category，不要用默认的文本前缀伪标签。
 """
 from __future__ import annotations
 
@@ -35,6 +36,23 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
 def label_of(row: Dict[str, Any]) -> str:
     """用 input 首词或 output 首词作为弱 label（medical flashcards 无显式 label）。"""
     return (row.get("input", "") or row.get("output", ""))[:40]
+
+
+def label_from_field(field: str):
+    def _fn(row: Dict[str, Any]) -> str:
+        val = row.get(field)
+        if val is None or str(val) == "":
+            return label_of(row)
+        return str(val)
+    return _fn
+
+
+def category_hist(rows: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+    hist: Dict[str, int] = {}
+    for r in rows:
+        key = str(r.get(field) or "")
+        hist[key] = hist.get(key, 0) + 1
+    return dict(sorted(hist.items()))
 
 
 def split_uniform(rows: List, n: int) -> List[List]:
@@ -105,6 +123,11 @@ def main() -> None:
                    help="从每 client 训练集再 holdout 一份本地 eval（DATA-2，0=不用）")
     p.add_argument("--seed", type=int, default=20260831)
     p.add_argument("--prefix", default="client", help="输出文件前缀")
+    p.add_argument(
+        "--label-field",
+        default="",
+        help="dirichlet 用的字段（Dolly 用 category）；空则用文本前缀伪标签",
+    )
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -122,16 +145,26 @@ def main() -> None:
             raise SystemExit(f"--ratios needs {args.num_clients} values, got {len(ratios)}")
         chunks = split_fixed(rows, ratios)
     else:
-        chunks = split_dirichlet(rows, args.num_clients, args.alpha, label_of)
+        chunks = split_dirichlet(
+            rows,
+            args.num_clients,
+            args.alpha,
+            label_from_field(args.label_field) if args.label_field else label_of,
+        )
+
+    for chunk in chunks:
+        random.shuffle(chunk)
 
     manifest = {
         "split_method": args.method,
         "seed": args.seed,
         "num_clients": args.num_clients,
         "alpha": args.alpha if args.method == "dirichlet" else None,
+        "label_field": args.label_field or None,
         "ratios": args.ratios if args.method == "fixed" else None,
         "holdout_eval_ratio": args.holdout_eval_ratio,
         "counts": {},
+        "category_hist": {},
         "paths": {"train": str(args.train), "eval": str(args.eval) if args.eval else None},
     }
     for cid, chunk in enumerate(chunks):
@@ -145,19 +178,28 @@ def main() -> None:
         if local_eval:
             eval_path = out_dir / f"{args.prefix}{cid}_eval.json"
             eval_path.write_text(json.dumps(local_eval, ensure_ascii=False, indent=2), encoding="utf-8")
+        hist_field = args.label_field or "category"
+        hist = category_hist(train_chunk, hist_field) if any(hist_field in r for r in train_chunk) else {}
         manifest["counts"][f"client{cid}"] = {
             "train": len(train_chunk),
             "local_eval": len(local_eval),
             "train_path": str(train_path),
             "eval_path": str(eval_path) if eval_path else None,
+            "category_hist": hist,
         }
+        manifest["category_hist"][f"client{cid}"] = hist
         print(f"  client{cid}: train={len(train_chunk)} local_eval={len(local_eval)} -> {train_path}")
+        if hist:
+            print(f"    {hist_field}: {hist}")
 
     mf_path = out_dir / "federated_split_manifest.json"
     mf_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Manifest: {mf_path}")
-    print("\nDATA-2 提示：在 nodes.yaml 里给每端 data_path 指向各自 train，eval-path 指向各自 *_eval.json")
-    print("Server 只记录 client_eval_loss，不强行平均不可比的 eval（已在 aggregation_server 区分）")
+    if args.eval:
+        print(f"Shared eval (same-domain): {args.eval}")
+    else:
+        print("\nDATA-2 提示：在 nodes.yaml 里给每端 data_path 指向各自 train，eval-path 指向各自 *_eval.json")
+        print("Server 只记录 client_eval_loss，不强行平均不可比的 eval（已在 aggregation_server 区分）")
 
 
 if __name__ == "__main__":

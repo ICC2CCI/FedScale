@@ -9,7 +9,9 @@
 | `medical_flashcards_train.json` | 16 MB | 医学闪卡训练集（30176 条） |
 | `medical_flashcards_eval.json` | 1.7 MB | 医学闪卡评估集（3352 条） |
 | `dolly_15k.json` | ~13 MB | Dolly-15k 全量（15011 条，含 `category`；gitignore） |
-| `dolly_15k_train.json` / `dolly_15k_eval.json` | | 90/10，seed=20260831（DATA-D1；client 切分见 DATA-D2） |
+| `dolly_15k_train.json` / `dolly_15k_eval.json` | | 90/10，seed=20260831（DATA-D1） |
+| `splits/dolly-iid/` | | 2 client IID 50/50（DATA-D2） |
+| `splits/dolly-dirichlet-a0.5/` | | 2 client、按 category Dirichlet α=0.5（DATA-D2） |
 | `dataset_info.json` | 634 B | LLaMA-Factory 数据集注册信息 |
 
 ## 数据来源

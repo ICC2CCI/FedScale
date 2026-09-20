@@ -123,9 +123,9 @@ Kairouz et al., *Advances and Open Problems in Federated Learning* (arXiv:1912.0
 | 只复现「论文里最常见的 Non-IID」 | **B** | 仍用闪卡 Dirichlet，或 **只把 Dolly 按 8 类切成两端** | FedIT、FS-LLM |
 | 和现有 0.985 数字可比 | **A** | 维持现状 50/50 闪卡 | 你们 `202609181406` |
 
-**建议（与执行计划一致）**：主实验走 **C：闪卡 + Dolly**。Dolly 在文献里主要是 B 的载体，拿来当 C 的「通用侧」是合理迁移（OpenFedLLM 通用侧常用 Alpaca；你们 0.5B 换 Dolly 是容量原因）。若审稿人问「标准 Non-IID」，用已有 Dirichlet 脚本补一条 **B 对照**，成本低。
+**决定（2026-09-20，与执行计划一致）**：先做 **B：Dolly-15k IID vs 按 category Dirichlet**（审稿人默认的 Non-IID 表）。**C：闪卡 + Dolly 跨机构后置**（DATA-C1）。Dolly 在文献里主要是 B 的载体；拿来当 C 的「通用侧」仍然合理（OpenFedLLM 通用侧常用 Alpaca；0.5B 换 Dolly 是容量：Alpaca-GPT4 撞过 S1-C 墙）。
 
-不建议第一枪：Alpaca-GPT4（S1-C 容量墙）、中英混合、同一联邦里塞四个 FlowerTune 域（client 数和评估都会炸）。
+不建议第一枪：Alpaca-GPT4、中英混合、同一联邦里塞四个 FlowerTune 域（client 数和评估都会炸）。
 
 ---
 

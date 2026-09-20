@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-18（主实验改为 Dolly 同集 IID vs Dirichlet；跨机构后置）
+- **更新**：2026-09-20（DATA-D3/D4 完成：Dolly 无 SecAgg 5 轮 + SecAgg 20 轮，IID vs Dirichlet）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -29,6 +29,22 @@
 
 **主实验改成审稿人预期的 B 档**（见 [相关工作 §7](../../algorithm/2026-09-18-non-iid-related-work.md)）：两端都用 **Dolly-15k**，IID 50/50 vs 按 category 的 Dirichlet。闪卡 vs Dolly 的跨机构（C 档）后置。变量一次只动一类：先 0.5B 换切法，再 3B/7B。
 
+### 0.1 为什么用 Dolly（决策，2026-09-18/20）
+
+要记的是 **选数据的理由**，不是 Dolly 比医学更真实。医学闪卡仍是同域 IID + SecAgg 的主数字（~0.985），**不要和 Dolly eval 比**。
+
+| 理由 | 说明 |
+|---|---|
+| 审稿人默认的 Non-IID | 社区说 Non-IID 多半是 **B：同一份公开指令集，按类别/Dirichlet 切开**，不是「一边医院一边通用」 |
+| 文献锚点 | FedIT / Shepherd / FS-LLM 标准集就是 `databricks/databricks-dolly-15k`（~15k，8 个 `category`，常见 \(\alpha=0.5\)） |
+| 闪卡不够当 B | 现有闪卡是随机 50/50（A 档）；没有可靠类别，脚本只能拿文本前缀当伪标签 |
+| 0.5B 容量 | Alpaca-GPT4 在 0.5B 上撞过 S1-C 墙（~1.33）；Dolly 15k 能训 |
+| 评估 | 同域可以 **共用一份** `dolly_15k_eval.json`；IID vs Dirichlet 只改切法 |
+
+跨机构（ICC1 闪卡 + ICC2 Dolly）是 **C 档，后置 DATA-C1**：那是两个任务的联邦，OpenFedLLM 第二种划分，eval 必须拆开报。
+
+文献对照写在 [Non-IID 相关工作](../../algorithm/2026-09-18-non-iid-related-work.md)，不要在两处各写一套互相打架的「主实验」。
+
 ---
 
 ## 1. 看板
@@ -37,9 +53,9 @@
 |---|---|---|---|---|
 | DATA-N0 | P0 | **done**（本文） | 写清当前闪卡是同域 IID；B 档 ≠ C 档跨域 | — |
 | DATA-D1 | P0 | **done** | 下载 Dolly-15k，转成 `instruction/input/output`，保留 `category` | — |
-| DATA-D2 | P0 | todo | 两套切分：IID 50/50 vs 按 `category` Dirichlet \(\alpha=0.5\)（2 client）+ 共享 Dolly eval | DATA-D1 |
-| DATA-D3 | P1 | todo | 0.5B、无 SecAgg：Dolly IID vs Dirichlet，各至少 5 轮 | DATA-D2 |
-| DATA-D4 | P1 | todo | 同上 + SecAgg；对照 Dolly IID，不对照闪卡 0.985 | DATA-D3 |
+| DATA-D2 | P0 | **done** | 两套切分：IID 50/50 vs 按 `category` Dirichlet \(\alpha=0.5\)（2 client）+ 共享 Dolly eval | DATA-D1 |
+| DATA-D3 | P1 | **done** | 0.5B、无 SecAgg：Dolly IID `202609200928` R5 eval=2.364；Dirichlet `202609200938` R5 eval=2.369 | DATA-D2 |
+| DATA-D4 | P1 | **done** | 同上 + SecAgg 20 轮：IID `202609201002` R20 eval=2.058；Dirichlet `202609201052` R20 eval=2.062 | DATA-D3 |
 | DATA-C1 | P2 | todo | **后置**：ICC1 闪卡 + ICC2 Dolly（跨机构）；每端 hold-out 分开记 | DATA-D3 |
 | MODEL-3B | P1 | todo | Qwen2.5-3B，仍用现有 medical IID，先无 SecAgg 再 SecAgg | — |
 | MODEL-7B | P2 | todo | Qwen2.5-7B；先过显存/Central RAM/上传体积，再 5 轮 | MODEL-3B |
@@ -61,6 +77,15 @@
 |---|---|---|
 | IID 50/50 | 随机对半，seed 固定 | **可以共用一份** Dolly hold-out（同域，这是通用报法） |
 | Dirichlet | 按 8 类 `Dir(α=0.5)` 分给 2 client（FedIT 同款 α） | 仍报同一份 Dolly eval；可加每端类别直方图证明切开了 |
+
+已落地（seed=20260831，共享 eval=`data/dolly_15k_eval.json`）：
+
+| | client0 | client1 |
+|---|---|---|
+| `data/splits/dolly-iid/` | 6755 | 6755 |
+| `data/splits/dolly-dirichlet-a0.5/` | 6314 | 7196 |
+
+Dirichlet 已偏斜，例如 `general_qa` 2 vs 1946、`brainstorming` 40 vs 1550。复现命令见 `data/splits/README.md`。
 
 成功：Dirichlet 的 eval 差于或明显不稳于 IID；SecAgg 与无 SecAgg 的相对关系仍说得清。数字 **不要** 和闪卡 0.985 比。
 
