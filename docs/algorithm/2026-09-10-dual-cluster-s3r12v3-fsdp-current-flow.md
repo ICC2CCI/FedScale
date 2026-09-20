@@ -1,6 +1,6 @@
 # 双集群 S3R12v3 + FSDP 当前联调流程说明
 
-- **日期**：2026-09-10（初稿）/ 2026-09-18（SecAgg 路径 + 正式复跑 + 时间优化）
+- **日期**：2026-09-10（初稿）/ 2026-09-18（SecAgg）/ **2026-09-20**（3B + FSDP scatter-load）
 - **对应实现**：`deploy/central-server-minio`（增量 `global_delta`、fp16 传输、在线 eval、MinIO；可选 Windowed SecAgg）
 - **参考跑次**：
   - 非 SecAgg（fp16 blocks）：`results/20260911-10pct-pipe2/`、`results/20260914-final-clean/`（R20 eval≈0.95–0.99）
@@ -8,10 +8,11 @@
   - **SecAgg Hadamard（精度对照）**：`results/202609180941/`（R20=**0.985**，`train≈38s`，整轮≈148s）
   - **SecAgg 时间优化 5 轮**：`results/202609181151/`（R5 eval=**1.364** 与 941 逐轮一致；`wait_agg≈10s`，整轮≈110–134s）
   - **SecAgg 时间优化 20 轮**：`results/202609181406/`（R20 eval=**0.985**，整轮≈113s）
-- **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`
-- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（SecAgg：`configs/s3r12v3-fsdp-secagg-verify.yaml` + 常用 `AGGREGATION_PORT_OVERRIDE=8081`）
+  - **3B 医学 IID + SecAgg**：`results/202609201530/`（R20 eval=**0.880**；不要和 0.5B 比）
+- **相关代码**：`experiments/run_s3r12v3_fsdp.py`、`experiments/server/aggregation_server.py`、`experiments/shared/minio_client.py`、`experiments/shared/secagg_*.py`、`experiments/shared/state_dict_utils.py`
+- **一键启动**：`bash scripts/start_s3r12v3_fsdp_run.sh`（0.5B SecAgg：`configs/s3r12v3-fsdp-secagg-verify.yaml`；3B：`configs/s3r12v3-fsdp-medical-3b-secagg.yaml`；常用 `AGGREGATION_PORT_OVERRIDE=8081`）
 
-本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md) / [completed：SecAgg 时间效率](../exec-plans/completed/2026-09-18-secagg-time-efficiency.md)。
+本文用白话说明：**ICC1、ICC2、Central Server 各自做什么，数据怎么传**。算法细节见 [S3R12v3](2026-09-04-s3r12v3-block-uniform.md)；SecAgg 量化与隐私见 [精度问题](2026-09-15-secagg-quantization-precision-issue.md) / [优化调研](2026-09-17-secagg-quantization-optimization-survey.md)；3B 后 FSDP 如何装权重见 [scatter-load](2026-09-20-fsdp-scatter-load.md)。早期部署规划见 [双集群规划](2026-09-09-dual-cluster-fsdp-deployment.md)（部分过时，以本文为准）。执行跟踪见 [completed 联调结项](../exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) / [completed 生产切片](../exec-plans/completed/2026-09-11-dual-cluster-to-production.md) / [completed：SecAgg 时间效率](../exec-plans/completed/2026-09-18-secagg-time-efficiency.md) / [进行中：Non-IID + 更大模型](../exec-plans/active/2026-09-18-non-iid-and-larger-models.md)。
 
 ---
 
@@ -47,11 +48,11 @@
 ## 2. 启动前准备（只做一次或换模型时做）
 
 1. Central 上 MinIO 健康、bucket 就绪。
-2. 把初始权重放到 MinIO：`global_state/round-0/state.pt`（可用 `scripts/bootstrap_initial_state.sh`）。
-3. 两端本地都有同一份底座模型目录（如 `model/Qwen/Qwen2.5-0.5B`）和各自训练数据切分。
+2. 把初始权重放到 MinIO：`global_state/round-0/state.pt`（可用 `scripts/bootstrap_initial_state.sh`）。**换模型必须重 bootstrap**（3B 不能沿用 0.5B 的 round-0）。
+3. 两端本地都有同一份底座模型目录（如 `model/Qwen/Qwen2.5-0.5B` 或 `Qwen2.5-3B`）和各自训练数据切分。
 4. 用启动脚本拉起：Server 聚合进程 → ICC1 → ICC2。当前默认：
    - `--transfer-dtype fp16`
-   - `--skip-round0-download`（首轮不拉 ~1GB 全量，用本地模型当 round-0）
+   - `--skip-round0-download`（首轮不拉全量，用本地模型当 round-0）
    - `--online-eval`（每轮训练后算 eval_loss 并上报）
 
 结果写入：`results/YYYYMMDDHHMM/`（含 `round_log.json`、`figures/`、`logs/`）。
@@ -66,7 +67,7 @@
 【两端各自，大致同时】
   ① 问 Server：现在第几轮？拿本轮 plan（选哪些 block）
   ② 准备全局权重（见下一节「下载/缓存」）
-  ③ 装进 FSDP 模型（多卡 load/broadcast）
+  ③ 装进 FSDP 模型（rank0 持全量 CPU dict，按 unit scatter；**禁止** 8 份整模 `broadcast_object`）
   ④ 本地训练若干 step
   ⑤ 在线 eval（可选）→ 得到 eval_loss
   ⑥ 算更新：delta + memory → 只编码 plan 选中的 blocks（验证配置常约 **10%**，`coverage_h=10`）
@@ -150,10 +151,13 @@ SecAgg 逐步细节见 §3.1；对应时间图 `figures/time_breakdown.png`（�
 两端启动后若开启 `--skip-round0-download`：
 
 - 用**本地 model-path** 抽出一份 state，当作 `local_global`，版本号记为 `0`
-- **不再**从 MinIO 下载 `global_state/round-0/state.pt`（省掉约 1GB）
+- **不再**从 MinIO 下载 `global_state/round-0/state.pt`（0.5B 约 1 GB；3B 约 5.7 GiB）
 - Server 自己仍从 MinIO 的 round-0 初始化聚合用的 global（两端底座模型需与之一致）
+- `mode=local_base` 时 GPU 分片已是 round-0，**跳过** `load_full_state_fsdp`
 
-日志里会看到：`Seeded local_global ... skip round-0`，`mode=local_base`。
+日志里会看到：`Seeded local_global ... skip round-0`，`Skip FSDP reload: local_base...`。
+
+完整 CPU `state_dict` **只留 rank0**。心跳 / `broadcast_object` 只回传 `{bytes, mode, version}`，不把整模 pickle 到每张卡。装权重见 [scatter-load](2026-09-20-fsdp-scatter-load.md)。
 
 ### 4.2 稳态轮次：优先 cache，其次 delta，最后全量
 
@@ -170,16 +174,21 @@ SecAgg 逐步细节见 §3.1；对应时间图 `figures/time_breakdown.png`（�
 
 ### 4.3 上传的是什么（不是全模型）
 
-每轮 Server 通过 plan 指定约 **20%** 的 block。客户端上传：
+验证配置默认 `coverage_h=10`（约 **10%** block）。客户端上传：
 
 ```
-uploads/round-N/client-0/blocks.pt   ← ICC1
+uploads/round-N/client-0/blocks.pt   ← ICC1（非 SecAgg）
 uploads/round-N/client-1/blocks.pt   ← ICC2
 ```
 
-内容大致是：选中 block 的参数增量（当前联调为 **fp16**）+ `num_examples` / `train_loss` / `eval_loss` 等元数据。
+SecAgg 时是 **一个** masked INT16 blob（`SAW1`），不是明文 fp16 blocks。
 
-通信量数量级（0.5B、ratio≈20%、fp16）：每端上行约 **220–260 MiB/轮**。
+通信量数量级（`coverage_h=10`）：
+
+| | 非 SecAgg fp16 | SecAgg INT16 |
+|---|---|---|
+| 0.5B | 历史上 20% 约 220–260 MiB；现默认 10% 更小 | 约 **140 MiB**/端 |
+| 3B | — | 约 **622–660 MiB**/端（840 window） |
 
 ---
 

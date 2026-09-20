@@ -2,13 +2,14 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-20（DATA-D3/D4 完成：Dolly 无 SecAgg 5 轮 + SecAgg 20 轮，IID vs Dirichlet）
+- **更新**：2026-09-20（MODEL-3B 完成：`202609201530` R20 eval=0.880；FSDP scatter-load）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
-  - [生产切片 DATA/SCALE](2026-09-11-dual-cluster-to-production.md)（DATA-1 切分脚本已有；DATA-2 共享 eval 仍是现状）
-  - [SecAgg 时间效率](2026-09-18-secagg-time-efficiency.md)（0.5B 墙钟标尺）
-  - 当前 IID 基线：无 SecAgg `20260914-final-clean`；SecAgg `202609180941` / `202609181406`
+  - [生产切片 DATA/SCALE](../completed/2026-09-11-dual-cluster-to-production.md)（DATA-1 切分脚本已有；DATA-2 共享 eval 仍是现状）
+  - [SecAgg 时间效率](../completed/2026-09-18-secagg-time-efficiency.md)（0.5B 墙钟标尺）
+  - 当前 IID 基线：无 SecAgg `20260914-final-clean`；0.5B SecAgg `202609180941` / `202609181406`；3B SecAgg `202609201530`
+  - [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)
   - [Non-IID 相关工作调研](../../algorithm/2026-09-18-non-iid-related-work.md)
 
 ## 0. 现状（先写死，避免和「真实机构」混谈）
@@ -57,13 +58,13 @@
 | DATA-D3 | P1 | **done** | 0.5B、无 SecAgg：Dolly IID `202609200928` R5 eval=2.364；Dirichlet `202609200938` R5 eval=2.369 | DATA-D2 |
 | DATA-D4 | P1 | **done** | 同上 + SecAgg 20 轮：IID `202609201002` R20 eval=2.058；Dirichlet `202609201052` R20 eval=2.062 | DATA-D3 |
 | DATA-C1 | P2 | todo | **后置**：ICC1 闪卡 + ICC2 Dolly（跨机构）；每端 hold-out 分开记 | DATA-D3 |
-| MODEL-3B | P1 | todo | Qwen2.5-3B，仍用现有 medical IID，先无 SecAgg 再 SecAgg | — |
+| MODEL-3B | P1 | **done** | Qwen2.5-3B 医学 IID + SecAgg 20 轮 `202609201530` R20 eval=**0.880** | — |
 | MODEL-7B | P2 | todo | Qwen2.5-7B；先过显存/Central RAM/上传体积，再 5 轮 | MODEL-3B |
-| SCALE-MEM | P1 | todo | 上 3B/7B 前复核 Central 峰值内存（SCALE-1 并未真正流式） | MODEL-3B |
+| SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB 可接受；SCALE-1 流式仍未做，7B 前再量 | MODEL-3B |
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-3B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
 
-建议落地顺序：**DATA-D1 → D2 → D3 → D4**；**DATA-C1 跨机构后置**。MODEL-3B 可并行下权重，实验不要同一周交叉。QUANT-8 只在大模型 INT16 能跑且体积成瓶颈时才做。
+建议落地顺序：DATA-D1–D4 与 MODEL-3B 已完成。**DATA-C1 跨机构后置**。MODEL-7B 不要和跨域同一周叠。QUANT-8 只在大模型 INT16 能跑且体积成瓶颈时才做。
 
 ---
 
@@ -107,28 +108,32 @@ ICC1 继续医学闪卡，ICC2 用已转换的 Dolly。领域不同，eval **必
 
 当前 SecAgg 约 coverage 10%：上传 ~140 MiB，~269 window，全量 `global_state` ~0.9 GB。
 
-| | 0.5B（已跑） | 3B（约 ×6） | 7B（约 ×14） |
+| | 0.5B（已跑） | 3B（已跑 `202609201530`） | 7B（约 ×14） |
 |---|---|---|---|
-| 每端上行 INT16 ~10% | ~0.14 GB | ~0.8 GB | ~2 GB |
-| window 数（同 `block_size`） | ~269 | ~1.6k | ~3.7k |
-| Central 全量 fp32 量级 | ~1 GB | ~6 GB | ~14 GB |
-| 20 轮 MinIO（含偶发全量） | 可接受 | 需盯盘 | 必须 `write_full_global_every_n_rounds` |
+| 每端上行 INT16 ~10% | ~0.14 GB | **~0.62–0.66 GB** | ~2 GB 量级 |
+| window 数（同 `block_size`） | ~269 | **840**（不是纸面 1.6k） | 待实跑 |
+| Central 全量 fp32 / RSS | ~1 GB | 全量 ~6 GB；聚合 RSS **~13 GiB** | ~14 GB 量级 |
+| 20 轮 MinIO（含偶发全量） | 可接受 | 每轮仍写全量 ~5.9 GiB，需盯盘 | 必须 `write_full_global_every_n_rounds` |
 
-P0/P1 单 blob / 并行 unmask **不跟模型名走**，window 变多时请求次数仍应是 O(1) PUT；墙钟会跟 **计算 + 带宽** 涨。Central **没有 GPU**，unmask 仍在 CPU；7B 的 server `wait_s` 会明显长于 0.5B 的 ~6s。
+P0/P1 单 blob / 并行 unmask **不跟模型名走**，window 变多时请求次数仍应是 O(1) PUT；墙钟会跟 **计算 + 带宽** 涨。Central **没有 GPU**，unmask 仍在 CPU；3B unmask ~19s（0.5B ~6s），7B 会更长。
 
-SCALE-1 的「流式、不整模常驻」**并未做到**（结项里写的是峰值可接受、真正流水线留到 7B 前）。上 3B 先量一次 Central RSS；若 7B 峰值顶满再改 `apply_block_delta`。
+SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13 GiB 可接受；7B 峰值顶满再改 `apply_block_delta`。Client 侧 8×整模 broadcast 已在 3B 上根治，见 [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)。
 
-### 3.2 MODEL-3B
+### 3.2 MODEL-3B（done）
 
-1. 两端 + 评估机下载 `Qwen/Qwen2.5-3B` 到与 0.5B 对称的 `model/Qwen/Qwen2.5-3B`
-2. `accelerate` wrap 仍 `Qwen2DecoderLayer`；`batch_size`/`seq_len` 必要时降到 4/512
-3. **数据先保持 medical IID**（只改模型）
-4. 无 SecAgg 5 轮冒烟 → 无 SecAgg 20 轮（新 fp16 基线，**不能**沿用 0.985）→ SecAgg 5 轮对齐 eval → 再 20 轮
-5. 超时：`client_upload_timeout_s` 按上传体积加大
+配置 `configs/s3r12v3-fsdp-medical-3b-secagg.yaml`；记录 [3B 医学 SecAgg](../../experiment-records/2026-09-20-qwen25-3b-medical-secagg.md)。
+
+1. 两端下载 `Qwen/Qwen2.5-3B`；MinIO round-0 **必须重新 bootstrap**（0.5B 的 `state.pt` 不能用）
+2. wrap 仍 `Qwen2DecoderLayer`；`batch_size=4`、`seq_len=512`（batch=8 预计 OOM）
+3. 数据保持 medical IID；**直接完整 SecAgg 20 轮**，无 SecAgg 未跑
+4. `client_upload_timeout_s=3600`；eval 每 5 轮
+5. Client 同步：完整 state 只留 rank0，按 FSDP unit scatter；禁止 `broadcast_object` 整模（第一枪 R2 8×全量 OOM，已修）
+
+数字：R20 eval=**0.880**，稳态整轮 ~385 s。不要和 0.5B 的 0.985 比。yaml 里 `scale3_sharded_extract` 只是旗标，**runner 未接线**，加载走 scatter-load。
 
 ### 3.3 MODEL-7B
 
-在 3B 的 SecAgg 5 轮稳定之后：
+3B 已 20 轮稳定。7B 仍：
 
 1. 同样只换 `model_path`，数据仍 IID 医学
 2. 先 1～2 轮看：OOM、MinIO 超时、Central RSS、`upload_blocks_MiB`

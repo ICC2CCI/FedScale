@@ -176,6 +176,8 @@ def run_rank0_io_with_heartbeat(
     """在 rank0 上跑可能很长的网络 I/O，其它 rank 用短心跳同步，避免长 NCCL 等待。
 
     work_fn() 仅在 main process 调用，返回任意结果；失败应抛异常。
+    返回值会 ``broadcast_object`` 到所有 rank——不要把完整 state_dict 放进返回值，
+    否则每个进程都会反序列化一份全量副本（3B/7B 会把主机内存打满）。
     """
     import threading
 
@@ -1015,8 +1017,8 @@ def main() -> None:
             t_download = time.monotonic() - t0
             download_bytes = float(nbytes)
             download_mode = mode
+            # 只广播 meta。完整 state 留在 rank0 的 local_global，避免 8 份 pickle 副本。
             return {
-                "state": local_global,
                 "bytes": float(nbytes),
                 "mode": mode,
                 "version": int(local_version) if local_version is not None else -1,
@@ -1029,9 +1031,9 @@ def main() -> None:
             timeout_s=3600.0,
             label=f"sync-global-{round_idx}",
         )
-        global_state = dl["state"] if isinstance(dl, dict) else dl
         download_bytes = float(dl.get("bytes", 0.0)) if isinstance(dl, dict) else 0.0
         download_mode = str(dl.get("mode", "unknown")) if isinstance(dl, dict) else "unknown"
+        global_state = local_global if is_main else None
         if is_main and memory is None:
             memory = zero_state_like(global_state)
         if is_main and transfer_dtype is None and global_state is not None:
@@ -1044,10 +1046,17 @@ def main() -> None:
             )
 
         t_load0 = time.monotonic()
-        # 不要 unwrap，保留 FSDP 包装
-        load_full_state_fsdp(model, global_state)
-        accelerator.wait_for_everyone()
-        t_broadcast_load = time.monotonic() - t_load0
+        # local_base：GPU 分片已是 round-0，不必再灌一遍。
+        # 其它模式：完整 CPU state 只在 rank0，按 FSDP unit scatter，禁止 8 份整模。
+        if download_mode == "local_base":
+            t_broadcast_load = 0.0
+            if is_main:
+                logger.info("Skip FSDP reload: local_base already matches round-0 shards")
+            accelerator.wait_for_everyone()
+        else:
+            load_full_state_fsdp(model, global_state if is_main else None)
+            accelerator.wait_for_everyone()
+            t_broadcast_load = time.monotonic() - t_load0
 
         # A-5: 客户端独立验证 plan（mask_hash + layout_hash）
         # 防止 server 在看到本轮更新后篡改 mask（spec 第 3 节 Independence from current private updates）

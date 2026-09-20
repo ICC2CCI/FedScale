@@ -6,7 +6,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 先 Dolly IID vs Dirichlet；跨机构后置；3B/7B |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | Dolly D1–D4 done；3B 医学 SecAgg done；7B / DATA-C1 未开 |
 
 已归档：
 
@@ -18,3 +18,5 @@
 - [当前双集群联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
 - [SecAgg 量化精度问题](../../algorithm/2026-09-15-secagg-quantization-precision-issue.md)（已解决）
 - [SecAgg 量化优化调研](../../algorithm/2026-09-17-secagg-quantization-optimization-survey.md)（精度 `202609180941`；时间 5 轮 `202609181151` / 20 轮 `202609181406`）
+- [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)
+- [3B 医学 SecAgg](../../experiment-records/2026-09-20-qwen25-3b-medical-secagg.md)

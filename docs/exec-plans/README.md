@@ -32,14 +32,14 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | 先 Dolly IID vs Dirichlet；跨机构后置；3B/7B |
+| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | Dolly D1–D4 done；3B 医学 SecAgg done；7B / DATA-C1 未开 |
 
 ## completed
 
 | 计划 | 结项 | 说明 |
 |---|---|---|
 | [SecAgg 时间效率](completed/2026-09-18-secagg-time-efficiency.md) | 2026-09-18 | P0/P1 落地；5 轮 `202609181151` / 20 轮 `202609181406`；PERF-7/8/10 不做 |
-| [双集群联调 → 真实联邦](completed/2026-09-11-dual-cluster-to-production.md) | 2026-09-11（2026-09-18 补实跑说明） | CFG/SEC/SCALE 已落地；双集群 + SecAgg 已实跑 |
+| [双集群联调 → 真实联邦](completed/2026-09-11-dual-cluster-to-production.md) | 2026-09-11（2026-09-20 补 SCALE-3 scatter-load） | CFG/SEC 已落地；SCALE-3 整模 broadcast 已废 |
 | [三场景 loss 对比](completed/2026-09-02-three-scenario-loss-comparison.md) | 2026-09-02 | S1/S2/S3 单机联邦对比主线 |
 | [S3R12v2 key 级排列](completed/2026-09-04-s3r12v2-block-permutation.md) | 2026-09-04 | 真 20% 带宽（key 级） |
 | [S3R12v3 block 均匀](completed/2026-09-04-s3r12v3-block-uniform.md) | 2026-09-04 | block 级均匀上传 |

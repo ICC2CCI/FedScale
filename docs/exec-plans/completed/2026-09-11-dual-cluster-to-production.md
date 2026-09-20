@@ -2,7 +2,7 @@
 
 - **状态**：completed（切片 A–J 已落地；SEC-0~5 + SCALE-1/3 全部实现并验证）
 - **创建**：2026-09-11
-- **更新**：2026-09-18（双集群实跑 + SecAgg Hadamard 正式对照 `202609180941`）
+- **更新**：2026-09-18（双集群实跑 + SecAgg Hadamard 正式对照 `202609180941`）；**2026-09-20**（SCALE-3 勘误：scatter-load 已落地，见 [FSDP 文档](../../algorithm/2026-09-20-fsdp-scatter-load.md)）
 - **当前阶段**：配置化与真实联邦能力已具备；双集群非 SecAgg / SecAgg 均已实跑验证
 - **目录约定**：本文件已完成，归档于此。联调见 [2026-09-10](2026-09-10-dual-cluster-s3r12v3-fsdp.md)；操作手册见 [current-flow](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)。
 - **关联**：
@@ -442,20 +442,24 @@ Server 把整份 `global_state` 放 CPU RAM，再把两端 blocks 全部 `get_to
 
 ### SCALE-3 减少每轮 FSDP 全量 load
 
-**现状**
+**现状（结项时，0.5B）**
 
-每轮训练前 `load_full_state_fsdp`；即使 `download_mode=cache`，load 仍可能很重。时间图上 `load` 是独立一段。
+每轮训练前 `load_full_state_fsdp`；当时实现用 `rank0_only=False`，每 rank 持全量。时间图上 `load` 是独立一段。
 
-**要做**
+**2026-09-20 勘误（与系统对齐）**
 
-- 评估：cache 命中时是否可跳过重建、只对选中 block 写入 FSDP 分片
-- 若 FSDP API 限制太大，至少避免 cache 时重复 broadcast 整模
-- 作为调研任务：先出结论（可行 / 本代不做），再改代码
+结项时写「本代不做、cache 轮仍需 broadcast 整模」已过时。3B 第 2 轮 8×全量把 ICC1 OOM kill 后，加载改为 **rank0 持 CPU 全量 + 按 FSDP unit scatter**，心跳不再 `broadcast_object` 整模。cache 命中时仍会 scatter 进分片（未做「只写选中 block」），但主机内存跟 1 份全量走，不是 ×8。详见 [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)。yaml `scale3_sharded_extract` **未接线**，勿当加载开关。
+
+**当时要做 / 2026-09-20 落地**
+
+- ~~cache 命中时避免 8 份 broadcast 整模~~：已做（rank0 + scatter）
+- cache 时「只写入选中分片、跳过重建」：仍未做；7B 若 load 秒数成瓶颈再单开
+- yaml `scale3_sharded_extract`：提出过、**runner 未接线**
 
 **验收**
 
-- 有简短结论写回本文或联调流程文档
-- 若改了：cache 轮的 `load` 秒数下降，且 eval_loss 与基线一致
+- 3B 20 轮 `202609201530` R20 eval=0.880；ICC1 主机约 108 GiB / 503 GiB，不再 OOM
+- 流程写在 [scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md) 与 [current-flow §4.1](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
 
 ---
 
@@ -623,7 +627,7 @@ SecAgg / DP（安全文档第四、五层）明确标为**可选，默认不做*
 | **D. 能断能续** | RES-1, RES-2 | 中 | done | 杀进程可接着训 |
 | **E. 允许缺席** | SYNC-1, SYNC-2 | 中 | done | 一端挂了另一端还能往前走 |
 | **F. 比例补齐** | ALG-2 | 小 | done | 40% 等多 slot |
-| **G. 规模** | SCALE-1, SCALE-2, SCALE-3 | 中～大 | SCALE-2 done; SCALE-1/3 designed | int8 已实现；流式/FSDP 分片为 7B 前再做 |
+| **G. 规模** | SCALE-1, SCALE-2, SCALE-3 | 中～大 | SCALE-2 done; SCALE-3 scatter-load **2026-09-20**；SCALE-1 流式仍未做 | int8 已实现；Central 流式为 7B 前再做 |
 | **H. 真实数据** | DATA-1, DATA-2, TRAIN-1, TRAIN-2 | 中 | done | 非 IID、异构 step |
 | **I. 运维** | OPS-1, OPS-2, OPS-3 | 中 | done | 可值守 |
 | **J. 安全加固** | SEC-1~5, SEC-4 | 中～大 | done | TLS+异常防护+上传隐私全部实现并验证 |
@@ -680,7 +684,7 @@ SecAgg / DP（安全文档第四、五层）明确标为**可选，默认不做*
   - **SEC-1/2/3**：设计就绪（见安全方案 §5），P3 合规项，改动传输格式需 client/server 协同迁移，默认关闭，待产品确认后接入。
   - **SCALE-1**：调研结论——当前 `apply_block_delta` 在 fp32 累加每个 selected block，峰值 `O(selected_elems×(1+C))`；0.5B/5%≈2.8GB 可接受，7B 同比线性放大。真正流式（拉一块/累加一块/写一块，不同时持有全量+所有 delta）需重构 `apply_block_delta` 的逐 key 循环为逐 block 流水线，标记为后续 7B 落地前再做。
   - **SCALE-2**：`block_selection.py` int8 对称量化（per-block scale，`_quantize_int8_block`/`_dequantize_int8_block`），`encode/apply/add_block_delta` 支持 int8（scale 存元组第 4 元素）；自测相对误差 ~0.8%，体积约为 fp16 的 54%。
-  - **SCALE-3**：调研结论——FSDP `load_full_state_fsdp` 用 `rank0_only=False` 的 FULL_STATE_DICT 加载，要求每 rank 持全量；cache 命中时跳过重建需 FSDP API 支持「只写入选中分片」，本代 PyTorch FSDP 未暴露该细粒度接口。结论：**本代不做**，cache 轮仍需 broadcast 整模；7B 时靠 IO-1（少写全量）+ delta 同步降低成本。
+  - **SCALE-3**：结项时结论是「本代不做、每 rank 持全量」。**2026-09-20 已改**：`load_full_state_fsdp` rank0-only + per-unit scatter；sync-global 只广播 meta。3B SecAgg 20 轮 `202609201530` 验证。cache 轮仍会 scatter 装模，但不再 8 份 CPU 全量。未实现按选中 block 写入分片；`scale3_sharded_extract` 未接线。
   - **DATA-1**：`scripts/split_federated_data.py`（uniform/fixed/dirichlet + per-client holdout）；自测 Dirichlet α=0.5 产出 2501 vs 24659 非 IID 切分。
   - **DATA-2**：切分脚本支持 `--holdout-eval-ratio` 生成每端 `*_eval.json`；Server 已在 `round_log` 区分 `client_eval_loss`（per-client）与 `eval_loss`（平均，仅联调可比时用）。
   - **TRAIN-1**：`nodes.yaml` 支持 per-client `local_steps` 覆盖，启动脚本注入 `--local-steps`。

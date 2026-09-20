@@ -1,0 +1,64 @@
+# MODEL-3B：医学闪卡 IID，Qwen2.5-3B，完整方案 Windowed SecAgg
+# Hadamard + INT16 + Issue #1（quant_residual_decay=1.0, stochastic rounding）
+# 跳过无 SecAgg；batch=4（3B 无 SecAgg 已见 ~28GB/卡）。
+# 用法：
+#   AGGREGATION_PORT_OVERRIDE=8081 NODES_FILE=/tmp/nodes-medical-3b.yaml \
+#     RUN_CONFIG=configs/s3r12v3-fsdp-medical-3b-secagg.yaml TAG=medical-3b-secagg-20r \
+#     bash scripts/start_s3r12v3_fsdp_run.sh
+
+federated:
+  num_clients: 2
+  num_rounds: 20
+  coverage_h: 10
+  slots_per_round: 1
+  seed: 20260831
+  transfer_dtype: fp16
+  memory_decay: 0.9
+  quant_residual_decay: 1.0
+  block_size: 524288
+  compressor: public_random
+  rho: 0.0
+  always_on_threshold: 4096
+
+train:
+  local_steps: 30
+  batch_size: 4
+  grad_accum: 2
+  lr: 1.0e-5
+  seq_len: 512
+
+io:
+  skip_round0_download: true
+  online_eval: true
+  write_full_global_every_n_rounds: 1
+  client_upload_timeout_s: 3600
+
+eval:
+  eval_path: data/medical_flashcards_eval.json
+  eval_max_batches: 0
+  eval_every_n_rounds: 5
+
+sync:
+  min_clients_to_aggregate: 0
+  round_deadline_s: 0
+
+security:
+  auth_token: ""
+  tls: false
+  sec_upload_privacy: false
+  secagg_enabled: true
+  secagg_modulus_bits: 16
+  secagg_scale: 0.0
+  secagg_stochastic_rounding: true
+  secagg_q_min: 0
+  secagg_hadamard: true
+
+scale:
+  scale1_no_resident_global: false
+  scale3_sharded_extract: true
+
+resume:
+  resume_from_round: 0
+
+ops:
+  minio_retention_recent_uploads: 0

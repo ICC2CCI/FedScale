@@ -106,25 +106,87 @@ def get_full_state_fsdp(model: torch.nn.Module) -> Optional[Dict[str, torch.Tens
 
 
 def load_full_state_fsdp(model: torch.nn.Module, state: Optional[Dict[str, torch.Tensor]]) -> None:
-    """加载完整 state。
+    """把完整 CPU state 写入 FSDP 分片。
 
-    对 FSDP：要求 **每个 rank 都持有完整 state**（先 broadcast），再用
-    rank0_only=False 的 FULL_STATE_DICT 上下文加载。空 dict 会导致 Missing key。
+    只有 rank0 需要持有 ``state``；其它 rank 传 ``None`` / ``{}``。
+    按 FSDP unit 逐个 ``summon``（recurse=False），峰值约一层，而不是 8 份整模。
+    禁止再用 FULL_STATE_DICT + rank0_only=False（那会让每张卡 CPU 都摊一份全量）。
     """
-    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-    if state is None:
-        raise ValueError("load_full_state_fsdp requires a full state dict on every rank")
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
     fsdp_model = _as_fsdp(model)
-    if fsdp_model is not None:
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-        with fsdp_model.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-            fsdp_model.load_state_dict(state)
+    if fsdp_model is None:
+        if not state:
+            raise ValueError("load_full_state_fsdp requires a state dict on non-FSDP models")
+        device = next(model.parameters()).device
+        model.load_state_dict({k: v.to(device=device) for k, v in state.items()}, strict=True)
         return
 
-    device = next(model.parameters()).device
-    model.load_state_dict({k: v.to(device=device) for k, v in state.items()}, strict=True)
+    rank = _dist_rank()
+    is_src = rank == 0
+    if is_src and not state:
+        raise ValueError("load_full_state_fsdp: rank0 must pass the full CPU state dict")
+
+    fsdp_units = [m for m in model.modules() if isinstance(m, FSDP)]
+
+    def _has_child_fsdp(unit) -> bool:
+        return any(isinstance(c, FSDP) and c is not unit for c in unit.modules())
+
+    leaves = [u for u in fsdp_units if not _has_child_fsdp(u)]
+    parents = [u for u in fsdp_units if _has_child_fsdp(u)]
+    copied = 0
+    missing = 0
+    processed_ids: set = set()
+    # 叶子（DecoderLayer）整层 unshard；根节点 recurse=False 只碰 embed/lm_head/norm。
+    for fsdp_unit, rec in [(u, True) for u in leaves] + [(u, False) for u in parents]:
+        try:
+            cm = FSDP.summon_full_params(
+                fsdp_unit, recurse=rec, offload_to_cpu=True,
+                rank0_only=False, writeback=True,
+            )
+            cm.__enter__()
+        except NotImplementedError:
+            cm = FSDP.summon_full_params(
+                fsdp_unit, recurse=rec, offload_to_cpu=False,
+                rank0_only=False, writeback=True,
+            )
+            cm.__enter__()
+        try:
+            unit_ids = {id(p) for _, p in fsdp_unit.named_parameters(recurse=True)}
+            for full_name, param in model.named_parameters():
+                pid = id(param)
+                if pid in processed_ids or pid not in unit_ids:
+                    continue
+                processed_ids.add(pid)
+                key = _canonical_param_name(full_name)
+                if is_src:
+                    src = state.get(key) if state is not None else None
+                    if src is None:
+                        missing += 1
+                        if missing <= 5:
+                            logger.warning("FSDP scatter-load missing key=%s (from %s)", key, full_name)
+                    else:
+                        param.data.copy_(
+                            src.detach().to(device=param.device, dtype=param.dtype).reshape_as(param)
+                        )
+                        copied += 1
+                _broadcast_tensor_inplace(param.data, src=0)
+        finally:
+            cm.__exit__(None, None, None)
+
+    if is_src:
+        logger.info(
+            "FSDP scatter-load: units=%s leaves=%s copied=%s missing=%s (per-unit summon, no 8-way full dict)",
+            len(fsdp_units), len(leaves), copied, missing,
+        )
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        n_copied = broadcast_object(copied if is_src else None, src=0)
+    else:
+        n_copied = copied
+    if int(n_copied or 0) <= 0:
+        raise RuntimeError("FSDP scatter-load copied 0 parameters; name mapping failed")
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +199,36 @@ def _strip_orig_mod_prefix(name: str) -> str:
     if name.startswith("_orig_mod."):
         return name[len("_orig_mod."):]
     return name
+
+
+def _canonical_param_name(name: str) -> str:
+    """FSDP/accelerate 包装名 → HuggingFace state_dict 键。"""
+    name = _strip_orig_mod_prefix(name)
+    return name.replace("._fsdp_wrapped_module", "").replace("_fsdp_wrapped_module.", "")
+
+
+def _dist_rank() -> int:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    return 0
+
+
+def _broadcast_tensor_inplace(tensor: torch.Tensor, src: int = 0) -> None:
+    """各 rank 对齐同一份 tensor。NCCL 不能广播 CPU tensor，需要时经当前 GPU 中转。"""
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    if tensor.device.type == "cpu" and dist.get_backend() == "nccl":
+        dev = torch.device("cuda", torch.cuda.current_device())
+        gpu = tensor.to(dev, non_blocking=False)
+        dist.broadcast(gpu, src=src)
+        tensor.copy_(gpu.to(device="cpu"))
+        del gpu
+        return
+    dist.broadcast(tensor, src=src)
 
 
 def get_sharded_block_delta(
