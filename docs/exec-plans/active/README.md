@@ -6,7 +6,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | Dolly D1–D4 done；3B 医学 SecAgg done；7B / DATA-C1 未开 |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 下一枪 BASE-S2-3B；然后 7B / DATA-C1 |
 
 已归档：
 

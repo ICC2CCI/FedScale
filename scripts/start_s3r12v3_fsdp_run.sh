@@ -238,7 +238,7 @@ nohup /home/pcllgr/miniconda3/envs/fedscale-server/bin/python \
 echo $! > "${ROOT}/logs/aggregation_server.pid"
 ln -sfn "${RUN_DIR}/logs/aggregation_server.log" "${ROOT}/logs/aggregation_server.log"
 
-for i in $(seq 1 30); do
+for i in $(seq 1 120); do
   if curl -fsS --max-time 2 "${SERVER_SCHEME}://127.0.0.1:${AGGREGATION_PORT:-8080}/api/round/current" >/dev/null 2>&1; then
     break
   fi

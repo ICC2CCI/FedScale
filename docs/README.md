@@ -24,7 +24,7 @@
 | [已完成：双集群 FSDP 联调](exec-plans/completed/2026-09-10-dual-cluster-s3r12v3-fsdp.md) | 测试床落地结项 |
 | [已完成：联调 → 真实联邦](exec-plans/completed/2026-09-11-dual-cluster-to-production.md) | CFG/SEC/SCALE 等切片结项；SCALE-3 勘误见 2026-09-20 |
 | [已完成：SecAgg 时间效率](exec-plans/completed/2026-09-18-secagg-time-efficiency.md) | 通用加速（不特化 0.5B）；5 轮 `202609181151` / 20 轮 `202609181406` |
-| [进行中：Non-IID + 更大模型](exec-plans/active/2026-09-18-non-iid-and-larger-models.md) | Dolly D1–D4 done；3B 医学 SecAgg `202609201530` R20=0.880；7B / DATA-C1 未开 |
+| [进行中：Non-IID + 更大模型](exec-plans/active/2026-09-18-non-iid-and-larger-models.md) | Dolly / 3B SecAgg done；下一枪双 ICC S2；7B / DATA-C1 未开 |
 | [3B 医学 SecAgg 记录](experiment-records/2026-09-20-qwen25-3b-medical-secagg.md) | Qwen2.5-3B IID + SecAgg 20 轮 |
 
 ## 历史 / 部分过时（勿当操作手册）

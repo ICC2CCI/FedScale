@@ -116,6 +116,80 @@ def to_chat_texts(rows: List[Dict[str, Any]], tokenizer) -> List[str]:
     return texts
 
 
+def patch_qwen2_attn_fp32_qk() -> None:
+    """V100 无 bf16：fp16 QK matmul 会 inf。Softmax 虽已 fp32，但 AMP 仍把 matmul 打回 fp16。
+
+    只把 QK（contract dim = head_dim）升到 fp32，权重仍 fp16，避免 7B 全 fp32 OOM。
+    """
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
+
+    if getattr(Qwen2Attention.forward, "_fedscale_fp32_qk", False):
+        return
+    orig_fwd = Qwen2Attention.forward
+
+    def forward(self, *args, **kwargs):
+        orig_matmul = torch.matmul
+        head_dim = int(getattr(self, "head_dim", 0) or 0)
+
+        def matmul_qk_fp32(a, b):
+            if (
+                head_dim
+                and torch.is_tensor(a)
+                and torch.is_tensor(b)
+                and a.dim() == 4
+                and b.dim() == 4
+                and a.shape[-1] == head_dim
+            ):
+                with torch.autocast(device_type="cuda", enabled=False):
+                    return orig_matmul(a.float(), b.float())
+            return orig_matmul(a, b)
+
+        torch.matmul = matmul_qk_fp32
+        try:
+            return orig_fwd(self, *args, **kwargs)
+        finally:
+            torch.matmul = orig_matmul
+
+    forward._fedscale_fp32_qk = True
+    Qwen2Attention.forward = forward
+
+
+def causal_lm_loss_fp32(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Shifted CE in fp32. fp16 logits × Qwen vocab(~152k) 在 7B+ 上会 overflow 成 nan。"""
+    shift_logits = logits[..., :-1, :].float().contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
+def model_step_loss(outputs, batch) -> torch.Tensor:
+    labels = batch.get("labels") if isinstance(batch, dict) else None
+    if labels is not None and getattr(outputs, "logits", None) is not None:
+        return causal_lm_loss_fp32(outputs.logits, labels)
+    return outputs.loss
+
+
+def load_causal_lm(model_path: str):
+    # 7B 全 fp32 在 8×V100 上 ~29GiB/卡 OOM（embed/lm_head 未切分）。
+    # 权重保持 fp16 AMP；QK matmul 单独 fp32（并关掉 autocast）。
+    patch_qwen2_attn_fp32_qk()
+    param_dtype = torch.float16
+    kwargs = dict(
+        torch_dtype=param_dtype,
+        trust_remote_code=False,
+        local_files_only=True,
+        attn_implementation="eager",
+    )
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    model.config._fedscale_attn_impl = "eager"
+    model.config._fedscale_attn_qk = "fp32"
+    model.config._fedscale_param_dtype = str(param_dtype).replace("torch.", "")
+    return model
+
+
 class ChatDataset(torch.utils.data.Dataset):
     def __init__(self, texts: List[str], tokenizer, seq_len: int):
         self.texts = texts
@@ -374,10 +448,18 @@ def train_local_steps(
                 torch.cuda.synchronize()
             fwd_start = time.monotonic()
             outputs = model(**batch)
-            loss = outputs.loss
+            loss = model_step_loss(outputs, batch)
             if detailed_metrics and torch.cuda.is_available():
                 torch.cuda.synchronize()
             fwd_ms = (time.monotonic() - fwd_start) * 1000
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                if accelerator.sync_gradients:
+                    step += 1
+                    if accelerator.is_main_process and step % 10 == 0:
+                        logger.warning("local step %s/%s loss=non-finite (skipped)", step, local_steps)
+                continue
 
             bwd_start = time.monotonic()
             accelerator.backward(loss)
@@ -416,6 +498,10 @@ def train_local_steps(
                     except Exception:
                         _prof = _make_profiler()
                 opt_start = time.monotonic()
+                try:
+                    accelerator.clip_grad_norm_(1.0)
+                except TypeError:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -476,7 +562,7 @@ def train_local_steps(
                         "gpu_mem_mb": _gpu_m,
                         "cpu_util_pct": _cpu_u,
                     })
-                if accelerator.is_main_process and step % 10 == 0:
+                if accelerator.is_main_process and (step == 1 or step % 10 == 0):
                     logger.info(
                         "local step %s/%s loss=%.4f",
                         step,
@@ -620,7 +706,8 @@ def eval_local_batches(
             break
         outputs = model(**batch)
         bs = int(batch["input_ids"].size(0))
-        total += outputs.loss.detach().double() * bs
+        step_loss = model_step_loss(outputs, batch)
+        total += step_loss.detach().double() * bs
         count += float(bs)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
@@ -778,6 +865,7 @@ def main() -> None:
               "num_examples", "config", "client_state_dir", "resume", "poll_interval"),
     )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # SEC-5：TLS 证书验证（自签名证书时跳过）
     _set_requests_verify(not args.tls_no_verify)
@@ -808,14 +896,16 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16,
-        trust_remote_code=False,
-        attn_implementation="eager",
-        local_files_only=True,
-    )
+    model = load_causal_lm(args.model_path)
     model.config.use_cache = False
+    if is_main:
+        logger.info(
+            "model attn=%s attn_qk=%s param_dtype=%s mixed_precision=%s",
+            getattr(model.config, "_fedscale_attn_impl", None),
+            getattr(model.config, "_fedscale_attn_qk", None),
+            getattr(model.config, "_fedscale_param_dtype", None),
+            accelerator.mixed_precision,
+        )
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
@@ -1598,10 +1688,16 @@ def main() -> None:
             t_put = time.monotonic() - t_put0
 
             t_notify0 = time.monotonic()
-            _tl = float(train_loss) if train_loss == train_loss and abs(train_loss) != float('inf') else 0.0
+            _tl = float(train_loss)
+            if not (_tl == _tl and abs(_tl) != float("inf")):
+                logger.warning("train_loss non-finite; omitting numeric train_loss")
+                _tl = 0.0  # schema 仍要 float；0 只表示无效，日志已警告
             _el = None
             if eval_loss_val is not None:
-                _el = float(eval_loss_val) if eval_loss_val == eval_loss_val and abs(eval_loss_val) != float('inf') else None
+                _el = float(eval_loss_val)
+                if not (_el == _el and abs(_el) != float("inf")):
+                    logger.warning("eval_loss non-finite; omitting from notify")
+                    _el = None
             body = {
                 "z_key": z_key,
                 "window_ids": [p[0] for p in blob_parts],

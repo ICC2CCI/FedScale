@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-20（MODEL-3B 完成：`202609201530` R20 eval=0.880；FSDP scatter-load）
+- **更新**：2026-09-20（看板加 BASE-S2：双 ICC 全量 FedAvg；3B SecAgg 已完成）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -59,12 +59,15 @@
 | DATA-D4 | P1 | **done** | 同上 + SecAgg 20 轮：IID `202609201002` R20 eval=2.058；Dirichlet `202609201052` R20 eval=2.062 | DATA-D3 |
 | DATA-C1 | P2 | todo | **后置**：ICC1 闪卡 + ICC2 Dolly（跨机构）；每端 hold-out 分开记 | DATA-D3 |
 | MODEL-3B | P1 | **done** | Qwen2.5-3B 医学 IID + SecAgg 20 轮 `202609201530` R20 eval=**0.880** | — |
-| MODEL-7B | P2 | todo | Qwen2.5-7B；先过显存/Central RAM/上传体积，再 5 轮 | MODEL-3B |
+| **BASE-S2-3B** | **P1** | **todo** | 双 ICC **S2 全量 FedAvg**：3B 医学 IID，20 轮，`compressor=dense`，**无 SecAgg**；与 `202609201530` 比 eval / 墙钟 / 上行 MiB | MODEL-3B |
+| BASE-S2-0.5B | P2 | todo | 同上，0.5B 双集群（旧单机 S2 eval≈1.01 栈不同，不能当主表） | — |
+| MODEL-7B | P2 | **doing** | Qwen2.5-7B 医学 IID + SecAgg 5 轮冒烟（`batch=2`）；14B 权重另下、先不训 | MODEL-3B |
 | SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB 可接受；SCALE-1 流式仍未做，7B 前再量 | MODEL-3B |
-| QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-3B |
+| ABL-MASK | P2 | todo | 明文短跑：公开随机 block vs 私有 Top-k（论证 Top-k 不能 SecAgg；不必上 3B） | — |
+| QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
 
-建议落地顺序：DATA-D1–D4 与 MODEL-3B 已完成。**DATA-C1 跨机构后置**。MODEL-7B 不要和跨域同一周叠。QUANT-8 只在大模型 INT16 能跑且体积成瓶颈时才做。
+建议落地顺序：**BASE-S2-3B（论文主对照）→ MODEL-7B 冒烟 →（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1 跨机构、QUANT-8 仍后置。不要和跨域同一周叠。
 
 ---
 
@@ -131,9 +134,28 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 
 数字：R20 eval=**0.880**，稳态整轮 ~385 s。不要和 0.5B 的 0.985 比。yaml 里 `scale3_sharded_extract` 只是旗标，**runner 未接线**，加载走 scatter-load。
 
+论文主表还缺同栈 **S2**（见 §3.2b）：现在的 0.880 只能说「3B 能收敛」，不能说「相对全量 FedAvg 掉多少」。
+
+### 3.2b BASE-S2：双 ICC 全量 FedAvg（论文主对照）
+
+**不是** S1 单机把两份数据揉在一起训，也 **不是** FedRolex 只训部分层。两端仍各训全模 30 step，只把通信改成 **100% delta**。
+
+| 项 | 与 `202609201530` 对齐 | 只改这些 |
+|---|---|---|
+| 模型 / 数据 / 轮次 | Qwen2.5-3B，医学 IID，20 轮，batch=4，eval 每 5 轮 | — |
+| 压缩 | — | `compressor: dense`，`coverage_h: 1` |
+| SecAgg | — | **关**（S2 是明文全量 FedAvg） |
+| 超时 | — | 上行约 6 GiB/端，超时至少 3600s，盯 MinIO 盘 |
+
+验收：同一份 `medical_flashcards_eval.json` 画曲线；报 R20 eval、平均整轮墙钟、每端 `upload_blocks_MiB`。成功 = 10%+SecAgg 与该 S2 **同量级** eval，体积约 **1/10**。
+
+0.5B 双集群同样缺这条（现有对照是「同 10% 有/无 SecAgg」）。有余力再跑 BASE-S2-0.5B；**不要**拿 2026-09-02 单机模拟 S2（eval≈1.01）填主表。
+
+已有 yaml 骨架：`configs/s3r12v3-fsdp-eval-20round-dense.yaml`（0.5B、10 轮）。3B 应对齐 `s3r12v3-fsdp-medical-3b-secagg.yaml` 再改 dense、关 SecAgg。
+
 ### 3.3 MODEL-7B
 
-3B 已 20 轮稳定。7B 仍：
+3B SecAgg 已 20 轮稳定。**论文主对照仍是 BASE-S2-3B**。7B 冒烟 `202609201834` 系统面通过（无 OOM、~14 min/轮、上行 ~1.46 GiB）但 **train/eval loss=nan**：V100 无 bf16，eager softmax 虽已 fp32，**fp16 QK matmul 仍 overflow**；「fp32 权重 + AMP」同样 nan（AMP 把 matmul 打回 fp16）；全 fp32（`202609202021`）每卡 ~29 GiB OOM（embed/lm_head 未切分）。正确修法：权重保持 fp16 AMP，**只把 QK matmul 升到 fp32 并关掉 autocast**（`202609202031` step1 loss≈2.3/2.9，随后 batch=2 ~28 GiB OOM）。7B 冒烟改 **batch=1**。通信仍 INT16。7B 仍：
 
 1. 同样只换 `model_path`，数据仍 IID 医学
 2. 先 1～2 轮看：OOM、MinIO 超时、Central RSS、`upload_blocks_MiB`
@@ -159,7 +181,7 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 ## 4. 验收总则
 
 - 跨域：N3 无 SecAgg 能跑完；N4 的 SecAgg eval **按本域分别** 对照，不要求医学 0.985
-- 3B/7B：该模型自己的 fp16 基线；SecAgg 5 轮与该基线同量级；`upload_blocks_MiB` 与「选中元素 × 2B」相符
+- 3B/7B：该模型自己的 **S2 dense** 为 eval 尺子；SecAgg 与该尺子同量级；`upload_blocks_MiB` 与「选中元素 × 2B」相符
 - 协议：禁止按 3B/7B 写死 window 数或层名
 
 ---
@@ -171,6 +193,7 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 - 为跨域再换量化或关掉 Hadamard（跨域和 QUANT-8 分开做）
 - PERF-7 AES-CTR（仍按时间计划 won't do；7B 若 SHAKE 真成 encode 大头再单开）
 - 0.5B 上为压体积而做 SecAgg INT8/INT4
+- 3B 再跑一遍「同 10%、无 SecAgg」（0.5B 已证明掉点可忽略；3B 主对照是 S2 全量）
 
 ---
 
@@ -190,5 +213,5 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 
 规范原话：mask **不得**使用任一 ICC 的私有更新作输入（见 `docs/ai-design/Public_Block_Mask_v1.txt`）。Top-k 正好违反这一条，也 **无法** 做 Windowed SecAgg（支撑集不一致就不能对位相加、mask 对消）。
 
-优势首先是 **能安全聚合的结构化稀疏**，其次才是省带宽。若服务器可信、只要体积，STC 类可以更小；那是另一条实验，不替代当前默认路径。
+论文方法节可用 **ABL-MASK**：明文短跑公开随机 vs Top-k，不必上 SecAgg、不必上 3B。优势首先是 **能安全聚合的结构化稀疏**，其次才是省带宽。若服务器可信、只要体积，STC 类可以更小；那是另一条实验，不替代当前默认路径。
 
