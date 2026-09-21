@@ -1,14 +1,15 @@
 # Qwen2.5-7B 医学闪卡 IID + Windowed SecAgg
 
-- **状态**：5 轮冒烟 **done**；20 轮进行中
+- **状态**：done（5 轮冒烟 + 20 轮）
 - **创建**：2026-09-21
-- **5 轮跑次**：`results/202609210952/`（gitignore；图用 `python scripts/plot_s3r12v3_fsdp_run.py` 生成）
+- **5 轮跑次**：`results/202609210952/`
+- **20 轮跑次**：`results/202609211137/`（gitignore；图用 `python scripts/plot_s3r12v3_fsdp_run.py` 生成）
 - **20 轮配置**：`configs/s3r12v3-fsdp-medical-7b-secagg-20r.yaml`
 - **关联**：
   - [执行计划](../exec-plans/active/2026-09-18-non-iid-and-larger-models.md) MODEL-7B
   - [V100 7B QK fp32](../algorithm/2026-09-21-v100-7b-qk-fp32.md)
   - [FSDP scatter-load](../algorithm/2026-09-20-fsdp-scatter-load.md)
-  - 3B SecAgg：`202609201530` R20 eval=0.880（**不要和 7B 5 轮 eval 比**）
+  - 3B SecAgg：`202609201530` R20 eval=0.880（**不要和 7B eval 直接比**）
 
 ## 1. 设定
 
@@ -53,6 +54,19 @@
 | QK fp32 + batch=2 `202609202031` | step1 loss 有限，下一步 backward OOM |
 | QK fp32 + **batch=1** `202609202039` 2 轮 | train/eval 有限；随后 5 轮 `202609210952` |
 
-## 4. 20 轮
+## 4. 20 轮结果（`202609211137`）
 
-配置：`configs/s3r12v3-fsdp-medical-7b-secagg-20r.yaml`。按 5 轮墙钟外推约 **6–7 小时**（~19 min/轮 × 20；eval 在 R1/5/10/15/20）。全量 `state.pt` 只在第 20 轮写一次（约 14 GiB），每轮仍有 INT16 delta。
+| 轮 | eval | 平均 train |
+|---|---|---|
+| R1 | 1.351 | 2.576 |
+| R5 | 1.014 | 1.196 |
+| R10 | 0.821 | 0.829 |
+| R15 | 0.779 | 0.707 |
+| **R20** | **0.766** | 0.680 |
+
+- 上行约 **1457–1460 MiB**/端；window=1609（约 10%）
+- 整轮约 **18–19 min**（`avg_round_wall_s≈1118`）；墙钟 11:37 → 17:53，约 **6.3 小时**
+- 图：`results/202609211137/figures/{eval,train}_loss.png` 等
+- 无 OOM、无 nan，20 轮全部聚合成功
+
+这是 7B 自己的 SecAgg 尺子（batch=1），不是相对全量 FedAvg 的掉点。论文主对照仍是 BASE-S2-3B。

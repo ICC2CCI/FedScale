@@ -2,13 +2,13 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-21（MODEL-7B 5 轮冒烟 done `202609210952` R5 eval=1.014；20 轮已开）
+- **更新**：2026-09-21（MODEL-7B 20 轮 done `202609211137` R20 eval=0.766）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
   - [生产切片 DATA/SCALE](../completed/2026-09-11-dual-cluster-to-production.md)（DATA-1 切分脚本已有；DATA-2 共享 eval 仍是现状）
   - [SecAgg 时间效率](../completed/2026-09-18-secagg-time-efficiency.md)（0.5B 墙钟标尺）
-  - 当前 IID 基线：无 SecAgg `20260914-final-clean`；0.5B SecAgg `202609180941` / `202609181406`；3B SecAgg `202609201530`；7B 5 轮 `202609210952`
+  - 当前 IID 基线：无 SecAgg `20260914-final-clean`；0.5B SecAgg `202609180941` / `202609181406`；3B SecAgg `202609201530`；7B SecAgg `202609211137` R20 eval=0.766
   - [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)
   - [Non-IID 相关工作调研](../../algorithm/2026-09-18-non-iid-related-work.md)
 
@@ -61,13 +61,13 @@
 | MODEL-3B | P1 | **done** | Qwen2.5-3B 医学 IID + SecAgg 20 轮 `202609201530` R20 eval=**0.880** | — |
 | **BASE-S2-3B** | **P1** | **todo** | 双 ICC **S2 全量 FedAvg**：3B 医学 IID，20 轮，`compressor=dense`，**无 SecAgg**；与 `202609201530` 比 eval / 墙钟 / 上行 MiB | MODEL-3B |
 | BASE-S2-0.5B | P2 | todo | 同上，0.5B 双集群（旧单机 S2 eval≈1.01 栈不同，不能当主表） | — |
-| MODEL-7B | P2 | **doing** | Qwen2.5-7B 医学 IID + SecAgg：5 轮冒烟 **done** `202609210952` R5 eval=**1.014**（batch=1，QK fp32）；**20 轮进行中** | MODEL-3B |
-| SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB；7B 5 轮已跑完（上行 ~1.46 GiB/轮），SCALE-1 流式仍未做 | MODEL-3B |
+| MODEL-7B | P2 | **done** | Qwen2.5-7B 医学 IID + SecAgg 20 轮 `202609211137` R20 eval=**0.766**（batch=1，QK fp32）；5 轮冒烟 `202609210952` | MODEL-3B |
+| SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB；7B 20 轮已跑完（上行 ~1.46 GiB/轮），SCALE-1 流式仍未做 | MODEL-3B |
 | ABL-MASK | P2 | todo | 明文短跑：公开随机 block vs 私有 Top-k（论证 Top-k 不能 SecAgg；不必上 3B） | — |
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
 
-建议落地顺序：**MODEL-7B 20 轮（进行中）→ BASE-S2-3B（论文主对照）→（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1 跨机构、QUANT-8 仍后置。不要和跨域同一周叠。
+建议落地顺序：**BASE-S2-3B（论文主对照）→（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1 跨机构、QUANT-8 仍后置。不要和跨域同一周叠。
 
 ---
 
@@ -159,7 +159,7 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 
 V100 上 7B 必须 **QK matmul fp32**（fp16 会 nan；全 fp32 OOM），见 [算法笔记](../../algorithm/2026-09-21-v100-7b-qk-fp32.md)。不要用 `202609201834` 的 nan 数字。
 
-20 轮：`configs/s3r12v3-fsdp-medical-7b-secagg-20r.yaml`，按 5 轮墙钟约 **6–7 小时**。coverage 保持 10%。**论文主对照仍是 BASE-S2-3B**；7B 20 轮是「该模型自己的 SecAgg 尺子」，还没有 7B 的 S2 dense。
+20 轮 **已完成**：`results/202609211137`，R20 eval=**0.766**、train 2.58→0.68，墙钟约 6.3 小时。coverage 保持 10%。**论文主对照仍是 BASE-S2-3B**；7B 20 轮是「该模型自己的 SecAgg 尺子」，还没有 7B 的 S2 dense。
 
 ### 3.4 传输量化（QUANT-8 / QUANT-4）— 大模型带宽杠杆，不是现在的加速
 
