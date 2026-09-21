@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-21（MODEL-7B 20 轮 done `202609211137` R20 eval=0.766）
+- **更新**：2026-09-21（STAGE-PT 定为后续 TODO；BASE-S2-3B 进行中）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -59,15 +59,16 @@
 | DATA-D4 | P1 | **done** | 同上 + SecAgg 20 轮：IID `202609201002` R20 eval=2.058；Dirichlet `202609201052` R20 eval=2.062 | DATA-D3 |
 | DATA-C1 | P2 | todo | **后置**：ICC1 闪卡 + ICC2 Dolly（跨机构）；每端 hold-out 分开记 | DATA-D3 |
 | MODEL-3B | P1 | **done** | Qwen2.5-3B 医学 IID + SecAgg 20 轮 `202609201530` R20 eval=**0.880** | — |
-| **BASE-S2-3B** | **P1** | **todo** | 双 ICC **S2 全量 FedAvg**：3B 医学 IID，20 轮，`compressor=dense`，**无 SecAgg**；与 `202609201530` 比 eval / 墙钟 / 上行 MiB | MODEL-3B |
+| **BASE-S2-3B** | **P1** | **doing** | 双 ICC **S2 全量 FedAvg**：3B 医学 IID，20 轮，`compressor=dense`，**无 SecAgg**；yaml `s3r12v3-fsdp-medical-3b-s2-dense.yaml`；与 `202609201530` 比 eval / 墙钟 / 上行 MiB | MODEL-3B |
 | BASE-S2-0.5B | P2 | todo | 同上，0.5B 双集群（旧单机 S2 eval≈1.01 栈不同，不能当主表） | — |
 | MODEL-7B | P2 | **done** | Qwen2.5-7B 医学 IID + SecAgg 20 轮 `202609211137` R20 eval=**0.766**（batch=1，QK fp32）；5 轮冒烟 `202609210952` | MODEL-3B |
 | SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB；7B 20 轮已跑完（上行 ~1.46 GiB/轮），SCALE-1 流式仍未做 | MODEL-3B |
 | ABL-MASK | P2 | todo | 明文短跑：公开随机 block vs 私有 Top-k（论证 Top-k 不能 SecAgg；不必上 3B） | — |
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
+| **STAGE-PT** | **P2** | **todo（后续）** | 联邦 **续预训练**（数据不出域、把私有语料写成知识）。当前主线仍是全参 SFT；**先不占 GPU**。数字不进 SFT 主表 | BASE-S2-3B |
 
-建议落地顺序：**BASE-S2-3B（论文主对照）→（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1 跨机构、QUANT-8 仍后置。不要和跨域同一周叠。
+建议落地顺序：**BASE-S2-3B（论文主对照）→（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1、QUANT-8、**STAGE-PT 预训练** 仍是后续 TODO，本周不排。不要和跨域、预训练同一周叠。
 
 ---
 
@@ -174,6 +175,22 @@ V100 上 7B 必须 **QK matmul fp32**（fp16 会 nan；全 fp32 OOM），见 [�
 顺序：**3B/7B 先用现有 INT16 跑通 → 体积/MinIO 真吃紧 → 先考虑再降 `coverage_h` → 再 QUANT-8 对照 eval**。INT8 目标是 7B 每端从 ~2 GB 量级减半，验收仍是「该模型自己的 INT16 基线同量级」，不是沿用 0.5B 的 0.985。
 
 不要和跨域同一周叠：eval 变差时分不清是 Non-IID 还是量化。
+
+### 3.5 STAGE-PT：联邦预训练（后续 TODO，当前不排）
+
+场景上有必要：联邦「数据不出域」时，各家真正出不去的往往是未标注长文本；**续预训练**才是把私有语料写成权重里的知识。当前闪卡 / Dolly 全参 SFT 主要是教指令格式，**不要把 0.880 写成「联邦增加了医学知识」**。
+
+落地仍是 **后续**，不和 BASE-S2-3B 抢 GPU。优先 **base 上续预训练**，不要从随机初始化训 3B/7B。
+
+| | 现在（SFT，主线） | 以后（STAGE-PT） |
+|---|---|---|
+| 起点 | 公开 Qwen2.5 base | 同一 base 上接着训领域语料 |
+| 数据 | 指令对（闪卡、Dolly） | 预训练语料（需另选、另切；原文不出门） |
+| 目标 | 指令格式下的 next-token | 文档级 next-token |
+| eval | 同域 hold-out CE | 另定 perplexity / 下游探针；不进 SFT 主表 |
+| 通信 / SecAgg | 当前协议 | 可复用，不特化 |
+
+**BASE-S2-3B 跑完、语料未定之前不要开。**
 
 ---
 
