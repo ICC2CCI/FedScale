@@ -32,7 +32,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | 下一枪 BASE-S2-3B；然后 7B / DATA-C1 |
+| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | 7B 5 轮 done，20 轮进行中；S2 仍缺 |
 
 ## completed
 

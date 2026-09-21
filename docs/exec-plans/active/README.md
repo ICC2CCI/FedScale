@@ -6,7 +6,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 下一枪 BASE-S2-3B；然后 7B / DATA-C1 |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 7B 5 轮 done，20 轮进行中；S2 仍缺 |
 
 已归档：
 
@@ -20,3 +20,5 @@
 - [SecAgg 量化优化调研](../../algorithm/2026-09-17-secagg-quantization-optimization-survey.md)（精度 `202609180941`；时间 5 轮 `202609181151` / 20 轮 `202609181406`）
 - [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)
 - [3B 医学 SecAgg](../../experiment-records/2026-09-20-qwen25-3b-medical-secagg.md)
+- [7B 医学 SecAgg](../../experiment-records/2026-09-21-qwen25-7b-medical-secagg.md)
+- [V100 7B QK fp32](../../algorithm/2026-09-21-v100-7b-qk-fp32.md)
