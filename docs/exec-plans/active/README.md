@@ -6,7 +6,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 7B 20 轮 done；下一枪 BASE-S2-3B |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 3B 全量 S2 `202609221148` eval=0.790 已完成。剩余见正文看板：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT、ABL-MDEC |
 
 已归档：
 
