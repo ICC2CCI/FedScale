@@ -25,10 +25,13 @@ logger = logging.getLogger("minio_client")
 # 16MiB part：单 part 在 GbE 上应秒级完成；卡住时由短 read timeout 触发失败
 _MULTIPART_THRESHOLD = 16 * 1024 * 1024
 _PART_SIZE = 16 * 1024 * 1024
-# 单 HTTP 请求（含单个 part）读超时；假死时不必等几百秒
-_DEFAULT_READ_TIMEOUT_S = 45.0
-# 整对象一次 attempt 的墙钟上限（正常 ~250MiB 上传 <10s）
+# 单 HTTP 请求读超时。45s 在全量 ~6.5GiB PUT 上会把慢 ACK 当成断连
+# （BASE-S2-3B Round 6：约 5 分钟 RemoteDisconnected，重试耗尽后整轮退出）。
+_DEFAULT_READ_TIMEOUT_S = 180.0
+# 整对象一次 attempt 的墙钟上限（小对象）。大对象另按体积放宽。
 _DEFAULT_ATTEMPT_TIMEOUT_S = 90.0
+# 超过该体积则分段 PUT 再 compose 成原 key，避免一条连接扛数 GiB。
+_CHUNK_PUT_BYTES = 128 * 1024 * 1024
 
 
 class MinIOClient:
@@ -200,10 +203,64 @@ class MinIOClient:
             self.client.put_object(**self._put_object_kwargs(key, io.BytesIO(data), len(data), content_type))
 
         # 正常路径按 5 MiB/s 估；假死由短 read timeout / 硬超时打断
-        size_timeout = max(self.attempt_timeout_s, (len(data) / (5 * 1024 * 1024)) + 30.0)
-        self._retry(f"put_bytes:{key}", _do, attempt_timeout_s=size_timeout)
+        self._retry(f"put_bytes:{key}", _do, attempt_timeout_s=self._size_timeout_s(len(data)))
+
+    def _put_file(self, key: str, path: str, size: int) -> None:
+        """上传本地文件。大于 128MiB 时分段 PUT，再 compose 成同一个 key。"""
+        if size <= _CHUNK_PUT_BYTES:
+            def _do() -> None:
+                with open(path, "rb") as f:
+                    self.client.put_object(**self._put_object_kwargs(key, f, size))
+
+            self._retry(f"put_torch:{key}", _do, attempt_timeout_s=self._size_timeout_s(size))
+            return
+
+        n_parts = (size + _CHUNK_PUT_BYTES - 1) // _CHUNK_PUT_BYTES
+        part_keys: list[str] = []
+        logger.info(
+            "chunked put %s size=%.1fMiB parts=%s",
+            key, size / (1024 * 1024), n_parts,
+        )
+        try:
+            with open(path, "rb") as f:
+                for i in range(n_parts):
+                    chunk = f.read(_CHUNK_PUT_BYTES)
+                    if not chunk:
+                        break
+                    part_key = f"{key}.part-{i:04d}"
+                    self.put_bytes(part_key, chunk)
+                    part_keys.append(part_key)
+            from minio.commonconfig import ComposeSource
+
+            sources = [ComposeSource(self.bucket, pk) for pk in part_keys]
+
+            def _compose() -> None:
+                self.client.compose_object(self.bucket, key, sources)
+
+            self._retry(f"compose:{key}", _compose, attempt_timeout_s=180.0)
+        finally:
+            for pk in part_keys:
+                try:
+                    self.client.remove_object(self.bucket, pk)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("remove chunk %s failed: %s", pk, exc)
+
+    def _size_timeout_s(self, size_bytes: int) -> float:
+        """按体积估 attempt 硬超时（与 put 一致：约 5 MiB/s + 30s 余量）。
+
+        dense 全量 delta / global_state 可达数 GiB；默认 90s 只够小对象，
+        不按 size 放宽会在 get 中途被硬超时掐死（BASE-S2-3B R1 复现）。
+        """
+        size = max(0, int(size_bytes))
+        return max(self.attempt_timeout_s, (size / (5 * 1024 * 1024)) + 30.0)
 
     def get_bytes(self, key: str) -> bytes:
+        size_timeout = self.attempt_timeout_s
+        try:
+            size_timeout = self._size_timeout_s(self.object_size(key))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stat before get_bytes:%s failed (%s); using default timeout", key, exc)
+
         def _do() -> bytes:
             resp = self.client.get_object(self.bucket, key)
             try:
@@ -212,7 +269,7 @@ class MinIOClient:
                 resp.close()
                 resp.release_conn()
 
-        return self._retry(f"get_bytes:{key}", _do)
+        return self._retry(f"get_bytes:{key}", _do, attempt_timeout_s=size_timeout)
 
     def exists(self, key: str) -> bool:
         try:
@@ -249,13 +306,7 @@ class MinIOClient:
         try:
             torch.save(obj, path)
             size = os.path.getsize(path)
-            size_timeout = max(self.attempt_timeout_s, (size / (5 * 1024 * 1024)) + 30.0)
-
-            def _do() -> None:
-                with open(path, "rb") as f:
-                    self.client.put_object(**self._put_object_kwargs(key, f, size))
-
-            self._retry(f"put_torch:{key}", _do, attempt_timeout_s=size_timeout)
+            self._put_file(key, path, size)
             return int(size)
         finally:
             Path(path).unlink(missing_ok=True)
