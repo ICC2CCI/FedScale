@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-21（STAGE-PT 定为后续 TODO；BASE-S2-3B 进行中）
+- **更新**：2026-09-22（BASE-S2-3B done `202609221148` R20 eval=0.790；ABL-MDEC 后续扫 memory_decay）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -59,7 +59,7 @@
 | DATA-D4 | P1 | **done** | 同上 + SecAgg 20 轮：IID `202609201002` R20 eval=2.058；Dirichlet `202609201052` R20 eval=2.062 | DATA-D3 |
 | DATA-C1 | P2 | todo | **后置**：ICC1 闪卡 + ICC2 Dolly（跨机构）；每端 hold-out 分开记 | DATA-D3 |
 | MODEL-3B | P1 | **done** | Qwen2.5-3B 医学 IID + SecAgg 20 轮 `202609201530` R20 eval=**0.880** | — |
-| **BASE-S2-3B** | **P1** | **doing** | 双 ICC **S2 全量 FedAvg**：3B 医学 IID，20 轮，`compressor=dense`，**无 SecAgg**；yaml `s3r12v3-fsdp-medical-3b-s2-dense.yaml`；与 `202609201530` 比 eval / 墙钟 / 上行 MiB | MODEL-3B |
+| **BASE-S2-3B** | **P1** | **done** | 双 ICC **S2 全量 FedAvg** `202609221148` R20 eval=**0.790**，每端上行 6481 MiB；对照 10%+SecAgg `202609201530` eval=0.880 | MODEL-3B |
 | BASE-S2-0.5B | P2 | todo | 同上，0.5B 双集群（旧单机 S2 eval≈1.01 栈不同，不能当主表） | — |
 | MODEL-7B | P2 | **done** | Qwen2.5-7B 医学 IID + SecAgg 20 轮 `202609211137` R20 eval=**0.766**（batch=1，QK fp32）；5 轮冒烟 `202609210952` | MODEL-3B |
 | SCALE-MEM | P1 | **partial** | 3B Central RSS ~13 GiB；7B 20 轮已跑完（上行 ~1.46 GiB/轮），SCALE-1 流式仍未做 | MODEL-3B |
@@ -67,8 +67,9 @@
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
 | **STAGE-PT** | **P2** | **todo（后续）** | 联邦 **续预训练**（数据不出域、把私有语料写成知识）。当前主线仍是全参 SFT；**先不占 GPU**。数字不进 SFT 主表 | BASE-S2-3B |
+| **ABL-MDEC** | **P2** | **todo（后续）** | 扫 **`memory_decay` ∈ {0, 0.2, 0.5, 0.7, 0.9, 1.0}**。只改这一个数；0.9 已有，不必重跑。看 R20 eval 相对全量 S2 | BASE-S2-3B |
 
-建议落地顺序：**BASE-S2-3B（论文主对照）→（有余力）BASE-S2-0.5B / ABL-MASK**。DATA-C1、QUANT-8、**STAGE-PT 预训练** 仍是后续 TODO，本周不排。不要和跨域、预训练同一周叠。
+建议落地顺序：**BASE-S2-3B 已完成**。有余力再做 BASE-S2-0.5B / ABL-MASK。DATA-C1、QUANT-8、**STAGE-PT**、**ABL-MDEC** 仍是后续 TODO，本周不排。不要和跨域、预训练同一周叠。
 
 ---
 
@@ -190,7 +191,22 @@ V100 上 7B 必须 **QK matmul fp32**（fp16 会 nan；全 fp32 OOM），见 [�
 | eval | 同域 hold-out CE | 另定 perplexity / 下游探针；不进 SFT 主表 |
 | 通信 / SecAgg | 当前协议 | 可复用，不特化 |
 
-**BASE-S2-3B 跑完、语料未定之前不要开。**
+**语料未定之前不要开。**
+
+### 3.6 ABL-MDEC：`memory_decay` 扫描（后续 TODO，当前不排）
+
+以前没扫过。仓库里所有 yaml 都是 **`memory_decay: 0.9`**，包括 0.5B 比例消融、Dolly、3B/7B SecAgg 和这次 S2。设成 1 的是 **`quant_residual_decay`**，不是这个系数。
+
+后面只动未选中 block 的残差衰减，其余与 10% 公开 mask 对齐（建议 0.5B 医学或 Dolly，不必上 3B）：
+
+| 取值 | 含义 |
+|---|---|
+| 0 | 没传出去的更新直接丢掉 |
+| 0.2 / 0.5 / 0.7 | 残差很快忘掉 |
+| **0.9** | 现有全部实验，**已有数字，不必重跑** |
+| 1.0 | 残差原样留到该 block 被选中（标准 error-feedback） |
+
+验收：同一份 eval，报各取值的 R20 eval，并和全量 S2 比。dense 上这个系数不起作用，扫描必须走 **稀疏 mask**，不要用 `compressor=dense`。
 
 ---
 
