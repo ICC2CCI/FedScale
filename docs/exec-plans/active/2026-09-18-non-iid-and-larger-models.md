@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-22（BASE-S2-3B done `202609221148` R20 eval=0.790；ABL-MDEC 后续扫 memory_decay）
+- **更新**：2026-09-22（正文与看板对齐：BASE-S2-3B `202609221148` R20 eval=0.790；7B SecAgg 已实跑；ABL-MDEC 后续扫 memory_decay）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -107,22 +107,22 @@ ICC1 继续医学闪卡，ICC2 用已转换的 Dolly。领域不同，eval **必
 
 家族继续 **Qwen2.5 base**（不要第一枪换 Instruct / 换 Llama，tokenizer 和 `Qwen2DecoderLayer` wrap 能少改）。
 
-两端各 8×V100 32GB；`run_s3r12v3_fsdp.py` 已开 `gradient_checkpointing`。部署文档估算 7B + batch 4 + seq 512 ≈ 19GB/卡，**纸面够，但没实跑**。
+两端各 8×V100 32GB；`run_s3r12v3_fsdp.py` 已开 `gradient_checkpointing`。7B **已实跑**（`batch=1`，QK matmul fp32）；部署文档里 batch=4 + seq 512 的显存估算没有拿来开跑。
 
 ### 3.1 规模会放大什么（0.5B 标尺 × 倍数）
 
 当前 SecAgg 约 coverage 10%：上传 ~140 MiB，~269 window，全量 `global_state` ~0.9 GB。
 
-| | 0.5B（已跑） | 3B（已跑 `202609201530`） | 7B（约 ×14） |
+| | 0.5B（已跑） | 3B（已跑 `202609201530`） | 7B（已跑 `202609211137`） |
 |---|---|---|---|
-| 每端上行 INT16 ~10% | ~0.14 GB | **~0.62–0.66 GB** | ~2 GB 量级 |
-| window 数（同 `block_size`） | ~269 | **840**（不是纸面 1.6k） | 待实跑 |
-| Central 全量 fp32 / RSS | ~1 GB | 全量 ~6 GB；聚合 RSS **~13 GiB** | ~14 GB 量级 |
-| 20 轮 MinIO（含偶发全量） | 可接受 | 每轮仍写全量 ~5.9 GiB，需盯盘 | 必须 `write_full_global_every_n_rounds` |
+| 每端上行 INT16 ~10% | ~0.14 GB | **~0.62–0.66 GB** | **~1.46 GB** |
+| window 数（同 `block_size`） | ~269 | **840**（不是纸面 1.6k） | **1609** |
+| Central 全量 fp32 / RSS | ~1 GB | 全量 ~6 GB；聚合 RSS **~13 GiB** | 20 轮已跑完；SCALE-1 流式仍未做 |
+| 20 轮 MinIO（含偶发全量） | 可接受 | SecAgg 每轮仍写全量 ~5.9 GiB | 已跑完（上行 ~1.46 GiB/轮） |
 
-P0/P1 单 blob / 并行 unmask **不跟模型名走**，window 变多时请求次数仍应是 O(1) PUT；墙钟会跟 **计算 + 带宽** 涨。Central **没有 GPU**，unmask 仍在 CPU；3B unmask ~19s（0.5B ~6s），7B 会更长。
+P0/P1 单 blob / 并行 unmask **不跟模型名走**，window 变多时请求次数仍应是 O(1) PUT；墙钟会跟 **计算 + 带宽** 涨。Central **没有 GPU**，unmask 仍在 CPU；3B unmask ~19s（0.5B ~6s）。7B 20 轮已跑完，unmask 仍在 CPU。
 
-SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13 GiB 可接受；7B 峰值顶满再改 `apply_block_delta`。Client 侧 8×整模 broadcast 已在 3B 上根治，见 [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)。
+SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13 GiB 可接受；7B 20 轮已跑完，流式仍是 SCALE-MEM 的剩余项。Client 侧 8×整模 broadcast 已在 3B 上根治，见 [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)。
 
 ### 3.2 MODEL-3B（done）
 
@@ -130,13 +130,13 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 
 1. 两端下载 `Qwen/Qwen2.5-3B`；MinIO round-0 **必须重新 bootstrap**（0.5B 的 `state.pt` 不能用）
 2. wrap 仍 `Qwen2DecoderLayer`；`batch_size=4`、`seq_len=512`（batch=8 预计 OOM）
-3. 数据保持 medical IID；**直接完整 SecAgg 20 轮**，无 SecAgg 未跑
+3. 数据保持 medical IID；**SecAgg 20 轮已跑完**。同栈全量 FedAvg 见 §3.2b
 4. `client_upload_timeout_s=3600`；eval 每 5 轮
 5. Client 同步：完整 state 只留 rank0，按 FSDP unit scatter；禁止 `broadcast_object` 整模（第一枪 R2 8×全量 OOM，已修）
 
 数字：R20 eval=**0.880**，稳态整轮 ~385 s。不要和 0.5B 的 0.985 比。yaml 里 `scale3_sharded_extract` 只是旗标，**runner 未接线**，加载走 scatter-load。
 
-论文主表还缺同栈 **S2**（见 §3.2b）：现在的 0.880 只能说「3B 能收敛」，不能说「相对全量 FedAvg 掉多少」。
+同栈 **S2** 已有（§3.2b，`202609221148` R20 eval=**0.790**）。0.880 是 10%+SecAgg，对照全量 FedAvg 的 0.790。
 
 ### 3.2b BASE-S2：双 ICC 全量 FedAvg（论文主对照）
 
@@ -151,9 +151,9 @@ SCALE-1 的「流式、不整模常驻」**并未做到**。3B Central RSS ~13�
 
 验收：同一份 `medical_flashcards_eval.json` 画曲线；报 R20 eval、平均整轮墙钟、每端 `upload_blocks_MiB`。成功 = 10%+SecAgg 与该 S2 **同量级** eval，体积约 **1/10**。
 
-0.5B 双集群同样缺这条（现有对照是「同 10% 有/无 SecAgg」）。有余力再跑 BASE-S2-0.5B；**不要**拿 2026-09-02 单机模拟 S2（eval≈1.01）填主表。
+**3B 已完成**：`configs/s3r12v3-fsdp-medical-3b-s2-dense.yaml`，`results/202609221148`。R20 eval=**0.790**，每端上行 6481 MiB，平均整轮约 1006 s。对照 10%+SecAgg `202609201530`：eval 0.880、约 650 MiB/端、约 385 s/轮。体积约 10 倍，墙钟约 3 倍，eval 更好。
 
-已有 yaml 骨架：`configs/s3r12v3-fsdp-eval-20round-dense.yaml`（0.5B、10 轮）。3B 应对齐 `s3r12v3-fsdp-medical-3b-secagg.yaml` 再改 dense、关 SecAgg。
+0.5B 双集群同样缺这条（现有对照是「同 10% 有/无 SecAgg」）。有余力再跑 BASE-S2-0.5B；**不要**拿 2026-09-02 单机模拟 S2（eval≈1.01）填主表。0.5B dense 骨架仍是 `configs/s3r12v3-fsdp-eval-20round-dense.yaml`（10 轮），还没在双 ICC 上跑。
 
 ### 3.3 MODEL-7B
 
