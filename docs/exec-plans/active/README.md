@@ -6,7 +6,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | 3B 全量 S2 `202609221148` eval=0.790 已完成。剩余见正文看板：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT、ABL-MDEC |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC done（默认 `memory_decay=1.0`）。剩余：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT |
 
 已归档：
 
@@ -21,4 +21,5 @@
 - [FSDP scatter-load](../../algorithm/2026-09-20-fsdp-scatter-load.md)
 - [3B 医学 SecAgg](../../experiment-records/2026-09-20-qwen25-3b-medical-secagg.md)
 - [7B 医学 SecAgg](../../experiment-records/2026-09-21-qwen25-7b-medical-secagg.md)
+- [ABL-MDEC memory_decay](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md)
 - [V100 7B QK fp32](../../algorithm/2026-09-21-v100-7b-qk-fp32.md)

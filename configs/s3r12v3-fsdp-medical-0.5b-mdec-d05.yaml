@@ -1,28 +1,29 @@
-# BASE-S2-3B：医学闪卡 IID，Qwen2.5-3B，双 ICC 全量 FedAvg（论文主对照）
-# 相对 s3r12v3-fsdp-medical-3b-secagg.yaml 只改：compressor=dense、coverage_h=1、关 SecAgg。
-# 对照 run：202609201530（10% public_random + Windowed SecAgg）。
+# ABL-MDEC：0.5B 医学 IID + 10% 公开 mask + Windowed SecAgg
+# 只改 memory_decay；其余对齐 202609181406（R20 eval≈0.985，decay=0.9，不必重跑）
+# memory_decay: 0.5 = 残差中等忘掉
+#
 # 用法：
-#   AGGREGATION_PORT_OVERRIDE=8081 NODES_FILE=/tmp/nodes-medical-3b.yaml \
-#     RUN_CONFIG=configs/s3r12v3-fsdp-medical-3b-s2-dense.yaml TAG=medical-3b-s2-dense-20r \
+#   AGGREGATION_PORT_OVERRIDE=8081 NODES_FILE=/tmp/nodes-medical-0.5b.yaml \
+#     RUN_CONFIG=configs/s3r12v3-fsdp-medical-0.5b-mdec-d05.yaml TAG=medical-0.5b-mdec-d05 \
 #     bash scripts/start_s3r12v3_fsdp_run.sh
 
 federated:
   num_clients: 2
   num_rounds: 20
-  coverage_h: 1
+  coverage_h: 10
   slots_per_round: 1
   seed: 20260831
   transfer_dtype: fp16
-  memory_decay: 1.0
+  memory_decay: 0.5
   quant_residual_decay: 1.0
   block_size: 524288
-  compressor: dense
+  compressor: public_random
   rho: 0.0
   always_on_threshold: 4096
 
 train:
   local_steps: 30
-  batch_size: 4
+  batch_size: 8
   grad_accum: 2
   lr: 1.0e-5
   seq_len: 512
@@ -30,8 +31,8 @@ train:
 io:
   skip_round0_download: true
   online_eval: true
-  write_full_global_every_n_rounds: 5
-  client_upload_timeout_s: 7200
+  write_full_global_every_n_rounds: 1
+  client_upload_timeout_s: 1800
 
 eval:
   eval_path: data/medical_flashcards_eval.json
@@ -46,16 +47,16 @@ security:
   auth_token: ""
   tls: false
   sec_upload_privacy: false
-  secagg_enabled: false
+  secagg_enabled: true
   secagg_modulus_bits: 16
   secagg_scale: 0.0
   secagg_stochastic_rounding: true
   secagg_q_min: 0
-  secagg_hadamard: false
+  secagg_hadamard: true
 
 scale:
   scale1_no_resident_global: false
-  scale3_sharded_extract: true
+  scale3_sharded_extract: false
 
 resume:
   resume_from_round: 0

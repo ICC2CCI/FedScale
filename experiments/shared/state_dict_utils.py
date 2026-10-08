@@ -238,7 +238,7 @@ def get_sharded_block_delta(
     selected_by_key: Dict[str, List[Tuple[int, int]]],
     *,
     transfer_dtype: Optional[torch.dtype] = None,
-    memory_decay: float = 0.9,
+    memory_decay: float = 1.0,
     is_main: bool = True,
 ) -> Tuple[Dict[str, List[Tuple]], Dict[str, torch.Tensor]]:
     """SCALE-3：逐 FSDP unit unshard，提取选中 block 的 delta，不 gather 完整 state。

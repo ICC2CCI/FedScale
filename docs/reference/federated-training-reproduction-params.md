@@ -319,7 +319,7 @@ permutation = FisherYates(n_blocks, PRG=Random(int.from_bytes(group_seed, "big")
 | 参数 | 值 |
 |---|---|
 | memory | 有（error feedback，累积未上传的 delta） |
-| memory_decay | 0.9 |
+| memory_decay | 1.0（ABL-MDEC 后默认；见 `2026-10-08-abl-mdec-memory-decay`） |
 | memory 更新方式 | block 级 |
 | 已上传 block | memory 清零（`flat[start:end] = 0`） |
 | 未上传 block | memory 保留 delta + 旧 memory |

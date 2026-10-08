@@ -15,7 +15,7 @@ federated:
   slots_per_round: 1     # 预留；P0 先写 1，ALG-2 再实现 >1（如 40%=H5×2slot）
   seed: 20260831
   transfer_dtype: fp16
-  memory_decay: 0.9
+  memory_decay: 1.0
   block_size: 524288
   compressor: public_random   # 默认 S3R12v3 公开 mask；dense=全量对照
   rho: 0.0                    # 保留字段；public_random 不使用

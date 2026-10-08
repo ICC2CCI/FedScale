@@ -14,7 +14,7 @@ federated:
   slots_per_round: 1
   seed: 20260831
   transfer_dtype: fp16
-  memory_decay: 0.9
+  memory_decay: 1.0
   quant_residual_decay: 1.0
   block_size: 524288
   compressor: public_random

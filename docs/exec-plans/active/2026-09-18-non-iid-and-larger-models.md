@@ -2,7 +2,7 @@
 
 - **状态**：active
 - **创建**：2026-09-18
-- **更新**：2026-09-22（正文与看板对齐：BASE-S2-3B `202609221148` R20 eval=0.790；7B SecAgg 已实跑；ABL-MDEC 后续扫 memory_decay）
+- **更新**：2026-10-08（ABL-MDEC **done**：同栈扫后默认 `memory_decay=1.0`；记录 [ABL-MDEC](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md)）
 - **不改**：Hadamard + INT16 + Issue #1 量化语义；S3R12v3 `public_random` mask；SecAgg 协议不按模型名特化
 - **关联**：
   - [当前联调流程](../../algorithm/2026-09-10-dual-cluster-s3r12v3-fsdp-current-flow.md)
@@ -67,9 +67,9 @@
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
 | **STAGE-PT** | **P2** | **todo（后续）** | 联邦 **续预训练**（数据不出域、把私有语料写成知识）。当前主线仍是全参 SFT；**先不占 GPU**。数字不进 SFT 主表 | BASE-S2-3B |
-| **ABL-MDEC** | **P2** | **todo（后续）** | 扫 **`memory_decay` ∈ {0, 0.2, 0.5, 0.7, 0.9, 1.0}**。只改这一个数；0.9 已有，不必重跑。看 R20 eval 相对全量 S2 | BASE-S2-3B |
+| **ABL-MDEC** | **P2** | **done** | 0.5B 同栈扫：R20 eval `0`=1.133 / `0.5`=1.041 / `0.9`=`202610081442`=0.962 / `1.0`=`202610081136`=**0.953**。默认改为 **1.0**。记录 [ABL-MDEC](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md) | BASE-S2-3B |
 
-建议落地顺序：**BASE-S2-3B 已完成**。有余力再做 BASE-S2-0.5B / ABL-MASK。DATA-C1、QUANT-8、**STAGE-PT**、**ABL-MDEC** 仍是后续 TODO，本周不排。不要和跨域、预训练同一周叠。
+建议落地顺序：**BASE-S2-3B / ABL-MDEC 已完成**。有余力再做 BASE-S2-0.5B / ABL-MASK。DATA-C1、QUANT-8、**STAGE-PT** 仍是后续 TODO。不要和跨域、预训练同一周叠。
 
 ---
 
@@ -193,20 +193,22 @@ V100 上 7B 必须 **QK matmul fp32**（fp16 会 nan；全 fp32 OOM），见 [�
 
 **语料未定之前不要开。**
 
-### 3.6 ABL-MDEC：`memory_decay` 扫描（后续 TODO，当前不排）
+### 3.6 ABL-MDEC：`memory_decay` 扫描（**done**）
 
-以前没扫过。仓库里所有 yaml 都是 **`memory_decay: 0.9`**，包括 0.5B 比例消融、Dolly、3B/7B SecAgg 和这次 S2。设成 1 的是 **`quant_residual_decay`**，不是这个系数。
+只动未选中 block 的 `block_memory` 衰减；`quant_residual_decay` 一直是 1.0（Issue #1），不是这个系数。dense 上不起作用，必须走稀疏 mask。
 
-后面只动未选中 block 的残差衰减，其余与 10% 公开 mask 对齐（建议 0.5B 医学或 Dolly，不必上 3B）：
+同栈 0.5B 医学 SecAgg（eval 每 5 轮）R20 eval：
 
-| 取值 | 含义 |
-|---|---|
-| 0 | 没传出去的更新直接丢掉 |
-| 0.2 / 0.5 / 0.7 | 残差很快忘掉 |
-| **0.9** | 现有全部实验，**已有数字，不必重跑** |
-| 1.0 | 残差原样留到该 block 被选中（标准 error-feedback） |
+| decay | 跑次 | R20 eval |
+|---|---|---|
+| 0 | `202610081002` | 1.133 |
+| 0.5 | `202610081052` | 1.041 |
+| 0.9 | `202610081442`（同栈重跑） | 0.962 |
+| **1.0** | `202610081136` | **0.953** |
 
-验收：同一份 eval，报各取值的 R20 eval，并和全量 S2 比。dense 上这个系数不起作用，扫描必须走 **稀疏 mask**，不要用 `compressor=dense`。
+跳过 0.2 / 0.7。旧 `202609181406`（0.9，R20≈0.985）不同栈，不作中间轮对照。图与叙述见 [实验记录](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md)。
+
+**落地**：默认 `memory_decay` 改为 **1.0**（`DEFAULT_MEMORY_DECAY` + 生产 yaml）。
 
 ---
 

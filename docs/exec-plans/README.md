@@ -32,7 +32,7 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | 3B 全量 S2 `202609221148` eval=0.790 已完成。剩余见正文看板：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT、ABL-MDEC |
+| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC done（默认 `memory_decay=1.0`）。剩余：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT |
 
 ## completed
 
