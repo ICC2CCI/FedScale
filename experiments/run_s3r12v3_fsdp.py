@@ -102,6 +102,24 @@ def load_json(path: Path) -> Any:
         return json.load(f)
 
 
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def load_rows(path: Path) -> List[Dict[str, Any]]:
+    """JSON 数组或 JSONL；按后缀选择。"""
+    if path.suffix == ".jsonl":
+        return load_jsonl(path)
+    return load_json(path)
+
+
 def to_chat_texts(rows: List[Dict[str, Any]], tokenizer) -> List[str]:
     texts = []
     for r in rows:
@@ -114,6 +132,27 @@ def to_chat_texts(rows: List[Dict[str, Any]], tokenizer) -> List[str]:
             tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         )
     return texts
+
+
+def to_pt_texts(rows: List[Dict[str, Any]]) -> List[str]:
+    """续预训练：只取 text 字段（无 chat template）。"""
+    texts: List[str] = []
+    for r in rows:
+        t = r.get("text")
+        if t is None:
+            raise ValueError("causal_pt row missing 'text' field")
+        texts.append(str(t))
+    return texts
+
+
+def rows_to_texts(
+    rows: List[Dict[str, Any]], tokenizer, objective: str
+) -> List[str]:
+    if objective == "causal_pt":
+        return to_pt_texts(rows)
+    if objective == "sft_chat":
+        return to_chat_texts(rows, tokenizer)
+    raise ValueError(f"unknown train objective: {objective!r} (use sft_chat|causal_pt)")
 
 
 def patch_qwen2_attn_fp32_qk() -> None:
@@ -734,6 +773,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum", type=int, default=DEFAULT_GRAD_ACCUM)
     p.add_argument("--lr", type=float, default=DEFAULT_LR)
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
+    p.add_argument(
+        "--objective",
+        default="sft_chat",
+        choices=["sft_chat", "causal_pt"],
+        help="sft_chat=指令 chat template（默认）；causal_pt=纯文本续预训练",
+    )
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
     p.add_argument(
         "--quant-residual-decay",
@@ -909,10 +954,20 @@ def main() -> None:
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
-    rows = load_json(Path(args.data_path))
-    texts = to_chat_texts(rows, tokenizer)
+    data_file = Path(args.data_path)
+    if not data_file.is_absolute():
+        data_file = REPO_ROOT / data_file
+    rows = load_rows(data_file)
+    texts = rows_to_texts(rows, tokenizer, args.objective)
     dataset = ChatDataset(texts, tokenizer, args.seq_len)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    if is_main:
+        logger.info(
+            "objective=%s train_examples=%s seq_len=%s",
+            args.objective,
+            len(dataset),
+            args.seq_len,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = get_cosine_schedule_with_warmup(
@@ -928,8 +983,8 @@ def main() -> None:
         if not eval_file.is_absolute():
             eval_file = REPO_ROOT / eval_file
         if eval_file.exists():
-            eval_rows = load_json(eval_file)
-            eval_texts = to_chat_texts(eval_rows, tokenizer)
+            eval_rows = load_rows(eval_file)
+            eval_texts = rows_to_texts(eval_rows, tokenizer, args.objective)
             eval_ds = ChatDataset(eval_texts, tokenizer, args.seq_len)
             eval_loader = DataLoader(
                 eval_ds, batch_size=args.batch_size, shuffle=False, drop_last=False
@@ -937,10 +992,11 @@ def main() -> None:
             eval_loader = accelerator.prepare(eval_loader)
             if is_main:
                 logger.info(
-                    "Online eval enabled path=%s examples=%s max_batches=%s",
+                    "Online eval enabled path=%s examples=%s max_batches=%s objective=%s",
                     eval_file,
                     len(eval_ds),
                     args.eval_max_batches,
+                    args.objective,
                 )
         elif is_main:
             logger.warning("Online eval requested but missing %s; disabled", eval_file)

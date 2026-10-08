@@ -38,3 +38,16 @@ python scripts/split_federated_data.py \
 | `dolly-dirichlet-a0.5/` | Dirichlet α=0.5 by category | 6314 | 7196 |
 
 两端 **eval 都用** `data/dolly_15k_eval.json`。类别直方图见各目录 `federated_split_manifest.json`。
+
+## FineWeb-Edu 续预训练（STAGE-PT）
+
+目录：`fineweb-edu-pt/`（`icc1_train.jsonl` / `icc2_train.jsonl` / `eval.jsonl`）。  
+纯文本 `{"text":...}`，**不是**指令对。复现见该目录 `README.md` 与：
+
+```bash
+python scripts/prepare_fineweb_edu_pt.py \
+  --tokenizer-path model/Qwen/Qwen2.5-0.5B \
+  --train-tokens 200000000 --eval-tokens 20000000
+```
+
+计划：`docs/exec-plans/active/2026-10-08-stage-pt-federated-continued-pretrain.md`。

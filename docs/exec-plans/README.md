@@ -32,7 +32,8 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC done（默认 `memory_decay=1.0`）。剩余：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT |
+| [Non-IID + 更大模型](active/2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC / STAGE-PT 阶段一 done。剩余可选：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT、PT 加码 |
+| [STAGE-PT 联邦续预训练](active/2026-10-08-stage-pt-federated-continued-pretrain.md) | 协议已验证（`202610081718`）；加码可选；不进 SFT 主表 |
 
 ## completed
 

@@ -6,7 +6,8 @@
 
 | 计划 | 说明 |
 |---|---|
-| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC done（默认 `memory_decay=1.0`）。剩余：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、STAGE-PT |
+| [Non-IID + 更大模型](2026-09-18-non-iid-and-larger-models.md) | ABL-MDEC / STAGE-PT 阶段一 done。剩余可选：BASE-S2-0.5B、ABL-MASK、DATA-C1、QUANT-8、PT 加码 |
+| [STAGE-PT 联邦续预训练](2026-10-08-stage-pt-federated-continued-pretrain.md) | 协议已验证（`202610081718` eval 2.608）。加码 `local_steps`/语料可选；不进 SFT 主表 |
 
 已归档：
 
@@ -22,4 +23,6 @@
 - [3B 医学 SecAgg](../../experiment-records/2026-09-20-qwen25-3b-medical-secagg.md)
 - [7B 医学 SecAgg](../../experiment-records/2026-09-21-qwen25-7b-medical-secagg.md)
 - [ABL-MDEC memory_decay](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md)
+- [STAGE-PT FineWeb 冒烟](../../experiment-records/2026-10-08-stage-pt-fineweb-0.5b-smoke.md)
+- [STAGE-PT FineWeb R20](../../experiment-records/2026-10-08-stage-pt-fineweb-0.5b-r20.md)
 - [V100 7B QK fp32](../../algorithm/2026-09-21-v100-7b-qk-fp32.md)

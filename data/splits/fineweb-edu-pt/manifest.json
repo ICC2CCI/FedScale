@@ -1,0 +1,27 @@
+{
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "revision": "main",
+  "source": {
+    "mode": "parquet",
+    "files": [
+      "data/cache/fineweb-edu-10bt/000_00000.parquet"
+    ]
+  },
+  "seed": 20260831,
+  "tokenizer_path": null,
+  "token_count_method": "chars/4",
+  "train_tokens_target": 200000000,
+  "eval_tokens_target": 20000000,
+  "stats": {
+    "docs_seen": 185414,
+    "train_docs": 168556,
+    "eval_docs": 16857,
+    "train_tokens": 200000151,
+    "eval_tokens": 20002509,
+    "elapsed_s": 6.6
+  },
+  "icc1_docs": 84278,
+  "icc2_docs": 84278,
+  "hf_endpoint": "https://hf-mirror.com",
+  "created_at": "2026-10-08T16:52:43+0800"
+}

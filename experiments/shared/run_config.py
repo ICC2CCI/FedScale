@@ -42,6 +42,7 @@ RUN_CONFIG_SCHEMA: Dict[str, List[str]] = {
         "grad_accum",
         "lr",
         "seq_len",
+        "objective",
     ],
     "io": [
         "skip_round0_download",

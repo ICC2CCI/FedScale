@@ -57,6 +57,7 @@ BATCH_SIZE="$(yaml_get YCFG_ BATCH_SIZE 8)"
 GRAD_ACCUM="$(yaml_get YCFG_ GRAD_ACCUM 2)"
 LR="$(yaml_get YCFG_ LR 1e-5)"
 SEQ_LEN="$(yaml_get YCFG_ SEQ_LEN 512)"
+OBJECTIVE="$(yaml_get YCFG_ OBJECTIVE sft_chat)"
 WRITE_FULL_EVERY_N="$(yaml_get YCFG_ WRITE_FULL_GLOBAL_EVERY_N_ROUNDS 1)"
 UPLOAD_TIMEOUT_S="$(yaml_get YCFG_ CLIENT_UPLOAD_TIMEOUT_S 1800)"
 EVAL_PATH="$(yaml_get YCFG_ EVAL_PATH data/medical_flashcards_eval.json)"
@@ -350,6 +351,7 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   --grad-accum ${GRAD_ACCUM} \\
   --lr ${LR} \\
   --seq-len ${SEQ_LEN} \\
+  --objective ${OBJECTIVE} \\
   --eval-path ${EVAL_PATH} \\
   --eval-max-batches ${EVAL_MAX_BATCHES} \\
   ${skip_round0_flag} \\

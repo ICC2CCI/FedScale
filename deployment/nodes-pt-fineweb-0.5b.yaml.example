@@ -1,0 +1,31 @@
+# STAGE-PT FineWeb-Edu 0.5B 节点清单（与医学 SFT 的 nodes.yaml 分离）
+# cp deployment/nodes-pt-fineweb-0.5b.yaml.example deployment/nodes-pt-fineweb-0.5b.yaml
+# 修改主机 / 路径；nodes-pt-*.yaml 已 gitignore，勿提交。
+# 启动：NODES_FILE=deployment/nodes-pt-fineweb-0.5b.yaml ...
+
+central:
+  server_url: "http://192.168.235.42:8080"
+  minio_endpoint: "http://192.168.235.42:9000"
+  minio_access_key: "${MINIO_ROOT_USER}"
+  minio_secret_key: "${MINIO_ROOT_PASSWORD}"
+  minio_bucket: "fedscale-bucket"
+  aggregation_port: 8080
+
+clients:
+  - client_id: 0
+    ssh: "pcl@192.168.206.116"
+    repo: "~/liuchao/fedscale-icc-1"
+    conda_env: "flwr-ft"
+    model_path: "model/Qwen/Qwen2.5-0.5B"
+    data_path: "data/splits/fineweb-edu-pt/icc1_train.jsonl"
+    accelerate_config: "configs/accelerate_config.yaml"
+    main_process_port: 29510
+
+  - client_id: 1
+    ssh: "pcl@192.168.205.130"
+    repo: "~/liuchao/fedscale-icc-2"
+    conda_env: "flwr-ft"
+    model_path: "model/Qwen/Qwen2.5-0.5B"
+    data_path: "data/splits/fineweb-edu-pt/icc2_train.jsonl"
+    accelerate_config: "configs/accelerate_config.yaml"
+    main_process_port: 29511
