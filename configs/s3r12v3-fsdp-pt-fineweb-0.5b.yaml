@@ -1,9 +1,12 @@
 # STAGE-PT：0.5B FineWeb-Edu 联邦续预训练（因果 LM，非 SFT）
 # 数字不进闪卡 / Dolly SFT 主表。
 #
+# 本配置 = 完整 PT（阶段二）：packing + local_steps=200 + 500M 语料。
+# 阶段一协议验证（local_steps=30, 无 packing, 200M 语料）见 results/202610081718。
+#
 # 用法：
 #   AGGREGATION_PORT_OVERRIDE=8081 NODES_FILE=deployment/nodes-pt-fineweb-0.5b.yaml \
-#     RUN_CONFIG=configs/s3r12v3-fsdp-pt-fineweb-0.5b.yaml TAG=pt-fineweb-0.5b \
+#     RUN_CONFIG=configs/s3r12v3-fsdp-pt-fineweb-0.5b.yaml TAG=pt-fineweb-0.5b-full \
 #     bash scripts/start_s3r12v3_fsdp_run.sh
 #
 # 冒烟可临时：NUM_ROUNDS_ENV=5
@@ -24,7 +27,8 @@ federated:
 
 train:
   objective: causal_pt
-  local_steps: 30
+  packing: true
+  local_steps: 200
   batch_size: 8
   grad_accum: 2
   lr: 5.0e-6
@@ -34,13 +38,13 @@ io:
   skip_round0_download: true
   online_eval: true
   write_full_global_every_n_rounds: 1
-  client_upload_timeout_s: 1800
+  client_upload_timeout_s: 3600
 
 eval:
   eval_path: data/splits/fineweb-edu-pt/eval.jsonl
-  # 0=全集（~1.7万条，约 2.5min/次）；冒烟可临时改 64
+  # 0=全集（完整 PT 数据 ~4万条 eval，约 6min/次）
   eval_max_batches: 0
-  eval_every_n_rounds: 5
+  eval_every_n_rounds: 2
 
 sync:
   min_clients_to_aggregate: 0

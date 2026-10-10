@@ -58,6 +58,7 @@ GRAD_ACCUM="$(yaml_get YCFG_ GRAD_ACCUM 2)"
 LR="$(yaml_get YCFG_ LR 1e-5)"
 SEQ_LEN="$(yaml_get YCFG_ SEQ_LEN 512)"
 OBJECTIVE="$(yaml_get YCFG_ OBJECTIVE sft_chat)"
+PACKING="$(yaml_get YCFG_ PACKING false)"
 WRITE_FULL_EVERY_N="$(yaml_get YCFG_ WRITE_FULL_GLOBAL_EVERY_N_ROUNDS 1)"
 UPLOAD_TIMEOUT_S="$(yaml_get YCFG_ CLIENT_UPLOAD_TIMEOUT_S 1800)"
 EVAL_PATH="$(yaml_get YCFG_ EVAL_PATH data/medical_flashcards_eval.json)"
@@ -171,6 +172,7 @@ fi
 # 辅助：把 true/false 转成 CLI flag
 skip_round0_flag="--skip-round0-download" ; [[ "$SKIP_ROUND0" == "false" ]] && skip_round0_flag="--no-skip-round0-download"
 online_eval_flag="--online-eval" ; [[ "$ONLINE_EVAL" == "false" ]] && online_eval_flag="--no-online-eval"
+packing_flag="--packing" ; [[ "$PACKING" != "true" ]] && packing_flag="--no-packing"
 auth_flag=""
 [[ -n "$AUTH_TOKEN" ]] && auth_flag="--auth-token ${AUTH_TOKEN}"
 sec_privacy_flag=""
@@ -356,6 +358,7 @@ nohup accelerate launch --config_file ${ACCEL_CFG} --main_process_port ${MPP} \\
   --eval-max-batches ${EVAL_MAX_BATCHES} \\
   ${skip_round0_flag} \\
   ${online_eval_flag} \\
+  ${packing_flag} \\
   ${PER_CLIENT_STEPS_FLAG} \\
   ${AUTH_FLAG} \\
   ${SEC_PRIVACY_FLAG} \\

@@ -253,6 +253,52 @@ class ChatDataset(torch.utils.data.Dataset):
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
+class PackedDataset(torch.utils.data.Dataset):
+    """Packed causal-LM dataset: concatenate all texts with EOS separators,
+    then chunk into fixed ``seq_len`` blocks.
+
+    Unlike ``ChatDataset`` (which pads each document to ``seq_len`` and wastes
+    40-60% of tokens on padding for short documents), this packs multiple
+    documents into each ``seq_len`` block, dramatically improving token
+    density. Only meaningful for ``causal_pt``; SFT should not use packing.
+    """
+
+    def __init__(self, texts: List[str], tokenizer, seq_len: int):
+        self.seq_len = seq_len
+        eos_id = tokenizer.eos_token_id
+
+        all_ids: List[int] = []
+        for t in texts:
+            ids = tokenizer.encode(t, add_special_tokens=False)
+            if eos_id is not None:
+                ids = ids + [eos_id]
+            all_ids.extend(ids)
+
+        self.chunks: List[List[int]] = []
+        for i in range(0, len(all_ids), seq_len):
+            chunk = all_ids[i : i + seq_len]
+            if len(chunk) < seq_len:
+                break
+            self.chunks.append(chunk)
+
+        if not self.chunks and all_ids:
+            last = all_ids[:seq_len]
+            pad_len = seq_len - len(last)
+            if eos_id is not None:
+                last = last + [eos_id] * pad_len
+            self.chunks.append(last)
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ids = self.chunks[idx]
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        labels = input_ids.clone()
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
 def wait_json(url: str, timeout_s: float = 3600.0, interval_s: float = 2.0, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     deadline = time.time() + timeout_s
     last_err: Optional[Exception] = None
@@ -779,6 +825,13 @@ def parse_args() -> argparse.Namespace:
         choices=["sft_chat", "causal_pt"],
         help="sft_chat=指令 chat template（默认）；causal_pt=纯文本续预训练",
     )
+    p.add_argument(
+        "--packing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Packed causal-LM: concatenate docs with EOS then chunk to seq_len (causal_pt only). "
+        "Dramatically improves token density vs per-doc padding.",
+    )
     p.add_argument("--memory-decay", type=float, default=DEFAULT_MEMORY_DECAY)
     p.add_argument(
         "--quant-residual-decay",
@@ -959,14 +1012,19 @@ def main() -> None:
         data_file = REPO_ROOT / data_file
     rows = load_rows(data_file)
     texts = rows_to_texts(rows, tokenizer, args.objective)
-    dataset = ChatDataset(texts, tokenizer, args.seq_len)
+    use_packing = bool(args.packing) and args.objective == "causal_pt"
+    if use_packing:
+        dataset = PackedDataset(texts, tokenizer, args.seq_len)
+    else:
+        dataset = ChatDataset(texts, tokenizer, args.seq_len)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     if is_main:
         logger.info(
-            "objective=%s train_examples=%s seq_len=%s",
+            "objective=%s train_examples=%s seq_len=%s packing=%s",
             args.objective,
             len(dataset),
             args.seq_len,
+            use_packing,
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)

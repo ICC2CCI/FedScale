@@ -5,9 +5,9 @@
 - **source**: `{'mode': 'parquet', 'files': ['data/cache/fineweb-edu-10bt/000_00000.parquet']}`
 - **seed**: `20260831`
 - **token_count**: `chars/4`
-- **train tokens（合计）**: 200,000,151
-- **eval tokens**: 20,002,509
-- **icc1 / icc2 docs**: 84,278 / 84,278
+- **train tokens（合计）**: 500,002,073
+- **eval tokens**: 50,000,521
+- **icc1 / icc2 docs**: 210,401 / 210,402
 - **切法**: 文档级随机 50/50（IID proxy）
 
 | 文件 | 用途 |

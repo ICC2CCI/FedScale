@@ -66,10 +66,10 @@
 | ABL-MASK | P2 | todo | 明文短跑：公开随机 block vs 私有 Top-k（论证 Top-k 不能 SecAgg；不必上 3B） | — |
 | QUANT-8 | P2 | todo | 大模型带宽不够时：SecAgg 传输 INT16 → INT8 对照（保 Hadamard） | MODEL-7B |
 | QUANT-4 | P3 | todo | INT4 / 更低 bit；需单独评估（Kashin 等），不能当 INT16 开关 | QUANT-8 |
-| **STAGE-PT** | **P1** | **阶段一 done** | 协议已验证（`202610081718` R20 eval 2.608）。独立计划：[STAGE-PT](2026-10-08-stage-pt-federated-continued-pretrain.md)。加码 `local_steps`/语料可选；数字不进 SFT 主表 | BASE-S2-3B |
+| **STAGE-PT** | **P1** | **阶段一 done / 阶段二进行中** | 协议已验证（`202610081718` R20 eval 2.608）。独立计划：[STAGE-PT](2026-10-08-stage-pt-federated-continued-pretrain.md)。阶段二：packing + `local_steps=200` + 500M 语料；数字不进 SFT 主表 | BASE-S2-3B |
 | **ABL-MDEC** | **P2** | **done** | 0.5B 同栈扫：R20 eval `0`=1.133 / `0.5`=1.041 / `0.9`=`202610081442`=0.962 / `1.0`=`202610081136`=**0.953**。默认改为 **1.0**。记录 [ABL-MDEC](../../experiment-records/2026-10-08-abl-mdec-memory-decay.md) | BASE-S2-3B |
 
-建议落地顺序：**BASE-S2-3B / ABL-MDEC / STAGE-PT 阶段一（协议）已完成**。STAGE-PT 加码与 BASE-S2-0.5B / ABL-MASK / DATA-C1 / QUANT-8 均后置、按需开。
+建议落地顺序：**BASE-S2-3B / ABL-MDEC / STAGE-PT 阶段一（协议）已完成**。STAGE-PT 阶段二（完整 PT）进行中。BASE-S2-0.5B / ABL-MASK / DATA-C1 / QUANT-8 均后置、按需开。
 
 ---
 
@@ -184,6 +184,8 @@ V100 上 7B 必须 **QK matmul fp32**（fp16 会 nan；全 fp32 OOM），见 [�
 **执行看板、语料、训练与验收** → [2026-10-08-stage-pt-federated-continued-pretrain.md](2026-10-08-stage-pt-federated-continued-pretrain.md)。
 
 第一枪已落地：**Qwen2.5-0.5B + FineWeb-Edu（~200M）+ SecAgg**；冒烟/R20 见独立计划与 experiment-records。当前预算偏小（`local_steps=30`），只验证通路；加码见该计划 `PT-SCALE-*`。
+
+**阶段二（完整 PT）进行中**（2026-10-09）：`PackedDataset`（EOS 拼接 + 切块）+ `local_steps=200` + 500M train / 50M eval；目标 eval CE 明显下降。详见 [STAGE-PT](2026-10-08-stage-pt-federated-continued-pretrain.md)。
 
 ### 3.6 ABL-MDEC：`memory_decay` 扫描（**done**）
 

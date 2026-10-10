@@ -240,10 +240,30 @@ def plot_run(run_dir: Path) -> None:
         ax.plot(er, el, "o-", color="#6d597a", lw=1.8)
         ax.set_xlabel("Federated round")
         ax.set_ylabel("eval_loss")
-        ax.set_title(f"{run_dir.name} — eval loss")
-        # 从 0 起笔，避免自动截断 y 轴造成“掉到接近 0”的错觉
-        ymax = float(max(el)) if el else 1.0
-        ax.set_ylim(0.0, ymax * 1.08 if ymax > 0 else 1.0)
+        # 默认从 0 起笔（SFT 大降幅）；变化极小时改放大，否则看起来像直线
+        ymin_v = float(min(el))
+        ymax_v = float(max(el))
+        span = ymax_v - ymin_v
+        zoom = span < max(0.02, 0.02 * abs(ymax_v))
+        if zoom:
+            pad = max(span * 0.8, 0.002)
+            ax.set_ylim(ymin_v - pad, ymax_v + pad)
+            ax.set_title(
+                f"{run_dir.name} — eval loss (zoomed; Δ={el[-1] - el[0]:+.4f})"
+            )
+            for x, y in zip(er, el):
+                ax.annotate(
+                    f"{y:.4f}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, 8),
+                    ha="center",
+                    fontsize=8,
+                    color="#6d597a",
+                )
+        else:
+            ax.set_ylim(0.0, ymax_v * 1.08 if ymax_v > 0 else 1.0)
+            ax.set_title(f"{run_dir.name} — eval loss")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(fig_dir / "eval_loss.png")
