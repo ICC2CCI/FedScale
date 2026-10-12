@@ -192,3 +192,9 @@ deployment/nodes-pt-fineweb-0.5b.yaml
 /results/20*/
 /results/current
 /.cursor/
+
+# SketchOPA 实验产物
+experiments_sketchopa/results_sketchopa/
+experiments_sketchopa/__pycache__/
+experiments_sketchopa/**/__pycache__/
+results_sketchopa/
