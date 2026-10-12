@@ -1,8 +1,8 @@
 # STAGE-PT：联邦续预训练（0.5B + FineWeb-Edu）
 
-- **状态**：active（**阶段一协议已验证**；**阶段二完整 PT 进行中**）
+- **状态**：active（**阶段一协议已验证**；**阶段二完整 PT + S2 对照已完成**）
 - **创建**：2026-10-08
-- **更新**：2026-10-09（阶段二：packing + local_steps=200 + 500M 语料；PT-CODE-2 done）
+- **更新**：2026-10-10（阶段二完整 PT + S2 dense 对照 done；lr sweep done）
 - **不改**：Hadamard + INT16 + Issue #1；S3R12v3 `public_random`；SecAgg 协议不按任务特化
 - **关联**：
   - 母计划 [Non-IID + 更大模型 §3.5](2026-09-18-non-iid-and-larger-models.md)（STAGE-PT 从该处拆出）
@@ -80,15 +80,15 @@ HuggingFace：`HuggingFaceFW/fineweb-edu`（用官方 streaming / 已发布 shar
 | **PT-RUN-20** | P1 | **done** `202610081718` | R20 eval=**2.608**（R1=2.614）；记录 [r20](../../experiment-records/2026-10-08-stage-pt-fineweb-0.5b-r20.md) | PT-SMOKE |
 | **PT-REC** | P1 | **done** | [smoke](../../experiment-records/2026-10-08-stage-pt-fineweb-0.5b-smoke.md) + [r20](../../experiment-records/2026-10-08-stage-pt-fineweb-0.5b-r20.md) | PT-RUN-20 |
 | **PT-CODE-2** | P1 | **done** | `PackedDataset`：EOS 拼接 + 切块到 `seq_len`；`--packing` CLI + yaml 开关；`causal_pt` only，eval 不 pack | PT-CODE-1 |
-| **PT-DATA-3** | P1 | **todo** | FineWeb-Edu 抽 **~500M train + 50M eval**（2-3 个 parquet 分片）；覆盖原 200M 数据；同步 ICC1/ICC2 | PT-CODE-2 |
-| **PT-CFG-2** | P1 | **done** | yaml 升级：`packing: true`、`local_steps: 200`、`eval_every_n_rounds: 2` | PT-CODE-2 |
-| **PT-FULL-20** | P1 | **done** `202610091639` | 完整 PT 20 轮 SecAgg；R20 eval=**2.610**（R1=2.618，降幅 0.008）；eval 降幅偏小，根因 lr=5e-6 过低。记录 [full-r20](../../experiment-records/2026-10-09-stage-pt-fineweb-0.5b-full-r20.md) | PT-DATA-3, PT-CFG-2 |
+| **PT-DATA-3** | P1 | **done** | FineWeb-Edu 抽 **~500M train + 50M eval**（1 个 parquet 分片，~859M tokens）；已同步 ICC1/ICC2/Central | PT-CODE-2 |
+| **PT-CFG-2** | P1 | **done** | yaml 升级：`packing: true`、`local_steps: 200`、`eval_every_n_rounds: 2`、`client_upload_timeout_s: 3600` | PT-CODE-2 |
+| **PT-FULL-20** | P1 | **done** `202610091639` | 完整 PT 20 轮 SecAgg；R20 eval=**2.610**（R1=2.618，降幅 0.008）；记录 [full-r20](../../experiment-records/2026-10-09-stage-pt-fineweb-0.5b-full-r20.md) | PT-DATA-3, PT-CFG-2 |
 | **PT-FULL-REC** | P1 | **done** | 完整 PT 实验记录 [full-r20](../../experiment-records/2026-10-09-stage-pt-fineweb-0.5b-full-r20.md) | PT-FULL-20 |
-| **PT-BASE-S2** | P2 | todo | 同数据 **无 SecAgg 全量 S2** 对照（看隐私聚合代价）；PT-FULL-20 跑通后开 | PT-FULL-20 |
-| **PT-LR-SWEEP** | P2 | todo | 提高 lr（如 `1e-5` / `2e-5`）重跑，确认 eval 降幅小是 lr 问题而非协议问题 | PT-FULL-20 |
-| **PT-SCALE-DATA** | P3 | todo | 可选：语料抽到 1B+ tokens（仅在 500M 不够时再开） | PT-FULL-20 |
+| **PT-LR-SWEEP** | P2 | **done** `202610100942` | lr=2e-5 冒烟 5 轮：R4 eval=2.6203（差于 lr=5e-6 的 2.6165）；同分布续训大 lr 破坏已有权重，已排除，lr=5e-6 确认最优 | PT-FULL-20 |
+| **PT-BASE-S2** | P2 | **done** `202610101414` | S2 dense 20 轮：R20 eval=**2.6035**（vs SecAgg 2.6101）；每端上传 1202 MiB/轮（vs ~252）；带宽压缩 4.8x，达到相同 eval 有效压缩 1.9x。记录 [s2-dense-r20](../../experiment-records/2026-10-10-stage-pt-fineweb-0.5b-s2-dense-r20.md) | PT-FULL-20 |
+| **PT-SCALE-DATA** | P3 | todo | 可选：语料抽到 1B+ tokens 或换领域语料（同分布续训降幅有限，换领域可能有更显著效果） | PT-FULL-20 |
 
-阶段一（协议验证）已闭环。阶段二（完整 PT）进行中。
+阶段一（协议验证）已闭环。阶段二（完整 PT + S2 对照）已完成。后续可选：换领域语料 / 更大数据量 / 更多 client。
 
 ---
 
