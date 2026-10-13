@@ -125,17 +125,9 @@ def main():
     args = parse_args()
     state = CoordinatorState(args)
 
-    # MinIO client
-    from minio import Minio
-    minio = Minio(
-        args.minio_endpoint.replace("http://", "").replace("https://", ""),
-        access_key=args.minio_access_key,
-        secret_key=args.minio_secret_key,
-        secure=False,
-    )
-    if not minio.bucket_exists(MINIO_BUCKET):
-        minio.make_bucket(MINIO_BUCKET)
-    state.minio = minio
+    # 本地文件存储（替代 MinIO，避免大文件 multipart upload 问题）
+    state.storage_dir = os.path.join(state.out_dir, "storage")
+    os.makedirs(state.storage_dir, exist_ok=True)
 
     # 启动 REST
     import uvicorn
@@ -145,7 +137,8 @@ def main():
 
     # Pydantic 模型已移到模块级
 
-    from fastapi import Body as FastBody
+    from fastapi import Body as FastBody, HTTPException, Header
+    from fastapi.responses import FileResponse
 
     @app.post("/api/meta")
     def report_meta(body: ClientMetaBody = FastBody(...)):
@@ -223,6 +216,30 @@ def main():
     def get_config():
         return {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
+    @app.post("/api/upload")
+    async def upload_file(body: bytes = FastBody(..., media_type="application/octet-stream"),
+                          x_key: str = Header(...)):
+        """接收 client 上传的文件，存到本地。"""
+        key = x_key
+        if not key:
+            raise HTTPException(status_code=400, detail="missing X-Key")
+        if not key.startswith("sketchopa/"):
+            raise HTTPException(status_code=400, detail="invalid key")
+        path = os.path.join(state.storage_dir, key.replace("/", "_"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(body)
+        logger.info("Upload received: %s (%d bytes)", key, len(body))
+        return {"ok": True}
+
+    @app.get("/api/download/{key:path}")
+    def download_file(key: str):
+        """发送文件给 client。"""
+        path = os.path.join(state.storage_dir, key.replace("/", "_"))
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(path, media_type="application/octet-stream")
+
     logger.info("Coordinator on port %d, method=%s, out=%s", args.port, args.method, state.out_dir)
     uvicorn.run(app, host="0.0.0.0", port=args.port)
 
@@ -273,22 +290,18 @@ def _init_layout(state: CoordinatorState):
 def _do_aggregate(state: CoordinatorState, round_idx: int):
     """聚合各 client 上传，写新全局模型到 MinIO。"""
     args = state.args
-    uploads = state.uploads[round_idx]
+    # 只取真正的 client 上传，跳过 _aggregating 等内部控制 key
+    uploads = {k: v for k, v in state.uploads[round_idx].items() if not str(k).startswith("_")}
 
-    # 下载各 client 的上传数据
-    minio = state.minio
+    # 下载各 client 的上传数据（从本地文件）
     client_data = {}
+    import io
     for cid, meta in uploads.items():
         key = f"{KEY_PREFIX}/round_{round_idx}/client_{cid}/upload.pt"
-        import io
-        try:
-            resp = minio.get_object(MINIO_BUCKET, key)
-            data = resp.read()
-            buf = io.BytesIO(data)
-            client_data[cid] = torch.load(buf, map_location="cpu", weights_only=False)
-        finally:
-            resp.close()
-            resp.release_conn()
+        path = os.path.join(state.storage_dir, key.replace("/", "_"))
+        with open(path, "rb") as f:
+            data = f.read()
+        client_data[cid] = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
 
     # 聚合
     if args.method == "dense":
@@ -300,13 +313,13 @@ def _do_aggregate(state: CoordinatorState, round_idx: int):
     else:
         raise ValueError(args.method)
 
-    # 写新全局模型到 MinIO
+    # 写新全局模型到本地文件
     import io
-    buf = io.BytesIO()
-    torch.save(agg_state, buf)
-    buf.seek(0)
     key = f"{KEY_PREFIX}/round_{round_idx+1}/global_state.pt"
-    minio.put_object(MINIO_BUCKET, key, buf, len(buf.getvalue()))
+    path = os.path.join(state.storage_dir, key.replace("/", "_"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        torch.save(agg_state, f)
     logger.info("Round %d aggregated, new global state -> %s", round_idx, key)
 
     # 记录日志
@@ -329,7 +342,8 @@ def _aggregate_dense(client_data: Dict[int, Dict]) -> Dict[str, torch.Tensor]:
     first_state = client_data[list(client_data.keys())[0]]["state"]
     agg = {}
     for key in first_state:
-        agg[key] = sum(d["state"][key] * (d["num_examples"] / total_ex) for d in client_data.values())
+        # fp16 state 转 fp32 聚合，再转回 fp16 存储
+        agg[key] = (sum(d["state"][key].to(torch.float32) * (d["num_examples"] / total_ex) for d in client_data.values())).to(torch.float16)
     return agg
 
 
@@ -345,7 +359,7 @@ def _aggregate_topk(client_data, state, round_idx):
         agg_flat[data["coords"]] += data["vals"] * w
 
     # 需要全局模型 before（从 MinIO 下载）
-    global_before = _load_global_state(state.minio, round_idx)
+    global_before = _load_global_state(state, round_idx)
     return apply_update_to_state_dict(agg_flat, layer_meta, global_before)
 
 
@@ -376,20 +390,17 @@ def _aggregate_sketchopa(client_data, state, round_idx):
         agg_sketch, encoder, layout, candidates, k_rec, clip_norm=args.clip_norm,
     )
     agg_flat = build_sparse_update(coords_r, vals_r, d)
-    global_before = _load_global_state(state.minio, round_idx)
+    global_before = _load_global_state(state, round_idx)
     return apply_update_to_state_dict(agg_flat, layer_meta, global_before)
 
 
-def _load_global_state(minio, round_idx) -> Dict[str, torch.Tensor]:
+def _load_global_state(state, round_idx) -> Dict[str, torch.Tensor]:
     import io
     key = f"{KEY_PREFIX}/round_{round_idx}/global_state.pt"
-    resp = minio.get_object(MINIO_BUCKET, key)
-    try:
-        data = resp.read()
-        return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
-    finally:
-        resp.close()
-        resp.release_conn()
+    path = os.path.join(state.storage_dir, key.replace("/", "_"))
+    with open(path, "rb") as f:
+        data = f.read()
+    return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
 
 
 if __name__ == "__main__":

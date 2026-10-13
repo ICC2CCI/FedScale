@@ -158,6 +158,7 @@ def train_local_steps(
     local_steps: int,
     device,
     grad_accum: int = 1,
+    accelerator=None,
 ) -> Tuple[float, List[float]]:
     """本地训练 local_steps 步，返回 (avg_loss, step_losses)。"""
     model.train()
@@ -177,15 +178,17 @@ def train_local_steps(
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.autocast(device_type="cuda", enabled=False):
-                outputs = model(**batch)
-                loss = causal_lm_loss_fp32(outputs.logits, batch["labels"]) / grad_accum
-            loss.backward()
+            outputs = model(**batch)
+            loss = causal_lm_loss_fp32(outputs.logits, batch["labels"]) / grad_accum
+            accelerator.backward(loss) if accelerator else loss.backward()
             l = loss.item()
             if math.isnan(l) or math.isinf(l):
                 l = 0.0
             accum_loss += l
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if accelerator is not None:
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -205,9 +208,8 @@ def evaluate(model, eval_loader: DataLoader, device) -> float:
     import math
     for batch in eval_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.autocast(device_type="cuda", enabled=False):
-            outputs = model(**batch)
-            loss = causal_lm_loss_fp32(outputs.logits, batch["labels"])
+        outputs = model(**batch)
+        loss = causal_lm_loss_fp32(outputs.logits, batch["labels"])
         l = loss.item()
         if math.isnan(l) or math.isinf(l):
             l = 0.0
@@ -230,13 +232,8 @@ def load_model_state_dict(model, state_dict: Dict[str, torch.Tensor]) -> None:
 
 
 def get_full_state_fsdp(model):
-    """FSDP 下获取完整 state_dict。"""
-    from accelerate import Accelerator
-    # accelerate FSDP: use get_state_dict
-    try:
-        return Accelerator.get_state_dict(model)
-    except Exception:
-        return {k: v.detach().cpu().to(torch.float32) for k, v in model.state_dict().items()}
+    """获取完整 state_dict。单卡直接用 model.state_dict()。"""
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
 
 def setup_accelerate():

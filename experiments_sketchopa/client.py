@@ -104,8 +104,17 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    accelerator = setup_accelerate()
-    is_main = accelerator.is_main_process
+    # 不用 accelerate，纯 PyTorch 单卡（避免 accelerate 在多 GPU 机器上的 NCCL/barrier 问题）
+    class _SimpleAcc:
+        is_main_process = True
+        num_processes = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        def wait_for_everyone(self): pass
+        def prepare(self, *args): return args
+        def backward(self, loss): loss.backward()
+        def clip_grad_norm_(self, params, max_norm): torch.nn.utils.clip_grad_norm_(params, max_norm)
+    accelerator = _SimpleAcc()
+    is_main = True
 
     # 从 coordinator 获取 config
     config = _get_config(args.server_url)
@@ -121,14 +130,25 @@ def main():
         secure=False,
     )
 
-    # 模型 + tokenizer
+    # 模型 + tokenizer（fp32 避免 fp16 AdamW nan）
     tokenizer = load_tokenizer(args.model_path)
-    model = load_model(args.model_path)
+    model = load_model(args.model_path, torch_dtype=torch.float32)
     model = model.to(accelerator.device)
 
     # 数据
     loader = build_dataloader(args.data_path, tokenizer, args.seq_len, args.batch_size)
-    eval_loader = build_eval_loader(args.eval_path, tokenizer, args.seq_len, args.batch_size)
+    # eval 用更小 batch 避免 logits（batch×seq×vocab）OOM
+    eval_batch = min(args.batch_size, 2)
+    eval_loader = build_eval_loader(args.eval_path, tokenizer, args.seq_len, eval_batch)
+
+    # 优化器 + scheduler（纯 PyTorch，不用 accelerator.prepare）
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=max(1, int(0.1 * args.local_steps)),
+        num_training_steps=args.local_steps,
+    )
 
     # 上报模型元信息
     if is_main:
@@ -138,7 +158,7 @@ def main():
         _report_meta(args.server_url, args.client_id, d, layer_meta, len(loader.dataset))
         logger.info("Reported meta: d=%d, layers=%d, examples=%d", d, len(layer_meta), len(loader.dataset))
 
-    accelerator.wait_for_everyone()
+    # 注：单卡模式无需 accelerator.wait_for_everyone()，去掉避免 NCCL barrier 卡住
 
     # sketchopa: 初始化 layout/encoder（is_main）
     layout = None
@@ -192,29 +212,38 @@ def main():
         # 下载全局模型（round 0：client 0 负责上传初始模型）
         if is_main:
             if round_idx == 0 and args.client_id == 0:
-                # 上传初始模型
-                init_state = {k: v.detach().cpu().to(torch.float32) for k, v in model.state_dict().items()}
-                _save_global_state(minio, 0, init_state)
+                # 上传初始模型到 coordinator（HTTP 直传）
+                init_state = {k: v.detach().cpu().to(torch.float16) for k, v in model.state_dict().items()}
+                buf = io.BytesIO()
+                torch.save(init_state, buf)
+                resp = _http().post(
+                    f"{args.server_url}/api/upload",
+                    data=buf.getvalue(),
+                    headers={"Content-Type": "application/octet-stream",
+                             "X-Key": f"{KEY_PREFIX}/round_0/global_state.pt"},
+                    timeout=600,
+                )
+                resp.raise_for_status()
                 logger.info("Uploaded initial global model to round_0")
-            global_state = _load_global_state(minio, round_idx)
+            global_state = _load_global_state(args.server_url, round_idx)
             _load_state_to_model(model, global_state, accelerator)
-        accelerator.wait_for_everyone()
+        # 单卡无需同步
 
-        # 本地训练
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda s: min(1.0, s / max(1, int(0.1 * args.local_steps))))
+        # 本地训练（复用全局 optimizer/scheduler）
         model.train()
         train_loss, _ = train_local_steps(
             model, loader, optimizer, scheduler,
             local_steps=args.local_steps, device=accelerator.device,
-            grad_accum=args.grad_accum,
+            grad_accum=args.grad_accum, accelerator=accelerator,
         )
 
         if is_main:
             after_state = get_full_state_fsdp(model)
-            after_state = {k: v.detach().cpu().to(torch.float32) for k, v in after_state.items()}
-            delta = compute_delta(global_state, after_state)
+            # 上传用 fp16 减半传输量（训练用 fp32 避免 AdamW nan，传输用 fp16 节省带宽）
+            after_state_fp16 = {k: v.detach().cpu().to(torch.float16) for k, v in after_state.items()}
+            # delta 和 flat_delta 用 fp32 计算
+            after_state_fp32 = {k: v.to(torch.float32) for k, v in after_state_fp16.items()}
+            delta = compute_delta(global_state, after_state_fp32)
             flat_delta, _ = flat_state_dict(delta)
 
             upload_data = {"num_examples": len(loader.dataset), "train_loss": train_loss}
@@ -224,7 +253,7 @@ def main():
             k = max(k, 1)
 
             if method == "dense":
-                upload_data["state"] = after_state
+                upload_data["state"] = after_state_fp16
 
             elif method == "topk":
                 if residual is not None:
@@ -259,12 +288,18 @@ def main():
                 upload_data["ct_zq"] = ct_zq
                 upload_data["coords"] = coords  # 实验记录用
 
-            # 上传到 MinIO
+            # 上传到 coordinator（HTTP 直传，不走 MinIO 避免 multipart 大文件问题）
             buf = io.BytesIO()
             torch.save(upload_data, buf)
-            buf.seek(0)
+            upload_bytes = buf.getvalue()
             key = f"{KEY_PREFIX}/round_{round_idx}/client_{args.client_id}/upload.pt"
-            minio.put_object(MINIO_BUCKET, key, buf, len(buf.getvalue()))
+            resp = _http().post(
+                f"{args.server_url}/api/upload",
+                data=upload_bytes,
+                headers={"Content-Type": "application/octet-stream", "X-Key": key},
+                timeout=600,
+            )
+            resp.raise_for_status()
 
             # 通知 coordinator
             method_specific = {}
@@ -273,16 +308,16 @@ def main():
             _notify_upload(args.server_url, round_idx, args.client_id,
                            len(loader.dataset), train_loss, method_specific)
 
-        accelerator.wait_for_everyone()
+        # 单卡无需同步
 
         # 等待聚合完成
         if is_main:
             _wait_round_done(args.server_url, round_idx, timeout=7200)
             # 下载新全局模型
-            new_state = _load_global_state(minio, round_idx + 1)
+            new_state = _load_global_state(args.server_url, round_idx + 1)
             _load_state_to_model(model, new_state, accelerator)
 
-        accelerator.wait_for_everyone()
+        # 单卡无需同步
 
         # eval
         eval_loss = evaluate(model, eval_loader, accelerator.device)
@@ -360,28 +395,20 @@ def _report_eval(server_url, round_idx, client_id, eval_loss):
     _http().post(f"{server_url}/api/round/{round_idx}/client/{client_id}/eval", json=body, timeout=60).raise_for_status()
 
 
-def _load_global_state(minio) -> Dict[str, torch.Tensor]:
-    # round_idx 由调用方控制，这里简化
-    pass
-
-
-def _load_global_state(minio, round_idx) -> Dict[str, torch.Tensor]:
-    key = f"{KEY_PREFIX}/round_{round_idx}/global_state.pt"
-    resp = minio.get_object(MINIO_BUCKET, key)
-    try:
-        data = resp.read()
-        return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
-    finally:
-        resp.close()
-        resp.release_conn()
-
-
-def _save_global_state(minio, round_idx, state_dict: Dict[str, torch.Tensor]) -> None:
-    key = f"{KEY_PREFIX}/round_{round_idx}/global_state.pt"
-    buf = io.BytesIO()
-    torch.save(state_dict, buf)
-    buf.seek(0)
-    minio.put_object(MINIO_BUCKET, key, buf, len(buf.getvalue()))
+def _load_global_state(server_url, round_idx) -> Dict[str, torch.Tensor]:
+    """从 coordinator 下载全局模型（HTTP，带重试）。"""
+    import time as _time
+    url = f"{server_url}/api/download/{KEY_PREFIX}/round_{round_idx}/global_state.pt"
+    for attempt in range(60):
+        try:
+            resp = _http().get(url, timeout=600)
+            if resp.status_code == 200:
+                return torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        except Exception:
+            pass
+        logger.info("Waiting for round %d global state (attempt %d)...", round_idx, attempt + 1)
+        _time.sleep(10)
+    raise TimeoutError(f"round {round_idx} global state not available after 600s")
 
 
 def _load_state_to_model(model, state_dict: Dict[str, torch.Tensor], accelerator) -> None:

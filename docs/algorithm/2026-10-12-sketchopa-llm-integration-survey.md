@@ -474,9 +474,86 @@ experiments_sketchopa/
 | round_log eval_losses 时序 | 聚合时记录日志但 eval 还没完成 | eval_report 时更新日志 |
 | train_loss=nan | fp16 logits 溢出 | autocast 禁用 + nan→0 兜底 |
 
-### 9.5 下一步
+### 9.5 B0 Dense 基线 20 轮实验结果（2026-10-13）
 
-- [ ] 修复 train_loss=nan 后跑 B0/B1 基线 20 轮
+**配置**：
+- 模型：Qwen2.5-0.5B（fp32 训练，避免 fp16 AdamW nan）
+- 数据：ICC1 `icc1_client0_train.json` (15088) + ICC2 `client1_train.json` (15088)
+- 评估：`medical_flashcards_eval.json` (3352)
+- 训练：local_steps=30, batch_size=4, grad_accum=4, lr=1e-5
+- 传输：state_dict fp16 上传（1.26GB/轮），HTTP 直传 coordinator（不走 MinIO）
+- 每轮耗时：~420s（7 分钟）
+
+**完整结果**：
+
+| Round | train_loss | eval_loss |
+|---|---|---|
+| 0 | 0.312 | 1.174 |
+| 1 | 0.288 | 1.156 |
+| 2 | 0.283 | 1.144 |
+| 3 | 0.282 | 1.134 |
+| 4 | 0.273 | 1.125 |
+| 5 | 0.274 | 1.119 |
+| 6 | 0.268 | 1.114 |
+| 7 | 0.267 | 1.110 |
+| 8 | 0.270 | 1.105 |
+| 9 | 0.269 | 1.102 |
+| 10 | 0.266 | 1.099 |
+| 11 | 0.262 | 1.096 |
+| 12 | 0.260 | 1.093 |
+| 13 | 0.256 | 1.090 |
+| 14 | 0.253 | 1.086 |
+| 15 | 0.251 | 1.083 |
+| 16 | 0.258 | 1.083 |
+| 17 | 0.251 | 1.080 |
+| 18 | 0.250 | 1.077 |
+| 19 | 0.248 | **1.075** |
+
+**结论**：
+- eval_loss 从 1.174 稳步下降到 **1.075**，收敛趋势清晰
+- 两个 client 全程 eval_loss 完全一致（FedAvg 后相同模型 + 相同评估集）
+- B0 基线已就绪，作为后续 topk/sketchopa 实验的对比基准
+
+**结果文件**：`results_sketchopa/B0_dense_20r_v7/round_log.json`
+
+### 9.6 实现中的关键修复（B0 实验期间）
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| MinIO 大文件上传超时 | `put_object` 对 2.5GB BytesIO 流 multipart upload 卡住 | 改用 HTTP 直传 coordinator（`/api/upload` + `/api/download`），不走 MinIO |
+| `accelerator.wait_for_everyone()` 卡住 | accelerate 在多 GPU 机器单进程模式下 NCCL barrier 等待 | 去掉所有 `wait_for_everyone`，纯 PyTorch 单卡 |
+| `Accelerator.get_state_dict` 卡住 | accelerate 包装的 model 导出 state_dict 触发分布式同步 | `get_full_state_fsdp` 改用简单 `model.state_dict()` |
+| fp16 AdamW 参数 nan | fp16 optimizer state 溢出 | 模型用 fp32 训练，上传时转 fp16 减半传输量 |
+| eval_loss=0.0 | eval batch_size=8 导致 logits OOM，nan→0 兜底 | eval batch_size 降到 2 |
+| client 1 下载 404 | client 1 在 client 0 上传初始模型前就尝试下载 | `_load_global_state` 加重试（60 次 × 10s） |
+| coordinator `_do_aggregate` race | 两个 client 同时上传触发重复聚合 | 加 `_aggregating` 标志保护 |
+| round_log eval_losses 时序 | 聚合时记录日志但 eval 还没完成 | `eval_report` 时更新日志 |
+
+### 9.7 当前系统架构
+
+```
+Central (192.168.235.42:8090)
+  └── coordinator.py（FastAPI）
+       ├── /api/config         — 返回实验配置
+       ├── /api/meta           — 接收 client 模型元信息
+       ├── /api/upload         — 接收 client 上传数据（HTTP 直传，本地文件存储）
+       ├── /api/download/{key} — 发送全局模型给 client
+       ├── /api/round/{r}/status — 查询轮次是否完成
+       └── /api/round/{r}/client/{c}/upload+eval — 上传通知 + eval 上报
+
+ICC1 (192.168.206.116)                    ICC2 (192.168.205.130)
+  └── client.py --client-id 0               └── client.py --client-id 1
+       ├── 下载全局模型（HTTP）                  ├── 下载全局模型（HTTP，带重试）
+       ├── 本地训练（fp32，V100 单卡）            ├── 本地训练（fp32，V100 单卡）
+       ├── Top-k / Sketch 编码                   ├── Top-k / Sketch 编码
+       ├── 上传（HTTP，fp16 state）               ├── 上传（HTTP，fp16 state）
+       └── eval + 上报                           └── eval + 上报
+```
+
+### 9.8 下一步
+
+- [x] B0 dense 基线 20 轮 ✅（eval_loss 1.174 → 1.075）
+- [ ] B1 topk 基线 20 轮
 - [ ] calibration 预跑（基于 B1 统计各层 Top-k 计数）
 - [ ] E1/E2/E3 实验 20 轮（uniform vs calibrated，residual on/off）
 - [ ] 扫参（rows, budget_ratio, topk_ratio, recover_rho）
