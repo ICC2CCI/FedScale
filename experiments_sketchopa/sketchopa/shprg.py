@@ -58,22 +58,16 @@ class SHPRG:
         self._A = self._derive_matrix_A()
 
     def _derive_matrix_A(self) -> torch.Tensor:
-        """从 ctx_hash 派生 A 矩阵 (length × seed_dim)，元素 ∈ [0, q)。"""
-        A = torch.zeros(self.length, self.seed_dim, dtype=torch.int64)
-        for j in range(self.seed_dim):
-            # 按列派生，每列从 ctx_hash + 列号 派生
-            h = hashlib.sha256(f"shprg_A|{self.ctx_hash}|col{j}".encode()).digest()
-            # 用 hash 流填充 length 个元素
-            needed = self.length * 2  # 每元素 2 字节
-            stream = bytearray()
-            counter = 0
-            while len(stream) < needed:
-                chunk = hashlib.sha256(h + counter.to_bytes(4, "little")).digest()
-                stream.extend(chunk)
-                counter += 1
-            for i in range(self.length):
-                v = int.from_bytes(stream[i*2:i*2+2], "little")
-                A[i, j] = v % self.modulus_q
+        """从 ctx_hash 派生 A 矩阵 (length × seed_dim)，元素 ∈ [0, q)。
+
+        向量化实现：用 ctx_hash 作为 torch 随机种子，一次性生成整个矩阵。
+        """
+        # 用 ctx_hash 派生 torch 种子
+        seed = int(hashlib.sha256(f"shprg_A|{self.ctx_hash}".encode()).hexdigest()[:16], 16)
+        g = torch.Generator()
+        g.manual_seed(seed)
+        # 一次性生成 (length × seed_dim) 的 Z_q 矩阵
+        A = torch.randint(0, self.modulus_q, (self.length, self.seed_dim), generator=g, dtype=torch.int64)
         return A
 
     def expand(self, seed_vec: List[int]) -> torch.Tensor:

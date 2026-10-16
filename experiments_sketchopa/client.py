@@ -96,6 +96,8 @@ def parse_args():
     p.add_argument("--quant-scale", type=float, default=1e5)
     p.add_argument("--sketch-seed", type=int, default=20260623)
     p.add_argument("--save-calibration", type=str, default=None)
+    p.add_argument("--calibration-path", type=str, default=None,
+                   help="本地 calibration 文件路径（覆盖 coordinator 下发的路径）")
     return p.parse_args()
 
 
@@ -180,7 +182,7 @@ def main():
         total_budget = int(1.0 * topk16_payload / (config.get("rows", 5) * 2))
         total_budget = max(total_budget, 8 * len(layers))
         allocation = config.get("allocation", "uniform_param")
-        cal_path = config.get("calibration_path")
+        cal_path = args.calibration_path or config.get("calibration_path")
         if allocation == "topk_count_calibrated":
             weights = _load_calibration_weights(layer_meta, cal_path)
         else:
@@ -262,10 +264,17 @@ def main():
                     coords, vals = global_topk_flat(flat_delta, k)
                 upload_data["coords"] = coords
                 upload_data["vals"] = vals
-                # calibration 统计
-                cnt = count_topk_per_layer(coords, layout) if layout else {}
-                for name, c in cnt.items():
-                    calibration_counts[name] = calibration_counts.get(name, 0) + c
+                # calibration 统计（topk 不需要 layout，直接用 layer_meta）
+                from sketchopa.topk import flat_state_dict as _fsd
+                # 用 layer_meta 找各坐标所属层
+                layer_starts = torch.tensor([s for _, s, _ in layer_meta], dtype=torch.long)
+                layer_ends = torch.tensor([e for _, _, e in layer_meta], dtype=torch.long)
+                from sketchopa.count_sketch import _find_layer_vec
+                li = _find_layer_vec(coords, layer_starts, layer_ends)
+                for idx in li.tolist():
+                    if idx >= 0:
+                        name = layer_meta[idx][0]
+                        calibration_counts[name] = calibration_counts.get(name, 0) + 1
 
             elif method == "sketchopa":
                 if residual is not None:

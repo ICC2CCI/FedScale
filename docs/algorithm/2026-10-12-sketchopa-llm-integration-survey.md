@@ -550,11 +550,33 @@ ICC1 (192.168.206.116)                    ICC2 (192.168.205.130)
        └── eval + 上报                           └── eval + 上报
 ```
 
-### 9.8 下一步
+### 9.8 实验结果与结论
+
+> **完整实验报告见**：`docs/algorithm/2026-10-14-sketchopa-experiment-report.md`
+
+**五组实验汇总**（Qwen2.5-0.5B, 2-client, 20 rounds, topk_ratio=1%）：
+
+| 实验 | 方法 | R0 eval_loss | R19 eval_loss | 状态 |
+|---|---|---|---|---|
+| B0 | Dense FedAvg | 1.174 | **1.075** | 稳定收敛 ✓ |
+| B1 | Top-k FedAvg | 1.734 | **1.160** | 稳定收敛 ✓ |
+| E1 | SketchOPA uniform no-residual | 1.783 | **15.548** | 完全发散 ✗ |
+| E2 | SketchOPA uniform + residual | 1.783 | **1.987** | 未崩溃，波动大 △ |
+| E3 | SketchOPA calibrated + residual | 1.783 | **2.977** | 波动更大 △ |
+
+**核心结论**：
+- Top-k 1% 稀疏化本身可行（B1 最终 1.160，通信压缩 16.7x）
+- SketchOPA 无 residual 完全发散（E1），residual 是必要组件
+- residual + uniform allocation（E2）未崩溃但 eval_loss 在 1.57-3.34 间波动，无法稳定收敛
+- calibrated allocation（E3）反而更不稳定——大模型 Top-k 分布极端集中在 embedding 层，简单加权导致中间层 bucket 不足
+- CountSketch 恢复引入的额外误差（相比直接 Top-k）过大，当前配置下不足以支撑稳定训练
+
+### 9.9 下一步
 
 - [x] B0 dense 基线 20 轮 ✅（eval_loss 1.174 → 1.075）
-- [ ] B1 topk 基线 20 轮
-- [ ] calibration 预跑（基于 B1 统计各层 Top-k 计数）
-- [ ] E1/E2/E3 实验 20 轮（uniform vs calibrated，residual on/off）
+- [x] B1 topk 基线 20 轮 ✅（eval_loss 1.734 → 1.160）
+- [x] calibration 预跑 ✅（基于 E1 统计各层 Top-k 计数）
+- [x] E1/E2/E3 实验 20 轮 ✅（uniform vs calibrated，residual on/off）
 - [ ] 扫参（rows, budget_ratio, topk_ratio, recover_rho）
+- [ ] 混合策略（embedding 层用 Top-k 直传，中间层用 CountSketch）
 - [ ] 结论文档
