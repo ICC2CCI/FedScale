@@ -571,6 +571,10 @@ ICC1 (192.168.206.116)                    ICC2 (192.168.205.130)
 - calibrated allocation（E3）反而更不稳定——大模型 Top-k 分布极端集中在 embedding 层，简单加权导致中间层 bucket 不足
 - CountSketch 恢复引入的额外误差（相比直接 Top-k）过大，当前配置下不足以支撑稳定训练
 
+> **发散根因详细分析见**：`docs/algorithm/2026-10-14-sketchopa-divergence-root-cause.md`
+>
+> 核心发现：实现忠实于交底书方案，发散根因是 **CountSketch bucket 预算严重不足**。budget_ratio=1.0 下 embed_tokens 层碰撞率 117×（152 万 Top-k 条目 → 12,993 bucket），恢复值被噪声淹没。这是大模型参数集中在 embedding 层导致的结构性问题，非实现 bug。
+
 ### 9.9 下一步
 
 - [x] B0 dense 基线 20 轮 ✅（eval_loss 1.174 → 1.075）
